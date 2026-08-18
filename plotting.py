@@ -130,10 +130,15 @@ def plot_regimes_and_cumret(strategy_df: pd.DataFrame,
         ax.plot(dates, (ret.reindex(strategy_df.index) - rf).cumsum(), label=curve_label,
                 color=color, lw=1.2, alpha=.9)
 
-    # shade the days actually held in the risk-free asset (signal + trading delay applied)
-    in_cash = (strategy_df["weight"] < .5).to_numpy()
+    # shade the days actually held at the defensive weight (signal + trading delay applied);
+    # that weight is zero for the pure 0/1 strategy and `1 - max_cash` under a cash limit
+    weight = strategy_df["weight"]
+    bear_weight = float(weight.min())
+    in_cash = (weight <= bear_weight + 1e-9).to_numpy() if bear_weight < weight.max() \
+        else np.zeros(len(weight), dtype=bool)
+    cash_label = "Bear (in cash)" if bear_weight <= 0. else f"Bear ({bear_weight:.0%} risky)"
     ax.fill_between(dates, 0, 1, where=in_cash, transform=ax.get_xaxis_transform(),
-                    color=BEAR_COLOR, alpha=.18, step="pre", label="Bear (in cash)")
+                    color=BEAR_COLOR, alpha=.18, step="pre", label=cash_label)
 
     ax.set(title=title, ylabel="Cumulative excess return")
     _percent_axis(ax)

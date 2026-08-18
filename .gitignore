@@ -1,0 +1,9 @@
+# 파이썬 바이트코드
+__pycache__/
+*.py[cod]
+
+# 테스트 캐시
+.pytest_cache/
+
+# 파이프라인 기본 출력 폴더 (--outdir)
+out/

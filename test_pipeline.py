@@ -15,8 +15,10 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from backtest import build_weights, delay_robustness_table, run_0_1_strategy
-from features import apply_transform, build_extra_features, parse_extra_spec
+from backtest import (build_weights, delay_robustness_table, resolve_cash_limits,
+                      resolve_cost_bps, run_0_1_strategy)
+from features import (EXAMPLE_HLS, EXTRA_WINDOWS, apply_transform, build_extra_features,
+                      feature_engineer, parse_extra_spec)
 from hmm_benchmark import smooth_states
 from rolling import (init_model, refit_schedule, resolve_max_feats, run_rolling_jm,
                      semiannual_anchors)
@@ -38,6 +40,49 @@ def test_transforms_are_causal():
     full = apply_transform(LEVELS, "ewm", 3)
     prefix = apply_transform(LEVELS.iloc[:6], "ewm", 3)
     assert np.allclose(full.iloc[:6], prefix)
+
+
+def test_extra_feature_set():
+    """The "extra" set extends the "example" one without dropping or renaming its columns."""
+    ret = pd.Series(np.linspace(-.02, .02, 400), index=pd.bdate_range("2020-01-01", periods=400).date)
+    example = feature_engineer(ret, ver="example")
+    extra = feature_engineer(ret, ver="extra")
+    assert list(extra.columns)[:len(example.columns)] == list(example.columns)
+    assert extra[example.columns].equals(example)
+    added = [col for col in extra.columns if col not in example.columns]
+    assert len(added) == 25 and len(extra.columns) == 34, (len(added), len(extra.columns))
+    # every statistic of the list the set was built from is present
+    for name in ("ret-simple", "ret-log", "ret-abs", "ret-sq", "ret-cumlog"):
+        assert name in added, name
+    for window in EXTRA_WINDOWS:
+        for stat in ("std", "var", "mad", "rms"):
+            assert f"{stat}_{window:d}" in added, f"{stat}_{window:d}"
+    for hl in EXAMPLE_HLS:
+        assert f"vol-log_{hl:.0f}" in added and f"vol-chg_{hl:.0f}" in added, hl
+    assert "vol-ratio_5-20" in added and "vol-ratio_20-60" in added
+
+    # the definitions that are easy to get wrong
+    assert np.allclose(extra["ret-simple"], ret)
+    assert np.allclose(extra["ret-cumlog"], np.log1p(ret).cumsum())
+    assert np.allclose(extra["var_20"], extra["std_20"] ** 2, equal_nan=True)
+    assert np.allclose(extra["vol-ratio_5-20"], extra["vol-log_5"] - extra["vol-log_20"])
+    assert np.allclose(extra["vol-chg_20"], extra["vol-log_20"].diff(20), equal_nan=True)
+
+    try:
+        feature_engineer(ret, ver="없는세트")
+        raise AssertionError("알 수 없는 피처 세트는 NotImplementedError를 내야 합니다.")
+    except NotImplementedError:
+        pass
+
+
+def test_extra_feature_set_is_causal():
+    """No "extra" feature may let a later observation change an earlier value."""
+    rng = np.random.default_rng(0)
+    dates = pd.bdate_range("2015-01-01", periods=600).date
+    ret = pd.Series(rng.normal(.0003, .011, 600), index=dates)
+    full = feature_engineer(ret, ver="extra")
+    for cut in (200, 450):
+        assert full.iloc[:cut].equals(feature_engineer(ret.iloc[:cut], ver="extra")), cut
 
 
 def test_extra_feature_specs():
@@ -73,7 +118,52 @@ def test_strategy_returns_and_costs():
     expected = (strategy.weight * RET + (1. - strategy.weight) * RF
                 - strategy.weight.diff().abs().fillna(0.) * 1e-3)
     assert np.allclose(strategy.jm, expected)
+    assert np.allclose(strategy.traded, strategy.bought + strategy.sold)
     assert strategy.traded.iloc[0] == 0.
+
+
+def test_cash_limits():
+    """The cash limits bound the weight on the risky asset in both regimes."""
+    assert resolve_cash_limits() == (1., 0.)                    # the pure 0/1 strategy
+    assert resolve_cash_limits(min_cash=.05, max_cash=.6) == (.95, .4)
+    for bad in ({"min_cash": -.1}, {"max_cash": 1.2}, {"min_cash": .6, "max_cash": .4}):
+        try:
+            resolve_cash_limits(**bad)
+            raise AssertionError(f"{bad}는 ValueError를 내야 합니다.")
+        except ValueError:
+            pass
+
+    weights = build_weights(REGIME, delay=1, min_cash=.1, max_cash=.7)
+    invested = np.where(REGIME == 0, .9, .3)
+    assert np.allclose(weights.iloc[2:], invested[:-2])
+    assert (weights.iloc[:2] == .9).all()                       # start at the bull weight
+    # a limited strategy is never fully in cash, and its returns stay between the extremes
+    limited = run_0_1_strategy(REGIME, RET, RF, delay=1, cost_bps=0., min_cash=.1, max_cash=.7)
+    assert limited.weight.between(.3, .9).all()
+    assert np.allclose(limited.jm, limited.weight * RET + (1. - limited.weight) * RF)
+
+
+def test_split_transaction_costs():
+    """Buys and sells are charged at their own rate, and default to the symmetric cost."""
+    assert resolve_cost_bps(10.) == (10., 10.)
+    assert resolve_cost_bps(10., sell_cost_bps=25.) == (10., 25.)
+    try:
+        resolve_cost_bps(10., buy_cost_bps=-1.)
+        raise AssertionError("음수 거래비용은 ValueError를 내야 합니다.")
+    except ValueError:
+        pass
+
+    strategy = run_0_1_strategy(REGIME, RET, RF, delay=1, buy_cost_bps=10., sell_cost_bps=25.)
+    change = strategy.weight.diff().fillna(0.)
+    assert np.allclose(strategy.bought, change.clip(lower=0.))
+    assert np.allclose(strategy.sold, (-change).clip(lower=0.))
+    assert np.allclose(strategy.cost, strategy.bought * 1e-3 + strategy.sold * 25e-4)
+    assert strategy.bought.iloc[0] == 0. and strategy.sold.iloc[0] == 0.
+    gross = strategy.weight * RET + (1. - strategy.weight) * RF
+    assert np.allclose(strategy.jm, gross - strategy.cost)
+    # the asymmetric cost is dearer than the symmetric one it extends
+    symmetric = run_0_1_strategy(REGIME, RET, RF, delay=1, cost_bps=10.)
+    assert strategy.cost.sum() > symmetric.cost.sum()
 
 
 def test_delay_robustness_table():

@@ -21,8 +21,9 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from backtest import (DEFAULT_COST_BPS, delay_robustness_table, format_performance_table,
-                      performance_table, regime_summary, run_0_1_strategy)
+from backtest import (DEFAULT_COST_BPS, DEFAULT_MAX_CASH, DEFAULT_MIN_CASH,
+                      delay_robustness_table, format_performance_table, performance_table,
+                      regime_summary, resolve_cash_limits, resolve_cost_bps, run_0_1_strategy)
 from data_io import (RF_UNITS, TRADING_DAYS, join_extra_table, load_extra_table,
                      load_market_data, normalize_header)
 from features import FEATURE_SETS, build_extra_features, build_features, parse_extra_spec
@@ -49,7 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     group = parser.add_argument_group("피처")
     group.add_argument("--feature-set", default="paper", choices=FEATURE_SETS,
-                       help="paper: 논문 Table 2의 3개 피처 / example: 레포 예제의 9개 피처")
+                       help="paper: 논문 Table 2의 3개 피처 / example: 레포 예제의 9개 피처 / "
+                            "extra: example 9개 + 수익률·변동성 파생 25개 = 34개 (--model sjm 권장)")
     group.add_argument("--log-dd", action="store_true",
                        help="paper 피처 세트에서 downside deviation을 로그 변환")
     group.add_argument("--warmup", type=int, default=252, help="EWM 워밍업으로 버릴 초기 행 수")
@@ -98,7 +100,16 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--delay", type=int, default=1,
                        help="거래 지연 일수. t일 신호는 t+delay+1일부터 적용")
     group.add_argument("--cost-bps", type=float, default=DEFAULT_COST_BPS,
-                       help="편도 거래비용 (bp)")
+                       help="편도 거래비용 (bp). --buy-cost-bps/--sell-cost-bps를 주지 않은 쪽에 적용")
+    group.add_argument("--buy-cost-bps", type=float, default=None,
+                       help="매수 거래비용 (bp). 미지정 시 --cost-bps 사용 (예: 10)")
+    group.add_argument("--sell-cost-bps", type=float, default=None,
+                       help="매도 거래비용 (bp). 증권거래세처럼 매도가 더 비쌀 때 지정 (예: 25)")
+    group.add_argument("--max-cash", type=float, default=DEFAULT_MAX_CASH,
+                       help="bear 레짐에서 허용하는 최대 현금 비중 (0~1). "
+                            "1이면 논문과 동일하게 100%% 현금, 0.5면 위험자산을 절반만 줄임")
+    group.add_argument("--min-cash", type=float, default=DEFAULT_MIN_CASH,
+                       help="bull 레짐에서도 항상 유지할 최소 현금 비중 (0~1)")
     group.add_argument("--delays", default="1,5,10",
                        help="거래 지연 로버스트니스 표(논문 Table 5)에 사용할 지연 일수 목록")
     group.add_argument("--no-robustness", action="store_true", help="지연 로버스트니스 표를 건너뜀")
@@ -225,6 +236,10 @@ def run_pipeline(input_path: str,
                  hmm_simple_ret: bool = False,
                  delay: int = 1,
                  cost_bps: float = DEFAULT_COST_BPS,
+                 buy_cost_bps: float = None,
+                 sell_cost_bps: float = None,
+                 min_cash: float = DEFAULT_MIN_CASH,
+                 max_cash: float = DEFAULT_MAX_CASH,
                  delays=(1, 5, 10),
                  robustness: bool = True,
                  plot: bool = True,
@@ -239,7 +254,8 @@ def run_pipeline(input_path: str,
     re-estimate the jump model every six months over a rolling window while inferring the
     regimes online in between, optionally run the rolling HMM benchmark, and backtest the
     0/1 strategy -- under the main trading delay and, for the robustness table, under
-    several delays.
+    several delays. `min_cash`/`max_cash` bound the share held in the risk-free asset, and
+    `buy_cost_bps`/`sell_cost_bps` charge the two legs of a trade separately.
 
     Parameters
     ----------
@@ -259,6 +275,11 @@ def run_pipeline(input_path: str,
         `robustness`, and the list of written files.
     """
     os.makedirs(outdir, exist_ok=True)
+    # fail fast on bad limits, and keep the resolved values for the log line and the plot title
+    bull_weight, bear_weight = resolve_cash_limits(min_cash, max_cash)
+    buy_bps, sell_bps = resolve_cost_bps(cost_bps, buy_cost_bps, sell_cost_bps)
+    cost_kwargs = {"cost_bps": cost_bps, "buy_cost_bps": buy_cost_bps,
+                   "sell_cost_bps": sell_cost_bps, "min_cash": min_cash, "max_cash": max_cash}
 
     # 1) raw file(s) -> daily returns, excess returns and custom variables
     data, extra_df = load_data_with_extras(
@@ -287,7 +308,7 @@ def run_pipeline(input_path: str,
 
     # 4) 0/1 strategy backtest on the online inferred signal
     strategy = run_0_1_strategy(result.regimes.regime, data.ret, data.rf,
-                                delay=delay, cost_bps=cost_bps, bull_state=0)
+                                delay=delay, bull_state=0, **cost_kwargs)
     summary = regime_summary(result.regimes.regime, bear_state=n_components - 1)
 
     # 5) optional HMM benchmark over the same period
@@ -306,14 +327,14 @@ def run_pipeline(input_path: str,
         # compare both models over the period they share
         common = result.regimes.index.intersection(hmm_result.regimes.index)
         hmm_strategy = run_0_1_strategy(hmm_result.regimes.regime.reindex(common), data.ret,
-                                        data.rf, delay=delay, cost_bps=cost_bps, bull_state=0)
+                                        data.rf, delay=delay, bull_state=0, **cost_kwargs)
         jm_aligned = strategy
         if len(common) < len(strategy):
             warnings.warn(
                 f"{result.model.upper()}({strategy.index[0]}~)과 HMM({hmm_result.regimes.index[0]}~)의 추론 구간이 달라 "
                 f"공통 구간 {common[0]} ~ {common[-1]}에서 성과를 비교합니다.")
             jm_aligned = run_0_1_strategy(result.regimes.regime.reindex(common), data.ret, data.rf,
-                                          delay=delay, cost_bps=cost_bps, bull_state=0)
+                                          delay=delay, bull_state=0, **cost_kwargs)
         performance = performance_table(jm_aligned, trading_days=trading_days, label=model_label,
                                         others={"HMM 0/1": hmm_strategy})
 
@@ -324,8 +345,8 @@ def run_pipeline(input_path: str,
         if hmm_result is not None:
             regime_dict["HMM"] = hmm_result.regimes.regime
         robustness_table = delay_robustness_table(regime_dict, data.ret, data.rf,
-                                                  delays=delay_list, cost_bps=cost_bps,
-                                                  trading_days=trading_days)
+                                                  delays=delay_list, trading_days=trading_days,
+                                                  **cost_kwargs)
 
     # 7) write everything out
     written = []
@@ -357,8 +378,13 @@ def run_pipeline(input_path: str,
         if plot_font:
             setup_font(plot_font)
         name = result.model.upper()
+        # only spell the extras out when they differ from the plain 0/1 strategy of the article
+        cost_text = (f"cost={buy_bps:g}bp" if buy_bps == sell_bps
+                     else f"cost={buy_bps:g}/{sell_bps:g}bp buy/sell")
+        weight_text = ("" if (bear_weight, bull_weight) == (0., 1.)
+                       else f", weight {bear_weight:.0%}-{bull_weight:.0%}")
         title = (f"{name} 0/1 strategy (lambda={jump_penalty:g}, window={result.window}, "
-                 f"delay={delay}, cost={cost_bps:g}bp)")
+                 f"delay={delay}, {cost_text}{weight_text})")
         extra_curves = {"HMM 0/1 strategy": hmm_strategy["jm"]} if hmm_strategy is not None else None
         written.append(plot_regimes_and_cumret(strategy, os.path.join(outdir, "regimes_cumret.png"),
                                                title=title, label=f"{name} 0/1 strategy",
@@ -376,6 +402,9 @@ def run_pipeline(input_path: str,
         print(f"온라인 레짐 구간: {summary['start']} ~ {summary['end']} ({summary['n_days']}거래일)")
         print(f"{result.model.upper():<3} bear 레짐 비중: {summary['bear_share']:.1%}, "
               f"레짐 전환 {summary['n_shifts']}회 (연 {summary['shifts_per_year']:.2f}회)")
+        print(f"위험자산 비중: bull {bull_weight:.0%} / bear {bear_weight:.0%} "
+              f"(현금 {min_cash:.0%}~{max_cash:.0%}), "
+              f"거래비용: 매수 {buy_bps:g}bp / 매도 {sell_bps:g}bp")
         if result.feat_weights is not None:
             mean_weights = result.feat_weights.mean().sort_values(ascending=False)
             kept = (result.feat_weights > 0).mean()
@@ -421,7 +450,9 @@ def main(argv=None) -> int:
                  hmm=args.hmm, hmm_window=args.hmm_window, hmm_refit_every=args.hmm_refit_every,
                  hmm_smooth_k=args.hmm_smooth_k, hmm_n_init=args.hmm_n_init,
                  hmm_covariance_type=args.hmm_covariance_type, hmm_simple_ret=args.hmm_simple_ret,
-                 delay=args.delay, cost_bps=args.cost_bps, delays=args.delays,
+                 delay=args.delay, cost_bps=args.cost_bps, buy_cost_bps=args.buy_cost_bps,
+                 sell_cost_bps=args.sell_cost_bps, min_cash=args.min_cash, max_cash=args.max_cash,
+                 delays=args.delays,
                  robustness=not args.no_robustness,
                  plot=not args.no_plot, plot_font=args.plot_font,
                  save_features=args.save_features, verbose=not args.quiet)

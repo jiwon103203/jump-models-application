@@ -2,7 +2,7 @@
 Feature engineering for the jump model, following Shu, Yu and Mulvey (2024),
 "Downside Risk Reduction Using Regime-Switching Signals".
 
-Two feature sets are provided:
+Three feature sets are provided:
 
 - ``"paper"`` (default): the three features of Table 2 of the article -- the EWM
   downside deviation with a halflife of 10 days, and EWM Sortino ratios with
@@ -10,6 +10,12 @@ Two feature sets are provided:
 - ``"example"``: the nine-feature set of ``examples/nasdaq/feature.py`` -- EWM
   return, log EWM downside deviation and EWM Sortino ratio over halflives of
   5, 20 and 60 days.
+- ``"extra"``: the nine features of ``"example"`` plus a broad set of return and
+  volatility statistics -- the plain, log, absolute, squared and cumulative return,
+  the rolling standard deviation, variance, mean absolute return and RMS return
+  over 5/20/60-day windows, and the EWMA volatility with its change over time and
+  its ratio across horizons. 34 features in total; pair it with ``--model sjm``,
+  which drops the ones that carry no regime information.
 """
 
 import re
@@ -17,12 +23,16 @@ import re
 import numpy as np
 import pandas as pd
 
-FEATURE_SETS = ("paper", "example")
+FEATURE_SETS = ("paper", "example", "extra")
 TRANSFORMS = ("raw", "ewm", "diff", "pct", "log", "logdiff")
 
 PAPER_DD_HL = 10.
 PAPER_SORTINO_HLS = (20., 60.)
 EXAMPLE_HLS = (5., 20., 60.)
+# the "extra" set reuses the horizons of the "example" set, as rolling windows for the
+# simple-window statistics and as halflives for the exponentially weighted ones
+EXTRA_WINDOWS = (5, 20, 60)
+EXTRA_VOL_RATIO_PAIRS = ((5., 20.), (20., 60.))
 
 
 def compute_ewm_DD(ret_ser: pd.Series, hl: float) -> pd.Series:
@@ -48,6 +58,31 @@ def compute_ewm_DD(ret_ser: pd.Series, hl: float) -> pd.Series:
     return np.sqrt(sq_mean)
 
 
+def compute_ewm_vol(ret_ser: pd.Series, hl: float) -> pd.Series:
+    """
+    Compute the EWMA volatility of a return series, the RiskMetrics-style square root of
+    the EWM second moment of the returns.
+
+    It is the two-sided counterpart of `compute_ewm_DD`: the same statistic taken over
+    every return rather than over the negative ones only, so that the pair separates a
+    fall in prices from a rise in turbulence.
+
+    Parameters
+    ----------
+    ret_ser : pd.Series
+        The input return series.
+
+    hl : float
+        The halflife, in periods, of the exponential weights.
+
+    Returns
+    -------
+    pd.Series
+        The EWMA volatility, in the units of the returns (not annualized).
+    """
+    return np.sqrt(ret_ser.pow(2).ewm(halflife=hl).mean())
+
+
 def compute_ewm_sortino(ret_ser: pd.Series, hl: float) -> pd.Series:
     """
     Compute the EWM Sortino ratio, the ratio of the EWM average return to the EWM
@@ -69,6 +104,107 @@ def compute_ewm_sortino(ret_ser: pd.Series, hl: float) -> pd.Series:
     return ret_ser.ewm(halflife=hl).mean().div(compute_ewm_DD(ret_ser, hl))
 
 
+def example_features(ret_ser: pd.Series) -> dict:
+    """
+    Build the nine features of the "example" set: the EWM return, the log EWM downside
+    deviation and the EWM Sortino ratio over halflives of 5, 20 and 60 days.
+
+    Parameters
+    ----------
+    ret_ser : pd.Series
+        The input return series.
+
+    Returns
+    -------
+    dict of {str: pd.Series}
+        The features, keyed by column name.
+    """
+    feat_dict = {}
+    for hl in EXAMPLE_HLS:
+        # Feature 1: EWM-ret
+        feat_dict[f"ret_{hl:.0f}"] = ret_ser.ewm(halflife=hl).mean()
+        # Feature 2: log(EWM-DD)
+        DD = compute_ewm_DD(ret_ser, hl)
+        feat_dict[f"DD-log_{hl:.0f}"] = np.log(DD)
+        # Feature 3: EWM-Sortino-ratio = EWM-ret/EWM-DD
+        feat_dict[f"sortino_{hl:.0f}"] = feat_dict[f"ret_{hl:.0f}"].div(DD)
+    return feat_dict
+
+
+def extra_features(ret_ser: pd.Series) -> dict:
+    """
+    Build the return and volatility statistics the "extra" set adds on top of the
+    "example" set.
+
+    The "example" features already summarize the *level* of the trailing return (its EWM
+    mean) and its *downside* dispersion (the EWM downside deviation); a rolling return is
+    therefore not repeated here. What they leave out, and what this function adds, is the
+    plain return in its various transforms, two-sided dispersion measured over simple
+    windows, and the term structure and dynamics of the EWMA volatility:
+
+    ============================ ==================================================
+    ``ret-simple``               the return itself, `r_t`
+    ``ret-log``                  the log return, `log(1 + r_t)`
+    ``ret-abs``                  the absolute return, `|r_t|`
+    ``ret-sq``                   the squared return, `r_t^2`
+    ``ret-cumlog``               the cumulative log return since the first observation
+    ``std_w``                    the rolling standard deviation over `w` days
+    ``var_w``                    the rolling variance over `w` days, i.e. `std_w^2`
+    ``mad_w``                    the rolling mean absolute return over `w` days
+    ``rms_w``                    the rolling root mean square return over `w` days
+    ``vol-log_hl``               the log EWMA volatility at halflife `hl`
+    ``vol-chg_hl``               its change over the last `hl` days, a log change
+    ``vol-ratio_s-l``            `vol-log_s - vol-log_l`, the log ratio of the two
+    ============================ ==================================================
+
+    Volatilities are kept on the log scale, as the "example" set does for its downside
+    deviation: they are positive and right-skewed, so the log is the better behaved
+    coordinate, and differences of logs are exactly the changes and ratios of the last
+    two rows.
+
+    Every statistic looks backwards only, so none of them leaks future information.
+    `ret-cumlog` is the one non-stationary column: it trends with the market over the
+    whole sample instead of fluctuating around a level, which makes it a poor clustering
+    coordinate. It is kept because a cumulative return is a common input, but the sparse
+    jump model (`--model sjm`) is expected to drop it.
+
+    Parameters
+    ----------
+    ret_ser : pd.Series
+        The input return series.
+
+    Returns
+    -------
+    dict of {str: pd.Series}
+        The features, keyed by column name.
+    """
+    # a daily excess return of -100% or worse cannot be logged; it does not occur in
+    # practice, and any such row is dropped downstream by `build_features`
+    log_ret = np.log1p(ret_ser.where(ret_ser > -1.))
+    feat_dict = {
+        "ret-simple": ret_ser,
+        "ret-log": log_ret,
+        "ret-abs": ret_ser.abs(),
+        "ret-sq": ret_ser.pow(2),
+        "ret-cumlog": log_ret.cumsum(),
+    }
+    for window in EXTRA_WINDOWS:
+        rolling = ret_ser.rolling(window)
+        feat_dict[f"std_{window:d}"] = rolling.std()
+        feat_dict[f"var_{window:d}"] = rolling.var()
+        feat_dict[f"mad_{window:d}"] = ret_ser.abs().rolling(window).mean()
+        feat_dict[f"rms_{window:d}"] = np.sqrt(ret_ser.pow(2).rolling(window).mean())
+    for hl in EXAMPLE_HLS:
+        log_vol = np.log(compute_ewm_vol(ret_ser, hl))
+        feat_dict[f"vol-log_{hl:.0f}"] = log_vol
+        # how much the volatility moved over its own horizon
+        feat_dict[f"vol-chg_{hl:.0f}"] = log_vol.diff(int(hl))
+    for short_hl, long_hl in EXTRA_VOL_RATIO_PAIRS:
+        feat_dict[f"vol-ratio_{short_hl:.0f}-{long_hl:.0f}"] = (
+            feat_dict[f"vol-log_{short_hl:.0f}"] - feat_dict[f"vol-log_{long_hl:.0f}"])
+    return feat_dict
+
+
 def feature_engineer(ret_ser: pd.Series, ver: str = "paper", log_dd: bool = False) -> pd.DataFrame:
     """
     Build the feature matrix fed to the jump model from a (excess) return series.
@@ -79,12 +215,13 @@ def feature_engineer(ret_ser: pd.Series, ver: str = "paper", log_dd: bool = Fals
         The input return series, typically the excess return over the risk-free rate.
 
     ver : str, optional (default="paper")
-        Either "paper" (three features, Table 2 of the article) or "example"
-        (the nine features used in the Nasdaq example of this repo).
+        One of "paper" (three features, Table 2 of the article), "example" (the nine
+        features used in the Nasdaq example of this repo) or "extra" (those nine plus the
+        return and volatility statistics of `extra_features`, 34 in total).
 
     log_dd : bool, optional (default=False)
         Whether to take the log of the downside deviation feature in the "paper"
-        feature set. The "example" set always uses the log scale.
+        feature set. The "example" and "extra" sets always use the log scale.
 
     Returns
     -------
@@ -99,16 +236,10 @@ def feature_engineer(ret_ser: pd.Series, ver: str = "paper", log_dd: bool = Fals
         return pd.DataFrame(feat_dict)
 
     if ver == "example":
-        feat_dict = {}
-        for hl in EXAMPLE_HLS:
-            # Feature 1: EWM-ret
-            feat_dict[f"ret_{hl:.0f}"] = ret_ser.ewm(halflife=hl).mean()
-            # Feature 2: log(EWM-DD)
-            DD = compute_ewm_DD(ret_ser, hl)
-            feat_dict[f"DD-log_{hl:.0f}"] = np.log(DD)
-            # Feature 3: EWM-Sortino-ratio = EWM-ret/EWM-DD
-            feat_dict[f"sortino_{hl:.0f}"] = feat_dict[f"ret_{hl:.0f}"].div(DD)
-        return pd.DataFrame(feat_dict)
+        return pd.DataFrame(example_features(ret_ser))
+
+    if ver == "extra":
+        return pd.DataFrame({**example_features(ret_ser), **extra_features(ret_ser)})
 
     raise NotImplementedError(f"지원하지 않는 피처 세트입니다: {ver}. 가능한 값: {FEATURE_SETS}")
 
