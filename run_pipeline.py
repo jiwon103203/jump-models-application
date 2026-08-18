@@ -26,7 +26,7 @@ from backtest import (DEFAULT_COST_BPS, delay_robustness_table, format_performan
 from data_io import (RF_UNITS, TRADING_DAYS, join_extra_table, load_extra_table,
                      load_market_data, normalize_header)
 from features import FEATURE_SETS, build_extra_features, build_features, parse_extra_spec
-from rolling import run_rolling_jm
+from rolling import MODELS, run_rolling_jm
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--extra-date-col", default=None, help="커스텀 변수 파일의 날짜 열 이름")
 
     group = parser.add_argument_group("모델 & 재추정")
+    group.add_argument("--model", default="jm", choices=MODELS,
+                       help="jm: 논문의 원본(이산) 점프 모델 / sjm: 피처 선택이 있는 sparse 점프 모델. "
+                            "커스텀 변수로 피처를 늘렸을 때 sjm이 노이즈 피처를 걸러 줍니다")
+    group.add_argument("--max-feats", type=float, default=None,
+                       help="sjm 전용. 남길 유효 피처 개수(kappa^2). 미지정 시 피처 개수의 절반")
     group.add_argument("--jump-penalty", type=float, default=50., help="점프 페널티 lambda")
     group.add_argument("--window", type=int, default=3000, help="학습창 길이 (거래일)")
     group.add_argument("--min-window", type=int, default=500,
@@ -201,6 +206,8 @@ def run_pipeline(input_path: str,
                  extra_file: str = None,
                  extra_sheet=None,
                  extra_date_col: str = None,
+                 model: str = "jm",
+                 max_feats: float = None,
                  jump_penalty: float = 50.,
                  window: int = 3000,
                  min_window: int = 500,
@@ -276,7 +283,7 @@ def run_pipeline(input_path: str,
     result = run_rolling_jm(X, data.excess_ret, jump_penalty=jump_penalty, window=window,
                             min_window=min_window, n_components=n_components, clip_mul=clip_mul,
                             n_init=n_init, random_state=random_state, start_date=refit_start,
-                            verbose=verbose)
+                            model=model, max_feats=max_feats, verbose=verbose)
 
     # 4) 0/1 strategy backtest on the online inferred signal
     strategy = run_0_1_strategy(result.regimes.regime, data.ret, data.rf,
@@ -285,7 +292,8 @@ def run_pipeline(input_path: str,
 
     # 5) optional HMM benchmark over the same period
     hmm_result = hmm_strategy = hmm_summary = None
-    performance = performance_table(strategy, trading_days=trading_days)
+    model_label = f"{result.model.upper()} 0/1"
+    performance = performance_table(strategy, trading_days=trading_days, label=model_label)
     if hmm:
         from hmm_benchmark import run_rolling_hmm
         hmm_result = run_rolling_hmm(data.ret, window=hmm_window or window, min_window=min_window,
@@ -302,17 +310,17 @@ def run_pipeline(input_path: str,
         jm_aligned = strategy
         if len(common) < len(strategy):
             warnings.warn(
-                f"JM({strategy.index[0]}~)과 HMM({hmm_result.regimes.index[0]}~)의 추론 구간이 달라 "
+                f"{result.model.upper()}({strategy.index[0]}~)과 HMM({hmm_result.regimes.index[0]}~)의 추론 구간이 달라 "
                 f"공통 구간 {common[0]} ~ {common[-1]}에서 성과를 비교합니다.")
             jm_aligned = run_0_1_strategy(result.regimes.regime.reindex(common), data.ret, data.rf,
                                           delay=delay, cost_bps=cost_bps, bull_state=0)
-        performance = performance_table(jm_aligned, trading_days=trading_days,
+        performance = performance_table(jm_aligned, trading_days=trading_days, label=model_label,
                                         others={"HMM 0/1": hmm_strategy})
 
     # 6) trading delay robustness (Table 5 of the article)
     robustness_table, delay_list = None, parse_delays(delays)
     if robustness:
-        regime_dict = {"JM": result.regimes.regime}
+        regime_dict = {result.model.upper(): result.regimes.regime}
         if hmm_result is not None:
             regime_dict["HMM"] = hmm_result.regimes.regime
         robustness_table = delay_robustness_table(regime_dict, data.ret, data.rf,
@@ -332,6 +340,8 @@ def run_pipeline(input_path: str,
         outputs += [("hmm_regimes.csv", hmm_result.regimes),
                     ("hmm_refit_params.csv", hmm_result.params.set_index("refit_date")),
                     ("hmm_strategy.csv", hmm_strategy)]
+    if result.feat_weights is not None:
+        outputs.append(("feat_weights.csv", result.feat_weights))
     if robustness_table is not None:
         outputs.append(("delay_robustness.csv", robustness_table))
     if save_features:
@@ -342,23 +352,36 @@ def run_pipeline(input_path: str,
         written.append(path)
 
     if plot:
-        from plotting import plot_refit_params, plot_regimes_and_cumret, plot_weights, setup_font
+        from plotting import (plot_feat_weights, plot_refit_params, plot_regimes_and_cumret,
+                              plot_weights, setup_font)
         if plot_font:
             setup_font(plot_font)
-        title = (f"JM 0/1 strategy (lambda={jump_penalty:g}, window={result.window}, "
+        name = result.model.upper()
+        title = (f"{name} 0/1 strategy (lambda={jump_penalty:g}, window={result.window}, "
                  f"delay={delay}, cost={cost_bps:g}bp)")
         extra_curves = {"HMM 0/1 strategy": hmm_strategy["jm"]} if hmm_strategy is not None else None
         written.append(plot_regimes_and_cumret(strategy, os.path.join(outdir, "regimes_cumret.png"),
-                                               title=title, extra_returns=extra_curves))
+                                               title=title, label=f"{name} 0/1 strategy",
+                                               extra_returns=extra_curves))
         written.append(plot_refit_params(result.params, result.feature_names,
-                                         os.path.join(outdir, "refit_params.png")))
+                                         os.path.join(outdir, "refit_params.png"),
+                                         title=f"Estimated centroids by regime from the rolling {name} fit"))
         written.append(plot_weights(strategy, os.path.join(outdir, "weights.png")))
+        if result.feat_weights is not None:
+            written.append(plot_feat_weights(result.feat_weights,
+                                             os.path.join(outdir, "feat_weights.png")))
 
     if verbose:
         print("\n" + "=" * 72)
         print(f"온라인 레짐 구간: {summary['start']} ~ {summary['end']} ({summary['n_days']}거래일)")
-        print(f"JM  bear 레짐 비중: {summary['bear_share']:.1%}, "
+        print(f"{result.model.upper():<3} bear 레짐 비중: {summary['bear_share']:.1%}, "
               f"레짐 전환 {summary['n_shifts']}회 (연 {summary['shifts_per_year']:.2f}회)")
+        if result.feat_weights is not None:
+            mean_weights = result.feat_weights.mean().sort_values(ascending=False)
+            kept = (result.feat_weights > 0).mean()
+            print("피처 가중(재추정 평균) / 선택된 비율:")
+            for feat, weight in mean_weights.items():
+                print(f"  {feat:<24} {weight:.3f}   {kept[feat]:.0%}")
         if hmm_summary is not None:
             print(f"HMM 고변동성 비중: {hmm_summary['bear_share']:.1%}, "
                   f"레짐 전환 {hmm_summary['n_shifts']}회 (연 {hmm_summary['shifts_per_year']:.2f}회)")
@@ -391,6 +414,7 @@ def main(argv=None) -> int:
                  feature_set=args.feature_set, log_dd=args.log_dd, warmup=args.warmup,
                  extra_features=args.extra_feature, extra_file=args.extra_file,
                  extra_sheet=args.extra_sheet, extra_date_col=args.extra_date_col,
+                 model=args.model, max_feats=args.max_feats,
                  jump_penalty=args.jump_penalty, window=args.window, min_window=args.min_window,
                  n_components=args.n_components, clip_mul=args.clip_mul, n_init=args.n_init,
                  random_state=args.random_state, refit_start=args.refit_start,
