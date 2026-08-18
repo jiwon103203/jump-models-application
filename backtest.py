@@ -155,29 +155,42 @@ def performance_metrics(ret: pd.Series,
     return metrics
 
 
-def performance_table(strategy_df: pd.DataFrame, trading_days: int = TRADING_DAYS) -> pd.DataFrame:
+def performance_table(strategy_df: pd.DataFrame,
+                     trading_days: int = TRADING_DAYS,
+                     others: dict = None,
+                     label: str = "JM 0/1") -> pd.DataFrame:
     """
     Build the buy-and-hold versus 0/1 strategy comparison table.
 
     Parameters
     ----------
     strategy_df : pd.DataFrame
-        The output of `run_0_1_strategy`.
+        The output of `run_0_1_strategy` for the main strategy.
 
     trading_days : int, optional (default=252)
         Trading days per year used for annualization.
 
+    others : dict of {str: pd.DataFrame}, optional
+        Further strategies to add as columns, e.g. `{"HMM 0/1": hmm_strategy_df}`. Each is
+        evaluated over its own period, which the caller is expected to have aligned.
+
+    label : str, optional (default="JM 0/1")
+        The column name of the main strategy.
+
     Returns
     -------
     pd.DataFrame
-        Metrics in rows, strategies in columns ("B & H" and "JM 0/1").
+        Metrics in rows, strategies in columns.
     """
     rf = strategy_df["rf"]
     table = {
         "B & H": performance_metrics(strategy_df["bh"], rf, weight=None, trading_days=trading_days),
-        "JM 0/1": performance_metrics(strategy_df["jm"], rf, weight=strategy_df["weight"],
-                                      trading_days=trading_days),
+        label: performance_metrics(strategy_df["jm"], rf, weight=strategy_df["weight"],
+                                   trading_days=trading_days),
     }
+    for name, other in (others or {}).items():
+        table[name] = performance_metrics(other["jm"], other["rf"], weight=other["weight"],
+                                          trading_days=trading_days)
     return pd.DataFrame(table)
 
 
@@ -218,3 +231,77 @@ def regime_summary(regime_ser: pd.Series, bear_state: int = 1) -> dict:
         "n_shifts": n_shifts,
         "shifts_per_year": n_shifts / n_years if n_years > 0 else np.nan,
     }
+
+
+def delay_robustness_table(regimes: dict,
+                           ret_ser: pd.Series,
+                           rf_ser: pd.Series,
+                           delays=(1, 5, 10),
+                           cost_bps: float = DEFAULT_COST_BPS,
+                           metrics=("Return", "Sharpe", "Calmar"),
+                           trading_days: int = TRADING_DAYS,
+                           bull_state: int = 0) -> pd.DataFrame:
+    """
+    Build the trading delay robustness table of Table 5 of the article.
+
+    Each regime sequence is traded under several delays, so that the decay of performance
+    with a slower implementation becomes visible; the buy-and-hold benchmark, which never
+    trades, is reported once.
+
+    Parameters
+    ----------
+    regimes : dict of {str: pd.Series}
+        The regime sequences to compare, e.g. `{"JM": jm_regimes, "HMM": hmm_regimes}`.
+
+    ret_ser : pd.Series
+        The total return series of the risky asset.
+
+    rf_ser : pd.Series
+        The daily risk-free rate.
+
+    delays : iterable of int, optional (default=(1, 5, 10))
+        The trading delays, in days. The signal of day `t` is applied from `t + delay + 1`.
+
+    cost_bps : float, optional (default=10.)
+        One-way transaction cost in basis points.
+
+    metrics : iterable of str, optional (default=("Return", "Sharpe", "Calmar"))
+        The rows of the table, taken from the keys of `performance_metrics`.
+
+    trading_days : int, optional (default=252)
+        Trading days per year used for annualization.
+
+    bull_state : int, optional (default=0)
+        The state held with a 100% weight in the risky asset.
+
+    Returns
+    -------
+    pd.DataFrame
+        Metrics in rows; columns are a MultiIndex of (model, delay), starting with the
+        buy-and-hold column. All models are evaluated over the common period covered by
+        every regime sequence.
+    """
+    if not regimes:
+        raise ValueError("비교할 레짐 시퀀스가 없습니다.")
+    # a common evaluation period, so that the columns are comparable
+    index = None
+    for regime_ser in regimes.values():
+        index = regime_ser.index if index is None else index.intersection(regime_ser.index)
+    if len(index) == 0:
+        raise ValueError("모델들이 공통으로 덮는 기간이 없습니다.")
+
+    columns, data = [], []
+    bh_ret, bh_rf = ret_ser.reindex(index), rf_ser.reindex(index)
+    if bh_ret.isna().any() or bh_rf.isna().any():
+        raise ValueError("수익률 또는 무위험금리에 비교 구간을 덮지 못하는 결측이 있습니다.")
+    columns.append(("B & H", ""))
+    data.append(performance_metrics(bh_ret, bh_rf, weight=None, trading_days=trading_days))
+    for name, regime_ser in regimes.items():
+        for delay in delays:
+            strategy = run_0_1_strategy(regime_ser.reindex(index), ret_ser, rf_ser,
+                                        delay=delay, cost_bps=cost_bps, bull_state=bull_state)
+            columns.append((name, delay))
+            data.append(performance_metrics(strategy["jm"], strategy["rf"],
+                                            weight=strategy["weight"], trading_days=trading_days))
+    table = pd.DataFrame(data, index=pd.MultiIndex.from_tuples(columns, names=["model", "delay"])).T
+    return table.loc[[metric for metric in metrics if metric in table.index]]
