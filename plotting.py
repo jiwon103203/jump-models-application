@@ -7,14 +7,66 @@ publication settings require a local LaTeX installation.
 
 import os
 
+import warnings
+
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.ticker import FuncFormatter
 
 BULL_COLOR, BEAR_COLOR = "#2b8a3e", "#c92a2a"
+EXTRA_COLORS = ("#37b24d", "#7048e8", "#0ca678", "#e8590c")
+
+# Custom variables often carry Korean names, which the default font cannot render.
+KOREAN_FONT_CANDIDATES = ("Malgun Gothic", "AppleGothic", "NanumGothic", "NanumBarunGothic",
+                          "Noto Sans CJK KR", "Noto Sans KR", "Source Han Sans KR",
+                          "WenQuanYi Zen Hei", "Unifont")
+
+
+def setup_font(preferred: str = None) -> str:
+    """
+    Pick a font able to render Korean labels, and make it the default of the figures.
+
+    Parameters
+    ----------
+    preferred : str, optional
+        A font name to try before the built-in candidates.
+
+    Returns
+    -------
+    str or None
+        The name of the font in use, or None when no Korean-capable font was found.
+    """
+    global KOREAN_FONT
+    available = {font.name for font in fm.fontManager.ttflist}
+    for name in ([preferred] if preferred else []) + list(KOREAN_FONT_CANDIDATES):
+        if name in available:
+            plt.rcParams["font.family"] = "sans-serif"
+            plt.rcParams["font.sans-serif"] = [name] + list(plt.rcParams["font.sans-serif"])
+            plt.rcParams["axes.unicode_minus"] = False
+            KOREAN_FONT = name
+            return name
+    if preferred:
+        warnings.warn(f"요청한 폰트 '{preferred}'를 찾지 못했습니다. 설치된 폰트로 대체합니다.")
+    KOREAN_FONT = None
+    return None
+
+
+KOREAN_FONT = None
+setup_font()
+
+
+def _warn_missing_font(labels) -> None:
+    """Warn once when non-ASCII labels are plotted without a font that can render them."""
+    if KOREAN_FONT is not None:
+        return
+    if any(not str(label).isascii() for label in labels):
+        warnings.warn(
+            "한글을 표시할 수 있는 폰트를 찾지 못했습니다. 그림의 한글 라벨이 깨질 수 있습니다. "
+            "NanumGothic 등 한글 폰트를 설치하거나 --plot-font 로 폰트를 지정해 주세요.")
 
 
 def _percent_axis(ax: plt.Axes) -> None:
@@ -35,6 +87,8 @@ def _save(fig: plt.Figure, filepath: str) -> str:
 def plot_regimes_and_cumret(strategy_df: pd.DataFrame,
                             filepath: str,
                             title: str = "JM-guided 0/1 strategy",
+                            label: str = "JM 0/1 strategy",
+                            extra_returns: dict = None,
                             figsize=(16, 7)) -> str:
     """
     Plot the cumulative excess returns of the buy-and-hold and 0/1 strategies, with the
@@ -43,13 +97,21 @@ def plot_regimes_and_cumret(strategy_df: pd.DataFrame,
     Parameters
     ----------
     strategy_df : pd.DataFrame
-        The output of `backtest.run_0_1_strategy`.
+        The output of `backtest.run_0_1_strategy` for the main strategy, whose weights
+        drive the shading.
 
     filepath : str
         Where to save the figure.
 
     title : str, optional
         The figure title.
+
+    label : str, optional
+        The legend entry of the main strategy.
+
+    extra_returns : dict of {str: pd.Series}, optional
+        Further total return series to draw, e.g. the HMM benchmark strategy. They are
+        aligned on the index of `strategy_df`.
 
     figsize : tuple, optional
         The figure size, in inches.
@@ -62,8 +124,11 @@ def plot_regimes_and_cumret(strategy_df: pd.DataFrame,
     dates = pd.to_datetime(pd.Index(strategy_df.index))
     rf = strategy_df["rf"]
     fig, ax = plt.subplots(figsize=figsize)
-    for col, label, color in (("bh", "Buy & hold", "#1c7ed6"), ("jm", "JM 0/1 strategy", "#f08c00")):
-        ax.plot(dates, (strategy_df[col] - rf).cumsum(), label=label, color=color, lw=1.4)
+    for col, curve_label, color in (("bh", "Buy & hold", "#1c7ed6"), ("jm", label, "#f08c00")):
+        ax.plot(dates, (strategy_df[col] - rf).cumsum(), label=curve_label, color=color, lw=1.4)
+    for (curve_label, ret), color in zip((extra_returns or {}).items(), EXTRA_COLORS):
+        ax.plot(dates, (ret.reindex(strategy_df.index) - rf).cumsum(), label=curve_label,
+                color=color, lw=1.2, alpha=.9)
 
     # shade the days actually held in the risk-free asset (signal + trading delay applied)
     in_cash = (strategy_df["weight"] < .5).to_numpy()
@@ -145,6 +210,7 @@ def plot_refit_params(params: pd.DataFrame,
     str
         The path of the saved figure.
     """
+    _warn_missing_font(feature_names)
     n_feat = len(feature_names)
     fig, axes = plt.subplots(n_feat, 1, figsize=(figsize[0], figsize[1] * n_feat), sharex=True)
     axes = np.atleast_1d(axes)
