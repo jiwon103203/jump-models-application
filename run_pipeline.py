@@ -50,7 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     group = parser.add_argument_group("피처")
     group.add_argument("--feature-set", default="paper", choices=FEATURE_SETS,
-                       help="paper: 논문 Table 2의 3개 피처 / example: 레포 예제의 9개 피처")
+                       help="paper: 논문 Table 2의 3개 피처 / example: 레포 예제의 9개 피처 / "
+                            "extra: example 9개 + 수익률·변동성 파생 25개 = 34개 (--model sjm 권장)")
     group.add_argument("--log-dd", action="store_true",
                        help="paper 피처 세트에서 downside deviation을 로그 변환")
     group.add_argument("--warmup", type=int, default=252, help="EWM 워밍업으로 버릴 초기 행 수")

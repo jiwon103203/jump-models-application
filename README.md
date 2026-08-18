@@ -3,7 +3,7 @@
 csv/엑셀 파일 하나(날짜·종가·무위험금리)를 넣으면 논문 [Shu, Yu and Mulvey (2024), *Downside Risk Reduction Using Regime-Switching Signals: A Statistical Jump Model Approach*](https://doi.org/10.1057/s41260-024-00376-x)의 절차대로
 
 1. 초과수익률 계산 →
-2. 지수가중이동(EWM) downside deviation·Sortino ratio 피처 생성 (+ 원하면 **사용자 커스텀 변수** 추가) →
+2. 지수가중이동(EWM) downside deviation·Sortino ratio 피처 생성 (+ 원하면 **확장 피처 세트**나 **사용자 커스텀 변수** 추가) →
 3. **6개월마다(1월·7월 첫 영업일) 3000거래일 학습창으로 점프 모델 재추정** + 재추정 사이 구간은 온라인 추론 →
 4. 0/1 전략 백테스트(거래비용·거래지연 반영, **현금 비중 제한**과 **매수/매도 거래비용 분리** 지원) + **거래 지연 로버스트니스 표(논문 Table 5)** →
 5. 선택적으로 **HMM 벤치마크(논문 §3.3)** 와 성과 비교
@@ -72,10 +72,10 @@ res["performance"]         # 전략 성과표
 
 | 옵션 | 기본값 | 설명 |
 |---|---|---|
-| `--feature-set` | `paper` | `paper`: 논문 Table 2의 3개 피처(DD hl=10, Sortino hl=20·60). `example`: 저장소 나스닥 예제의 9개 피처(hl 5·20·60 × 수익률·log DD·Sortino) |
+| `--feature-set` | `paper` | `paper`: 논문 Table 2의 3개 피처(DD hl=10, Sortino hl=20·60). `example`: 저장소 나스닥 예제의 9개 피처(hl 5·20·60 × 수익률·log DD·Sortino). `extra`: `example` 9개 + 수익률·변동성 파생 25개 = 34개 (3-1 참고) |
 | `--log-dd` | 꺼짐 | `paper` 피처의 downside deviation을 로그 변환 |
 | `--warmup` | 252 | EWM 초기 불안정 구간으로 버릴 행 수 |
-| `--model` | `jm` | `jm`: 논문의 원본(이산) 점프 모델 / `sjm`: 피처 선택이 있는 sparse 점프 모델 (3-4 참고) |
+| `--model` | `jm` | `jm`: 논문의 원본(이산) 점프 모델 / `sjm`: 피처 선택이 있는 sparse 점프 모델 (3-5 참고) |
 | `--max-feats` | 피처 수의 절반 | `sjm` 전용. 남길 유효 피처 개수 κ² |
 | `--jump-penalty` | 50.0 | 점프 페널티 λ. 클수록 레짐이 덜 바뀝니다(논문 Table 3) |
 | `--window` | 3000 | 학습창 길이(거래일). 논문 기준 약 12년 |
@@ -83,9 +83,9 @@ res["performance"]         # 전략 성과표
 | `--refit-start` | 없음 | 이 날짜 이후의 재추정 시점만 사용(학습창이 짧은 초기 구간을 버리고 싶을 때) |
 | `--delay` | 1 | 거래 지연. t일 신호는 t+delay+1일부터 적용(논문 §3.1) |
 | `--cost-bps` | 10 | 편도 거래비용(bp). 아래 매수/매도 옵션을 주지 않은 쪽에 적용 |
-| `--buy-cost-bps` | `--cost-bps` | 매수 거래비용(bp) (3-2 참고) |
+| `--buy-cost-bps` | `--cost-bps` | 매수 거래비용(bp) (3-3 참고) |
 | `--sell-cost-bps` | `--cost-bps` | 매도 거래비용(bp). 증권거래세처럼 매도가 더 비쌀 때 지정 |
-| `--max-cash` | 1.0 | bear 레짐에서 허용하는 최대 현금 비중(0~1) (3-2 참고) |
+| `--max-cash` | 1.0 | bear 레짐에서 허용하는 최대 현금 비중(0~1) (3-3 참고) |
 | `--min-cash` | 0.0 | bull 레짐에서도 항상 유지할 최소 현금 비중(0~1) |
 | `--start-date` / `--end-date` | 없음 | 분석 기간 필터 |
 | `--n-init` | 10 | 좌표하강 재시작 횟수. 줄이면 빨라지고 해의 안정성은 떨어집니다 |
@@ -93,7 +93,41 @@ res["performance"]         # 전략 성과표
 | `--no-plot`, `--save-features`, `--quiet` | | 출력 제어 |
 | `--plot-font` | 자동 | 그림 폰트. 한글 라벨이 깨질 때 지정 (예: `NanumGothic`) |
 
-### 3-1. 커스텀 변수 (`--extra-feature`, `--extra-file`)
+### 3-1. 확장 피처 세트 (`--feature-set extra`)
+
+`example`의 9개 피처에, 수익률과 변동성에서 흔히 쓰는 파생 변수 25개를 더한 **34개 피처** 세트입니다. 수익률 시계열 하나만으로 만들 수 있는 통계를 폭넓게 깔아 두고 모델이 고르게 하는 용도이므로, **`--model sjm`과 함께 쓰는 것을 권장합니다.**
+
+```bash
+python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm
+```
+
+`example`의 9개(`ret_5/20/60`, `DD-log_5/20/60`, `sortino_5/20/60`)는 그대로 두고 아래가 추가됩니다.
+
+| 피처 | 개수 | 계산 |
+|---|---|---|
+| `ret-simple` | 1 | 당일 (초과)수익률 `r_t` |
+| `ret-log` | 1 | 로그수익률 `log(1 + r_t)` |
+| `ret-abs` | 1 | 절대수익률 `\|r_t\|` |
+| `ret-sq` | 1 | 제곱수익률 `r_t²` |
+| `ret-cumlog` | 1 | 시작 시점부터의 누적 로그수익률 |
+| `std_5/20/60` | 3 | 5·20·60일 롤링 표준편차 |
+| `var_5/20/60` | 3 | 5·20·60일 롤링 분산 (= `std²`) |
+| `mad_5/20/60` | 3 | 5·20·60일 롤링 평균절대수익률 |
+| `rms_5/20/60` | 3 | 5·20·60일 롤링 RMS 수익률 |
+| `vol-log_5/20/60` | 3 | 반감기 5·20·60일 EWMA 변동성(로그 스케일) |
+| `vol-chg_5/20/60` | 3 | 위 변동성의 자기 horizon(5·20·60일) 대비 변화 |
+| `vol-ratio_5-20`, `vol-ratio_20-60` | 2 | 단기/장기 변동성 비율 (로그 스케일이므로 차이가 곧 비율) |
+
+- **Rolling Return은 넣지 않았습니다.** `example`의 `ret_5/20/60`(EWM 평균 수익률)이 이미 "과거 구간의 평균 수익률"이라 가중 방식만 다른 같은 통계이기 때문입니다. 단순 창(window) 방식의 누적수익률이 따로 필요하면 `features.extra_features`에 한 줄 추가하면 됩니다.
+- 변동성은 `example`의 `DD-log`와 마찬가지로 **로그 스케일**을 씁니다. 양수·우측 꼬리 분포라 로그가 다루기 좋고, 로그의 차이가 곧 변화율·비율이 되어 `vol-chg`·`vol-ratio`가 자연스럽게 정의됩니다.
+- `DD-log`가 하방 변동성만 보는 데 반해 `vol-log`는 양방향 변동성이라, 둘을 같이 쓰면 "하락"과 "변동성 확대"를 구분하는 데 도움이 됩니다.
+- `std`와 `var`는 서로 제곱 관계라 정보가 같습니다. 요청하신 목록을 그대로 반영해 둘 다 넣었고, `sjm`을 쓰면 보통 한쪽만 남습니다.
+- ⚠️ `ret-cumlog`는 **정상(stationary) 시계열이 아닙니다.** 표본 전체에 걸쳐 추세를 그리므로 군집 좌표로는 적절하지 않고, 학습창 밖 구간에서는 윈저라이징(±`--clip-mul`σ) 경계에 붙어 상수처럼 동작합니다. 요청 목록에 있어 포함했지만 `sjm`은 대개 이 열의 가중을 0으로 떨어뜨립니다.
+- 일반적으로 `ret-simple`·`ret-log`·`ret-sq`처럼 평활하지 않은 당일 값은 노이즈가 커서 `sjm`에서 먼저 탈락하고, 변동성 계열(`std`·`rms`·`vol-log`·`vol-ratio`)이 남는 경향이 있습니다. 어떤 변수가 실제로 선택됐는지는 `feat_weights.csv`·`feat_weights.png`와 실행 로그에서 확인하세요.
+- 모든 통계는 과거만 참조합니다(`test_extra_feature_set_is_causal`에서 검증).
+- 롤링 창 60일과 `vol-chg_60`의 60일 시차 때문에 앞부분이 잘려 나가므로, 기본 `--warmup 252`면 충분합니다.
+
+### 3-2. 커스텀 변수 (`--extra-feature`, `--extra-file`)
 
 수익률에서 파생된 기본 피처 외에 사용자 변수를 피처로 추가할 수 있습니다. 형식은 `열이름[:변환[:파라미터]]` 이고, 여러 번 지정하면 여러 피처가 됩니다.
 
@@ -124,7 +158,7 @@ python run_pipeline.py --input 내데이터.csv --extra-file 매크로.csv \
 - 커스텀 변수도 학습창마다 클리핑·표준화가 다시 적합되므로 단위가 달라도 그대로 넣으면 됩니다.
 - 파이썬에서는 `run_pipeline(..., extra_features=["VIX:ewm:20"], extra_file="매크로.csv")` 형태로 넘깁니다.
 
-### 3-2. 현금 비중 제한과 매수/매도 거래비용 (`--max-cash`, `--min-cash`, `--buy-cost-bps`, `--sell-cost-bps`)
+### 3-3. 현금 비중 제한과 매수/매도 거래비용 (`--max-cash`, `--min-cash`, `--buy-cost-bps`, `--sell-cost-bps`)
 
 논문의 0/1 전략은 bear 레짐에서 위험자산을 100% 팔고 bull 레짐에서 100% 담습니다. 실제 운용에서는 그렇게 극단적으로 움직이기 어렵고(위임 한도, 최소 투자비율), 매수와 매도의 비용도 대칭이 아닙니다. 두 옵션 묶음이 그 두 제약을 풀어 줍니다.
 
@@ -157,7 +191,7 @@ python run_pipeline.py --input 내데이터.xlsx \
     --max-cash 0.6 --min-cash 0.05 --buy-cost-bps 10 --sell-cost-bps 25
 ```
 
-### 3-3. HMM 벤치마크 (`--hmm`)
+### 3-4. HMM 벤치마크 (`--hmm`)
 
 논문 §3.3의 2-state 가우시안 HMM을 같은 기간·같은 0/1 전략으로 함께 돌려 비교합니다. `pip install hmmlearn`이 필요합니다.
 
@@ -177,9 +211,9 @@ python run_pipeline.py --input 내데이터.xlsx --hmm
 - 상태 구분은 논문과 같이 **조건부 변동성** 기준입니다(저변동성 = 0 = 위험자산 보유).
 - 상태 추론(Viterbi)은 매일 수행되고, 재추정 주기만 옵션입니다. 3000일 창 EM 적합 1회가 약 0.8초라 매일 재추정하면 30년 데이터에서 몇 시간이 걸립니다. 기본값 21(월 1회)로 36년 데이터가 약 7분입니다.
 
-### 3-4. Sparse JM (`--model sjm`)
+### 3-5. Sparse JM (`--model sjm`)
 
-논문이 쓰는 모델은 **원본(이산) JM** 입니다(`JumpModel(cont=False)`). 피처가 3개뿐이라 피처 선택의 실익이 없기 때문인데, 논문도 "확장된 피처 세트를 쓸 경우 sparse JM이 유용할 수 있다"고 언급합니다. 커스텀 변수로 피처를 늘렸다면 `--model sjm`으로 Nystrup et al. (2021)의 sparse JM을 쓸 수 있습니다.
+논문이 쓰는 모델은 **원본(이산) JM** 입니다(`JumpModel(cont=False)`). 피처가 3개뿐이라 피처 선택의 실익이 없기 때문인데, 논문도 "확장된 피처 세트를 쓸 경우 sparse JM이 유용할 수 있다"고 언급합니다. `--feature-set extra`나 커스텀 변수로 피처를 늘렸다면 `--model sjm`으로 Nystrup et al. (2021)의 sparse JM을 쓸 수 있습니다.
 
 ```bash
 # 예제 9피처 + 커스텀 2개 = 11피처를 sparse JM으로

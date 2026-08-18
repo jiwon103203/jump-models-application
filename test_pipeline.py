@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from backtest import (build_weights, delay_robustness_table, resolve_cash_limits,
                       resolve_cost_bps, run_0_1_strategy)
-from features import apply_transform, build_extra_features, parse_extra_spec
+from features import (EXAMPLE_HLS, EXTRA_WINDOWS, apply_transform, build_extra_features,
+                      feature_engineer, parse_extra_spec)
 from hmm_benchmark import smooth_states
 from rolling import (init_model, refit_schedule, resolve_max_feats, run_rolling_jm,
                      semiannual_anchors)
@@ -39,6 +40,49 @@ def test_transforms_are_causal():
     full = apply_transform(LEVELS, "ewm", 3)
     prefix = apply_transform(LEVELS.iloc[:6], "ewm", 3)
     assert np.allclose(full.iloc[:6], prefix)
+
+
+def test_extra_feature_set():
+    """The "extra" set extends the "example" one without dropping or renaming its columns."""
+    ret = pd.Series(np.linspace(-.02, .02, 400), index=pd.bdate_range("2020-01-01", periods=400).date)
+    example = feature_engineer(ret, ver="example")
+    extra = feature_engineer(ret, ver="extra")
+    assert list(extra.columns)[:len(example.columns)] == list(example.columns)
+    assert extra[example.columns].equals(example)
+    added = [col for col in extra.columns if col not in example.columns]
+    assert len(added) == 25 and len(extra.columns) == 34, (len(added), len(extra.columns))
+    # every statistic of the list the set was built from is present
+    for name in ("ret-simple", "ret-log", "ret-abs", "ret-sq", "ret-cumlog"):
+        assert name in added, name
+    for window in EXTRA_WINDOWS:
+        for stat in ("std", "var", "mad", "rms"):
+            assert f"{stat}_{window:d}" in added, f"{stat}_{window:d}"
+    for hl in EXAMPLE_HLS:
+        assert f"vol-log_{hl:.0f}" in added and f"vol-chg_{hl:.0f}" in added, hl
+    assert "vol-ratio_5-20" in added and "vol-ratio_20-60" in added
+
+    # the definitions that are easy to get wrong
+    assert np.allclose(extra["ret-simple"], ret)
+    assert np.allclose(extra["ret-cumlog"], np.log1p(ret).cumsum())
+    assert np.allclose(extra["var_20"], extra["std_20"] ** 2, equal_nan=True)
+    assert np.allclose(extra["vol-ratio_5-20"], extra["vol-log_5"] - extra["vol-log_20"])
+    assert np.allclose(extra["vol-chg_20"], extra["vol-log_20"].diff(20), equal_nan=True)
+
+    try:
+        feature_engineer(ret, ver="없는세트")
+        raise AssertionError("알 수 없는 피처 세트는 NotImplementedError를 내야 합니다.")
+    except NotImplementedError:
+        pass
+
+
+def test_extra_feature_set_is_causal():
+    """No "extra" feature may let a later observation change an earlier value."""
+    rng = np.random.default_rng(0)
+    dates = pd.bdate_range("2015-01-01", periods=600).date
+    ret = pd.Series(rng.normal(.0003, .011, 600), index=dates)
+    full = feature_engineer(ret, ver="extra")
+    for cut in (200, 450):
+        assert full.iloc[:cut].equals(feature_engineer(ret.iloc[:cut], ver="extra")), cut
 
 
 def test_extra_feature_specs():
