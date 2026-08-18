@@ -24,10 +24,97 @@ except ImportError:  # a source checkout that has not been pip-installed
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     from jumpmodels.jump import JumpModel
 from jumpmodels.preprocess import DataClipperStd, StandardScalerPD
+from jumpmodels.sparse_jump import SparseJumpModel
+from jumpmodels.utils import weighted_mean_cluster
 
 TRADING_DAYS = 252
 REFIT_MONTHS = (1, 7)          # January and July, i.e. a semiannual refit
 MAX_ANCHOR_GAP_DAYS = 45       # tolerance between the 1st of the month and the first trading day
+MODELS = ("jm", "sjm")         # the original discrete JM, and the sparse JM with feature selection
+
+
+def resolve_max_feats(max_feats, n_features: int) -> float:
+    """
+    Validate the `max_feats` parameter of the sparse jump model, or pick a default.
+
+    `max_feats` is the square of kappa in Nystrup et al. (2021) and roughly represents the
+    effective number of features kept by the Lasso-like constraint on the feature weights.
+
+    Parameters
+    ----------
+    max_feats : float or None
+        The requested value. When None, half of the features is used.
+
+    n_features : int
+        The number of features in the feature matrix.
+
+    Returns
+    -------
+    float
+        The value to pass to `SparseJumpModel`.
+    """
+    if max_feats is None:
+        return max(2., n_features / 2.)
+    max_feats = float(max_feats)
+    if max_feats < 1.:
+        raise ValueError(f"max_feats는 1 이상이어야 합니다. 입력값: {max_feats}")
+    if max_feats > n_features:
+        warnings.warn(
+            f"max_feats({max_feats:g})가 피처 개수({n_features})보다 커서 {n_features}로 줄입니다. "
+            f"이 경우 모든 피처가 동일 가중을 받아 원래 JM과 같아집니다.")
+        return float(n_features)
+    return max_feats
+
+
+def init_model(model: str = "jm",
+               n_components: int = 2,
+               jump_penalty: float = 50.,
+               n_init: int = 10,
+               random_state: int = 0,
+               max_feats: float = None,
+               n_features: int = None):
+    """
+    Build the model instance used at each re-estimation.
+
+    Parameters
+    ----------
+    model : str, optional (default="jm")
+        "jm" for the original discrete jump model of the article, or "sjm" for the sparse
+        jump model of Nystrup et al. (2021), which weighs and selects features.
+
+    n_components : int, optional (default=2)
+        The number of regimes.
+
+    jump_penalty : float, optional (default=50.)
+        The jump penalty. The sparse model rescales it internally by `1/sqrt(n_features)`,
+        so values of a similar magnitude work for both models.
+
+    n_init : int, optional (default=10)
+        The number of restarts of the coordinate descent algorithm.
+
+    random_state : int, optional (default=0)
+        The seed of the centroid initialization.
+
+    max_feats : float, optional
+        Sparse model only: the effective number of features to keep, see `resolve_max_feats`.
+
+    n_features : int, optional
+        The number of features, needed to resolve `max_feats`.
+
+    Returns
+    -------
+    JumpModel or SparseJumpModel
+        The unfitted model instance.
+    """
+    if model == "jm":
+        return JumpModel(n_components=n_components, jump_penalty=jump_penalty, cont=False,
+                         n_init=n_init, random_state=random_state)
+    if model == "sjm":
+        return SparseJumpModel(n_components=n_components,
+                               max_feats=resolve_max_feats(max_feats, n_features),
+                               jump_penalty=jump_penalty, cont=False,
+                               n_init_jm=n_init, random_state=random_state)
+    raise ValueError(f"지원하지 않는 모델입니다: {model}. 가능한 값: {MODELS}")
 
 
 def semiannual_anchors(index) -> list:
@@ -128,6 +215,13 @@ class RollingJMResult:
 
     window : int
         The intended training window length.
+
+    model : str
+        The model used, "jm" or "sjm".
+
+    feat_weights : pd.DataFrame or None
+        Sparse model only: the feature weights of every re-estimation, indexed by refit
+        date with one column per feature. A zero weight means the feature was dropped.
     """
     regimes: pd.DataFrame
     params: pd.DataFrame
@@ -135,6 +229,8 @@ class RollingJMResult:
     schedule: list = field(default_factory=list)
     feature_names: list = field(default_factory=list)
     window: int = 3000
+    model: str = "jm"
+    feat_weights: pd.DataFrame = None
 
 
 def run_rolling_jm(X: pd.DataFrame,
@@ -147,6 +243,8 @@ def run_rolling_jm(X: pd.DataFrame,
                    n_init: int = 10,
                    random_state: int = 0,
                    start_date=None,
+                   model: str = "jm",
+                   max_feats: float = None,
                    verbose: bool = True) -> RollingJMResult:
     """
     Re-estimate a jump model every six months and infer the regimes online in between.
@@ -190,17 +288,33 @@ def run_rolling_jm(X: pd.DataFrame,
     start_date : str or datetime.date, optional
         Ignore refit dates before this date.
 
+    model : str, optional (default="jm")
+        "jm" for the original discrete jump model, or "sjm" for the sparse jump model,
+        which weighs the features and drops the noisy ones. The sparse model is worth
+        using once the feature set grows beyond the three features of the article.
+
+    max_feats : float, optional
+        Sparse model only: the effective number of features to keep. Defaults to half of
+        the features, see `resolve_max_feats`.
+
     verbose : bool, optional (default=True)
         Whether to print the progress of the re-estimations.
 
     Returns
     -------
     RollingJMResult
-        The online inferred regimes, the estimated parameters of every refit, and the
-        in-sample regimes of the last training window.
+        The online inferred regimes, the estimated parameters of every refit, the in-sample
+        regimes of the last training window, and -- for the sparse model -- the feature
+        weights of every re-estimation.
     """
     if not isinstance(X, pd.DataFrame):
         raise TypeError("X는 pandas DataFrame이어야 합니다.")
+    if model not in MODELS:
+        raise ValueError(f"지원하지 않는 모델입니다: {model}. 가능한 값: {MODELS}")
+    if model == "sjm" and X.shape[1] <= 3:
+        warnings.warn(
+            f"피처가 {X.shape[1]}개뿐이라 sparse JM의 피처 선택 효과가 거의 없습니다. "
+            f"커스텀 변수를 추가하거나 --model jm 을 쓰는 편이 낫습니다.")
     ret_ser = ret_ser.reindex(X.index)
     if ret_ser.isna().any():
         raise ValueError("수익률 시리즈가 피처 행렬의 모든 날짜를 포함하지 않습니다.")
@@ -219,7 +333,7 @@ def run_rolling_jm(X: pd.DataFrame,
             f"(가장 짧은 창: {min(w for _, w in short)}거래일, 목표: {window}거래일).")
 
     proba_cols = [f"proba_{i}" for i in range(n_components)]
-    regime_parts, param_rows = [], []
+    regime_parts, param_rows, weight_rows = [], [], {}
     insample_last = None
     n_obs = len(X)
 
@@ -232,14 +346,15 @@ def run_rolling_jm(X: pd.DataFrame,
         clipper, scaler = DataClipperStd(mul=clip_mul), StandardScalerPD()
         X_train_processed = scaler.fit_transform(clipper.fit_transform(X_train))
 
-        jm = JumpModel(n_components=n_components, jump_penalty=jump_penalty, cont=False,
-                       n_init=n_init, random_state=random_state)
-        jm.fit(X_train_processed, ret_train, sort_by="cumret")
+        model_ins = init_model(model, n_components=n_components, jump_penalty=jump_penalty,
+                               n_init=n_init, random_state=random_state, max_feats=max_feats,
+                               n_features=X.shape[1])
+        model_ins.fit(X_train_processed, ret_train, sort_by="cumret")
 
         # online inference from this refit date until the next one
         seg_end = schedule[i + 1][1] if i + 1 < len(schedule) else n_obs
         X_context = X.iloc[pos - win:seg_end]      # lookback window + the segment itself
-        proba_online = jm.predict_proba_online(scaler.transform(clipper.transform(X_context)))
+        proba_online = model_ins.predict_proba_online(scaler.transform(clipper.transform(X_context)))
         proba_seg = proba_online.iloc[win:]        # drop the lookback rows
 
         seg = pd.DataFrame(np.asarray(proba_seg), index=proba_seg.index, columns=proba_cols)
@@ -247,9 +362,26 @@ def run_rolling_jm(X: pd.DataFrame,
         seg["refit_date"] = refit_date
         regime_parts.append(seg)
 
-        # parameters of this refit, with the centroids mapped back to the feature units
-        centers_orig = scaler.scaler.inverse_transform(jm.centers_)
-        labels_train = np.asarray(jm.labels_)
+        # parameters of this refit, with the centroids mapped back to the feature units.
+        # The sparse model stores its centroids in the weighted space, so they are recomputed
+        # on the unweighted features before being un-standardized.
+        if model == "sjm":
+            centers = weighted_mean_cluster(np.asarray(X_train_processed),
+                                            np.asarray(model_ins.proba_))
+            weight_rows[refit_date] = pd.Series(np.asarray(model_ins.feat_weights),
+                                                index=X.columns)
+        else:
+            centers = model_ins.centers_
+        centers_orig = scaler.scaler.inverse_transform(centers)
+        transmat = getattr(model_ins, "transmat_", None)
+        if transmat is None:        # the sparse model keeps it on its inner jump model
+            transmat = model_ins.jm_ins.transmat_
+        labels_train = np.asarray(model_ins.labels_)
+        missing = [k for k in range(n_components) if not (labels_train == k).any()]
+        if missing:
+            warnings.warn(
+                f"{refit_date} 재추정의 학습창에 상태 {missing}가 나타나지 않아 해당 파라미터가 "
+                f"NaN으로 기록됩니다. 학습창이 한 레짐만 덮고 있을 수 있습니다(--window 확인).")
         for k in range(n_components):
             row = {
                 "refit_date": refit_date,
@@ -259,9 +391,9 @@ def run_rolling_jm(X: pd.DataFrame,
                 "state": k,
                 "regime": "bull" if k == 0 else ("bear" if k == n_components - 1 else f"mid{k}"),
                 "freq": float((labels_train == k).mean()),
-                "ret_ann": float(jm.ret_[k] * TRADING_DAYS),
-                "vol_ann": float(jm.vol_[k] * np.sqrt(TRADING_DAYS)),
-                "stay_prob": float(jm.transmat_[k, k]),
+                "ret_ann": float(model_ins.ret_[k] * TRADING_DAYS),
+                "vol_ann": float(model_ins.vol_[k] * np.sqrt(TRADING_DAYS)),
+                "stay_prob": float(transmat[k, k]),
             }
             row.update({f"center_{col}": float(val) for col, val in zip(X.columns, centers_orig[k])})
             param_rows.append(row)
@@ -270,16 +402,27 @@ def run_rolling_jm(X: pd.DataFrame,
             insample_last = pd.Series(labels_train, index=X_train.index, name="insample_regime")
 
         if verbose:
+            selected = ""
+            if model == "sjm":
+                weights = weight_rows[refit_date]
+                kept = weights[weights > 0]
+                selected = f", 선택된 피처 {len(kept)}/{len(weights)}"
             print(f"[{i + 1}/{len(schedule)}] refit {refit_date}: "
                   f"학습창 {X_train.index[0]} ~ {X_train.index[-1]} ({win}일), "
                   f"온라인 추론 {seg.index[0]} ~ {seg.index[-1]} ({len(seg)}일), "
-                  f"bear 비중 {float((seg.regime == n_components - 1).mean()):.1%}")
+                  f"bear 비중 {float((seg.regime == n_components - 1).mean()):.1%}{selected}")
 
     regimes = pd.concat(regime_parts)
     regimes.index.name = "date"
+    feat_weights = None
+    if weight_rows:
+        feat_weights = pd.DataFrame(weight_rows).T
+        feat_weights.index.name = "refit_date"
     return RollingJMResult(regimes=regimes,
                            params=pd.DataFrame(param_rows),
                            insample_last=insample_last,
                            schedule=schedule,
                            feature_names=list(X.columns),
-                           window=window)
+                           window=window,
+                           model=model,
+                           feat_weights=feat_weights)
