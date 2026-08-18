@@ -259,3 +259,44 @@ def plot_weights(strategy_df: pd.DataFrame, filepath: str, figsize=(16, 3.)) -> 
     _percent_axis(ax)
     ax.grid(alpha=.25)
     return _save(fig, filepath)
+
+
+def plot_feat_weights(feat_weights: pd.DataFrame,
+                      filepath: str,
+                      title: str = "Feature weights of the sparse JM across re-estimations",
+                      figsize=(16, 6)) -> str:
+    """
+    Plot how the feature weights of the sparse jump model evolve across re-estimations.
+
+    A weight of zero means the Lasso-like constraint dropped that feature at that
+    re-estimation, so the figure shows which variables actually drive the regimes over time.
+
+    Parameters
+    ----------
+    feat_weights : pd.DataFrame
+        The `feat_weights` table of `rolling.RollingJMResult`, indexed by refit date with
+        one column per feature.
+
+    filepath : str
+        Where to save the figure.
+
+    title : str, optional
+        The figure title.
+
+    figsize : tuple, optional
+        The figure size, in inches.
+
+    Returns
+    -------
+    str
+        The path of the saved figure.
+    """
+    _warn_missing_font(feat_weights.columns)
+    dates = pd.to_datetime(pd.Index(feat_weights.index))
+    fig, ax = plt.subplots(figsize=figsize)
+    for column in feat_weights.columns:
+        ax.plot(dates, feat_weights[column], marker="o", ms=3, lw=1.3, label=column)
+    ax.set(title=title, ylabel="Feature weight", ylim=(-.02, None))
+    ax.grid(alpha=.25)
+    ax.legend(loc="upper left", ncol=2, fontsize="small")
+    return _save(fig, filepath)
