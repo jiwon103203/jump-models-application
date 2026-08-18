@@ -15,7 +15,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from backtest import build_weights, delay_robustness_table, run_0_1_strategy
+from backtest import (build_weights, delay_robustness_table, resolve_cash_limits,
+                      resolve_cost_bps, run_0_1_strategy)
 from features import apply_transform, build_extra_features, parse_extra_spec
 from hmm_benchmark import smooth_states
 from rolling import (init_model, refit_schedule, resolve_max_feats, run_rolling_jm,
@@ -73,7 +74,52 @@ def test_strategy_returns_and_costs():
     expected = (strategy.weight * RET + (1. - strategy.weight) * RF
                 - strategy.weight.diff().abs().fillna(0.) * 1e-3)
     assert np.allclose(strategy.jm, expected)
+    assert np.allclose(strategy.traded, strategy.bought + strategy.sold)
     assert strategy.traded.iloc[0] == 0.
+
+
+def test_cash_limits():
+    """The cash limits bound the weight on the risky asset in both regimes."""
+    assert resolve_cash_limits() == (1., 0.)                    # the pure 0/1 strategy
+    assert resolve_cash_limits(min_cash=.05, max_cash=.6) == (.95, .4)
+    for bad in ({"min_cash": -.1}, {"max_cash": 1.2}, {"min_cash": .6, "max_cash": .4}):
+        try:
+            resolve_cash_limits(**bad)
+            raise AssertionError(f"{bad}는 ValueError를 내야 합니다.")
+        except ValueError:
+            pass
+
+    weights = build_weights(REGIME, delay=1, min_cash=.1, max_cash=.7)
+    invested = np.where(REGIME == 0, .9, .3)
+    assert np.allclose(weights.iloc[2:], invested[:-2])
+    assert (weights.iloc[:2] == .9).all()                       # start at the bull weight
+    # a limited strategy is never fully in cash, and its returns stay between the extremes
+    limited = run_0_1_strategy(REGIME, RET, RF, delay=1, cost_bps=0., min_cash=.1, max_cash=.7)
+    assert limited.weight.between(.3, .9).all()
+    assert np.allclose(limited.jm, limited.weight * RET + (1. - limited.weight) * RF)
+
+
+def test_split_transaction_costs():
+    """Buys and sells are charged at their own rate, and default to the symmetric cost."""
+    assert resolve_cost_bps(10.) == (10., 10.)
+    assert resolve_cost_bps(10., sell_cost_bps=25.) == (10., 25.)
+    try:
+        resolve_cost_bps(10., buy_cost_bps=-1.)
+        raise AssertionError("음수 거래비용은 ValueError를 내야 합니다.")
+    except ValueError:
+        pass
+
+    strategy = run_0_1_strategy(REGIME, RET, RF, delay=1, buy_cost_bps=10., sell_cost_bps=25.)
+    change = strategy.weight.diff().fillna(0.)
+    assert np.allclose(strategy.bought, change.clip(lower=0.))
+    assert np.allclose(strategy.sold, (-change).clip(lower=0.))
+    assert np.allclose(strategy.cost, strategy.bought * 1e-3 + strategy.sold * 25e-4)
+    assert strategy.bought.iloc[0] == 0. and strategy.sold.iloc[0] == 0.
+    gross = strategy.weight * RET + (1. - strategy.weight) * RF
+    assert np.allclose(strategy.jm, gross - strategy.cost)
+    # the asymmetric cost is dearer than the symmetric one it extends
+    symmetric = run_0_1_strategy(REGIME, RET, RF, delay=1, cost_bps=10.)
+    assert strategy.cost.sum() > symmetric.cost.sum()
 
 
 def test_delay_robustness_table():
