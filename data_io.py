@@ -32,7 +32,7 @@ RF_ALIASES = ("무위험금리", "무위험수익률", "무위험이자율", "�
 RF_UNITS = ("annual_percent", "annual_decimal", "daily")
 
 
-def _normalize(name) -> str:
+def normalize_header(name) -> str:
     """Lowercase a column header and strip separators, for alias matching."""
     return "".join(str(name).split()).replace("_", "").replace("-", "").replace(".", "").lower()
 
@@ -46,15 +46,15 @@ def _find_col(columns, aliases: tuple, role: str, explicit: Optional[str] = None
             return explicit
         # allow a case/spacing-insensitive match on the explicit name as well
         for col in columns:
-            if _normalize(col) == _normalize(explicit):
+            if normalize_header(col) == normalize_header(explicit):
                 return col
         raise KeyError(f"열 '{explicit}' (역할: {role})을 찾을 수 없습니다. 파일의 열: {list(columns)}")
     for col in columns:
-        if _normalize(col) in aliases:
+        if normalize_header(col) in aliases:
             return col
     # fall back to a substring match, e.g. "종가(원)" or "risk free rate (%)"
     for col in columns:
-        norm = _normalize(col)
+        norm = normalize_header(col)
         if any(alias in norm for alias in aliases):
             return col
     raise KeyError(
@@ -141,7 +141,8 @@ def load_market_data(filepath: str,
                      rf_unit: str = "annual_percent",
                      trading_days: int = TRADING_DAYS,
                      start_date=None,
-                     end_date=None) -> pd.DataFrame:
+                     end_date=None,
+                     extra_cols=None) -> pd.DataFrame:
     """
     Load a csv/Excel file of date, close price and risk-free rate into a clean daily panel.
 
@@ -165,11 +166,16 @@ def load_market_data(filepath: str,
     start_date, end_date : str or datetime.date, optional
         Optional date filters applied after the returns are computed.
 
+    extra_cols : iterable of str, optional
+        Additional columns of the same file to carry along, e.g. custom variables such as
+        an implied volatility index or a credit spread. They are converted to floats and
+        forward-filled, and kept under their original names.
+
     Returns
     -------
     pd.DataFrame
         Indexed by `datetime.date`, with columns `close`, `rf` (daily risk-free rate),
-        `ret` (simple total return) and `excess_ret` (`ret` minus `rf`).
+        `ret` (simple total return), `excess_ret` (`ret` minus `rf`), and any `extra_cols`.
     """
     raw = load_raw_table(filepath, sheet=sheet)
     if raw.empty:
@@ -187,6 +193,11 @@ def load_market_data(filepath: str,
         "close": _to_numeric(raw[col_close], col_close),
         "rf_raw": _to_numeric(raw[col_rf], col_rf),
     })
+    extra_names = []
+    for name in (extra_cols or []):
+        col = _find_col(raw.columns, (), f"커스텀 변수 '{name}'", explicit=name)
+        df[name] = _to_numeric(raw[col], col)
+        extra_names.append(name)
 
     n_bad_date = int(df.date.isna().sum())
     if n_bad_date:
@@ -223,4 +234,84 @@ def load_market_data(filepath: str,
         df = df.loc[:pd.Timestamp(end_date).date()]
     if df.empty:
         raise ValueError("전처리 후 남은 데이터가 없습니다. 날짜 필터와 입력 파일을 확인해 주세요.")
-    return df[["close", "rf_raw", "rf", "ret", "excess_ret"]]
+    for name in extra_names:
+        n_missing = int(df[name].isna().sum())
+        if n_missing:
+            warnings.warn(f"커스텀 변수 '{name}'의 결측 {n_missing}개를 직전 값으로 채웁니다.")
+            df[name] = df[name].ffill()
+    return df[["close", "rf_raw", "rf", "ret", "excess_ret"] + extra_names]
+
+
+def load_extra_table(filepath: str,
+                     sheet=None,
+                     date_col: Optional[str] = None,
+                     columns=None) -> pd.DataFrame:
+    """
+    Load custom variables from a second file, indexed by date.
+
+    Parameters
+    ----------
+    filepath : str
+        Path of the csv/Excel file holding a date column and one or more variables.
+
+    sheet : str or int, optional
+        Excel sheet name/index.
+
+    date_col : str, optional
+        The date column name; detected from the headers when omitted.
+
+    columns : iterable of str, optional
+        The variables to keep. All non-date columns are kept when omitted.
+
+    Returns
+    -------
+    pd.DataFrame
+        Indexed by `datetime.date`, holding the requested variables as floats.
+    """
+    raw = load_raw_table(filepath, sheet=sheet)
+    if raw.empty:
+        raise ValueError(f"커스텀 변수 파일이 비어 있습니다: {filepath}")
+    col_date = _find_col(raw.columns, DATE_ALIASES, "날짜", date_col)
+    dates = pd.to_datetime(raw[col_date], errors="coerce")
+    if dates.isna().all():
+        raise ValueError(f"커스텀 변수 파일의 열 '{col_date}'을 날짜로 변환하지 못했습니다.")
+
+    keep = list(columns) if columns else [col for col in raw.columns if col != col_date]
+    out = pd.DataFrame({"date": dates})
+    for name in keep:
+        col = _find_col(raw.columns, (), f"커스텀 변수 '{name}'", explicit=name)
+        out[name] = _to_numeric(raw[col], col)
+    out = out.dropna(subset=["date"]).sort_values("date").drop_duplicates(subset="date", keep="last")
+    return out.set_index(out.date.dt.date.rename(None)).drop(columns="date")
+
+
+def join_extra_table(data: pd.DataFrame, extra: pd.DataFrame) -> pd.DataFrame:
+    """
+    Align custom variables from a second file onto the trading days of the main data.
+
+    Values are forward-filled, so a variable published at a lower frequency keeps its last
+    observed value; no future value is ever carried backwards.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        The output of `load_market_data`.
+
+    extra : pd.DataFrame
+        The output of `load_extra_table`.
+
+    Returns
+    -------
+    pd.DataFrame
+        `data` with the custom variables joined on its index.
+    """
+    overlap = [col for col in extra.columns if col in data.columns]
+    if overlap:
+        raise ValueError(f"커스텀 변수 파일의 열 이름이 기존 열과 겹칩니다: {overlap}")
+    aligned = extra.reindex(data.index.union(extra.index)).ffill().reindex(data.index)
+    n_missing = int(aligned.isna().any(axis=1).sum())
+    if n_missing:
+        warnings.warn(
+            f"커스텀 변수 파일이 덮지 못하는 날짜가 {n_missing}일 있습니다 "
+            f"(주로 데이터 시작 구간). 해당 행은 피처 생성 단계에서 제외됩니다.")
+    return data.join(aligned)
