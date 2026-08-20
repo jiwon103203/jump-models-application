@@ -16,15 +16,22 @@ Three feature sets are provided:
   over 5/20/60-day windows, and the EWMA volatility with its change over time and
   its ratio across horizons. 34 features in total; pair it with ``--model sjm``,
   which drops the ones that carry no regime information.
+
+Any subset of the resulting columns can be *pinned* so that the sparse jump model never
+drops it -- see `resolve_pinned_features` and `sparse_pin.PinnedSparseJumpModel`.
 """
 
 import re
+import warnings
 
 import numpy as np
 import pandas as pd
 
 FEATURE_SETS = ("paper", "example", "extra")
 TRANSFORMS = ("raw", "ewm", "diff", "pct", "log", "logdiff")
+# names that stand for a whole group of features when pinning: the three feature sets,
+# "custom" for the user-supplied variables and "all" for every column
+PIN_GROUPS = FEATURE_SETS + ("custom", "all")
 
 PAPER_DD_HL = 10.
 PAPER_SORTINO_HLS = (20., 60.)
@@ -244,6 +251,50 @@ def feature_engineer(ret_ser: pd.Series, ver: str = "paper", log_dd: bool = Fals
     raise NotImplementedError(f"지원하지 않는 피처 세트입니다: {ver}. 가능한 값: {FEATURE_SETS}")
 
 
+def feature_set_columns(ver: str = "paper", log_dd: bool = False) -> list:
+    """
+    List the columns `feature_engineer` produces for a feature set, without computing them.
+
+    Pinning a whole feature set by name needs its column names before -- or without -- the
+    features themselves; `test_feature_set_columns` checks this list against the real output
+    of `feature_engineer`, so the two cannot drift apart unnoticed.
+
+    Parameters
+    ----------
+    ver : str, optional (default="paper")
+        The feature set, one of `FEATURE_SETS`.
+
+    log_dd : bool, optional (default=False)
+        Whether the downside deviation of the "paper" set is log-transformed, which changes
+        its column name. Ignored by the other sets, which always use the log scale.
+
+    Returns
+    -------
+    list of str
+        The column names, in the order `feature_engineer` returns them.
+    """
+    if ver == "paper":
+        return ([f"DD{'-log' if log_dd else ''}_{PAPER_DD_HL:.0f}"]
+                + [f"sortino_{hl:.0f}" for hl in PAPER_SORTINO_HLS])
+
+    if ver in ("example", "extra"):
+        columns = []
+        for hl in EXAMPLE_HLS:
+            columns += [f"ret_{hl:.0f}", f"DD-log_{hl:.0f}", f"sortino_{hl:.0f}"]
+        if ver == "example":
+            return columns
+        columns += ["ret-simple", "ret-log", "ret-abs", "ret-sq", "ret-cumlog"]
+        for window in EXTRA_WINDOWS:
+            columns += [f"{stat}_{window:d}" for stat in ("std", "var", "mad", "rms")]
+        for hl in EXAMPLE_HLS:
+            columns += [f"vol-log_{hl:.0f}", f"vol-chg_{hl:.0f}"]
+        columns += [f"vol-ratio_{short_hl:.0f}-{long_hl:.0f}"
+                    for short_hl, long_hl in EXTRA_VOL_RATIO_PAIRS]
+        return columns
+
+    raise NotImplementedError(f"지원하지 않는 피처 세트입니다: {ver}. 가능한 값: {FEATURE_SETS}")
+
+
 ############################################
 ## User-supplied custom variables
 ############################################
@@ -417,3 +468,106 @@ def build_features(ret_ser: pd.Series,
         raise ValueError(
             f"피처 계산 후 남은 데이터가 없습니다. 입력 길이는 {len(ret_ser)}행, warmup은 {warmup}행입니다.")
     return X
+
+
+############################################
+## Pinned (always-kept) features
+############################################
+
+def _spec_column_name(spec: str):
+    """
+    Return the column a custom variable specification builds, or None when `spec` is not one.
+
+    It lets a variable be pinned under the same ``column[:transform[:param]]`` string it was
+    added with, rather than under the name `build_extra_features` derived from it.
+    """
+    try:
+        return _extra_feature_name(*parse_extra_spec(spec))
+    except ValueError:
+        return None
+
+
+def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = False) -> list:
+    """
+    Expand pin specifications into the feature columns they name.
+
+    The sparse jump model (`--model sjm`) re-selects its features at every re-estimation, so
+    a feature one considers essential can be dropped in some periods. Pinning names the
+    columns that must survive every selection; `sparse_pin.PinnedSparseJumpModel` then keeps
+    them in the model whatever their weight.
+
+    A specification is either
+
+    - a group name from `PIN_GROUPS`: a feature set name ("paper", "example", "extra") for
+      every column that set contributes, "custom" for the variables added through
+      `--extra-feature`/`--extra-file`, or "all" for every column;
+    - the exact name of a column of the feature matrix, e.g. ``"sortino_60"`` or ``"VIX_ewm20"``; or
+    - the specification a custom variable was added with, e.g. ``"VIX:ewm:20"``, which saves
+      having to know the column name `build_extra_features` derived from it.
+
+    Group names win over an identically named column, and columns a group asks for but the
+    feature matrix does not hold are skipped with a warning -- pinning "paper" while running
+    ``--feature-set example`` keeps the two Sortino ratios the two sets share, since the
+    downside deviation of the paper set uses a halflife the example set does not compute.
+
+    Parameters
+    ----------
+    columns : iterable of str
+        The columns of the feature matrix, in order.
+
+    specs : iterable of str, optional
+        The specifications to expand. None or empty gives an empty list.
+
+    ver : str, optional (default="paper")
+        The feature set the matrix was built with; it tells the return-based columns from
+        the custom variables.
+
+    log_dd : bool, optional (default=False)
+        Whether the "paper" downside deviation was log-transformed, see `feature_engineer`.
+
+    Returns
+    -------
+    list of str
+        The pinned columns, ordered as in `columns` and free of duplicates.
+    """
+    columns = [str(col) for col in columns]
+    known = set(columns)
+    base = set(feature_set_columns(ver, log_dd=log_dd))
+    pinned = set()
+
+    for spec in specs or ():
+        name = str(spec).strip()
+        if not name:
+            raise ValueError("고정할 피처 이름이 비어 있습니다.")
+        group = name.lower()
+
+        if group not in PIN_GROUPS:
+            column = name if name in known else _spec_column_name(name)
+            if column not in known:
+                raise KeyError(
+                    f"고정할 피처 '{name}'을 찾을 수 없습니다. 피처 이름, 커스텀 변수 지정"
+                    f"(예: 'VIX:ewm:20'), 또는 그룹 이름 {PIN_GROUPS} 중 하나여야 합니다. "
+                    f"사용 가능한 피처: {columns}")
+            pinned.add(column)
+            continue
+
+        if name in known:
+            warnings.warn(
+                f"'{name}'은 그룹 이름으로 해석했습니다. 같은 이름의 피처 한 개만 고정하려면 "
+                f"열 이름을 바꿔 주세요.")
+        if group == "all":
+            wanted = columns
+        elif group == "custom":
+            wanted = [col for col in columns if col not in base]
+            if not wanted:
+                warnings.warn("커스텀 변수가 없어 'custom' 고정 지정이 아무 피처도 선택하지 않았습니다.")
+        else:
+            wanted = feature_set_columns(group, log_dd=log_dd)
+            missing = [col for col in wanted if col not in known]
+            if missing:
+                warnings.warn(
+                    f"'{group}' 피처 세트의 {missing}는 현재 피처 행렬(--feature-set {ver})에 없어 "
+                    f"고정 대상에서 제외합니다.")
+        pinned.update(col for col in wanted if col in known)
+
+    return [col for col in columns if col in pinned]

@@ -9,6 +9,7 @@ Run directly (`python test_pipeline.py`) or through `pytest test_pipeline.py`.
 
 import os
 import sys
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -17,11 +18,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from backtest import (build_weights, delay_robustness_table, resolve_cash_limits,
                       resolve_cost_bps, run_0_1_strategy)
-from features import (EXAMPLE_HLS, EXTRA_WINDOWS, apply_transform, build_extra_features,
-                      feature_engineer, parse_extra_spec)
+from features import (EXAMPLE_HLS, EXTRA_WINDOWS, FEATURE_SETS, apply_transform,
+                      build_extra_features, feature_engineer, feature_set_columns,
+                      parse_extra_spec, resolve_pinned_features)
 from hmm_benchmark import smooth_states
 from rolling import (init_model, refit_schedule, resolve_max_feats, run_rolling_jm,
                      semiannual_anchors)
+from sparse_pin import PinnedSparseJumpModel, solve_lasso_pinned
 
 DATES = pd.date_range("2020-01-01", periods=12, freq="D").date
 LEVELS = pd.Series([10., 11, 12, 11, 10, 9, 10, 11, 12, 13, 12, 11], index=DATES, name="x")
@@ -83,6 +86,50 @@ def test_extra_feature_set_is_causal():
     full = feature_engineer(ret, ver="extra")
     for cut in (200, 450):
         assert full.iloc[:cut].equals(feature_engineer(ret.iloc[:cut], ver="extra")), cut
+
+
+def test_feature_set_columns():
+    """The advertised column names of each feature set are the ones actually produced."""
+    ret = pd.Series(np.linspace(-.02, .02, 400), index=pd.bdate_range("2020-01-01", periods=400).date)
+    for ver in FEATURE_SETS:
+        assert feature_set_columns(ver) == list(feature_engineer(ret, ver=ver).columns), ver
+    assert feature_set_columns("paper", log_dd=True) == \
+           list(feature_engineer(ret, ver="paper", log_dd=True).columns)
+    try:
+        feature_set_columns("없는세트")
+        raise AssertionError("알 수 없는 피처 세트는 NotImplementedError를 내야 합니다.")
+    except NotImplementedError:
+        pass
+
+
+def test_resolve_pinned_features():
+    """Pin specifications name feature sets, custom variables or individual columns."""
+    columns = feature_set_columns("example") + ["VIX_ewm20"]
+    resolve = lambda specs, **kw: resolve_pinned_features(columns, specs, ver="example", **kw)
+    assert resolve(None) == [] and resolve([]) == []
+    assert resolve(["example"]) == feature_set_columns("example")
+    assert resolve(["custom"]) == ["VIX_ewm20"]
+    assert resolve(["all"]) == columns
+    # a set the matrix only partly holds keeps the shared columns and warns about the rest
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert resolve(["paper"]) == ["sortino_20", "sortino_60"]
+        assert any("DD_10" in str(w.message) for w in caught), [str(w.message) for w in caught]
+    # individual columns, and the spec a custom variable was added with (its halflife default
+    # included), which saves having to know the column name the spec was turned into
+    assert resolve(["sortino_60", "VIX:ewm:20"]) == ["sortino_60", "VIX_ewm20"]
+    assert resolve(["VIX:ewm"]) == ["VIX_ewm20"]
+    # the result follows the column order and is free of duplicates, however the pins came in
+    assert resolve(["VIX_ewm20", "ret_5"]) == ["ret_5", "VIX_ewm20"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert resolve(["paper", "sortino_20"]) == ["sortino_20", "sortino_60"]
+    for bad in (["없는피처"], ["VIX"], ["VIX:nope"], [" "]):
+        try:
+            resolve(bad)
+            raise AssertionError(f"{bad}는 KeyError나 ValueError를 내야 합니다.")
+        except (KeyError, ValueError):
+            pass
 
 
 def test_extra_feature_specs():
@@ -198,15 +245,21 @@ def test_resolve_max_feats():
     assert resolve_max_feats(None, 10) == 5.
     assert resolve_max_feats(None, 3) == 2.       # never below two features
     assert resolve_max_feats(3., 10) == 3.
-    import warnings as _warnings
-    with _warnings.catch_warnings():
-        _warnings.simplefilter("ignore")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
         assert resolve_max_feats(20., 10) == 10.  # capped at the feature count
     try:
         resolve_max_feats(0.5, 10)
         raise AssertionError("max_feats < 1은 ValueError를 내야 합니다.")
     except ValueError:
         pass
+    # pinned features are kept whatever the budget, so the budget cannot be below their count
+    assert resolve_max_feats(None, 4, n_pinned=3) == 3.
+    assert resolve_max_feats(None, 10, n_pinned=3) == 5.       # the default still wins when larger
+    assert resolve_max_feats(4., 10, n_pinned=3) == 4.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert resolve_max_feats(2., 10, n_pinned=3) == 3.
 
 
 def test_init_model():
@@ -217,6 +270,14 @@ def test_init_model():
     sjm = init_model("sjm", jump_penalty=50., n_init=4, max_feats=3., n_features=9)
     assert isinstance(sjm, SparseJumpModel)
     assert sjm.max_feats == 3. and sjm.n_init_jm == 4
+    assert not isinstance(sjm, PinnedSparseJumpModel)        # nothing pinned: the plain model
+    mask = np.array([True, True] + [False] * 7)
+    pinned = init_model("sjm", jump_penalty=50., n_init=4, max_feats=3., n_features=9,
+                        pin_mask=mask)
+    assert isinstance(pinned, PinnedSparseJumpModel)
+    assert (pinned.pin_mask == mask).all() and pinned.max_feats == 3.
+    # a mask is meaningless for the discrete model, which does not weigh features
+    assert not hasattr(init_model("jm", pin_mask=mask), "pin_mask")
     try:
         init_model("cjm")
         raise AssertionError("알 수 없는 모델은 ValueError를 내야 합니다.")
@@ -258,6 +319,66 @@ def test_sparse_jump_model_run():
     assert all(f"center_{col}" in result.params.columns for col in X.columns)
     assert result.params.stay_prob.between(0., 1.).all()
     assert result.params.freq.gt(0.).all()      # both regimes present in every window
+
+
+def test_solve_lasso_pinned():
+    """Pinning exempts a feature from the threshold without disturbing the free ones."""
+    from jumpmodels.sparse_jump import solve_lasso
+    scores, kappa = np.array([1., .9, .05, .02]), 1.2
+    free = np.asarray(solve_lasso(scores, kappa))
+    assert np.allclose(solve_lasso_pinned(scores, kappa, np.zeros(4, bool)), free)
+    assert (free[2:] == 0.).all()               # the two weak features are dropped...
+
+    pinned = solve_lasso_pinned(scores, kappa, np.array([False, False, True, True]))
+    assert (pinned > 0.).all()                  # ... and kept once pinned
+    assert abs(np.linalg.norm(pinned) - 1.) < 1e-12
+    # the surviving free features keep their relative weights, and the budget only overshoots
+    assert abs(pinned[0] / pinned[1] - free[0] / free[1]) < 1e-9
+    assert pinned.sum() >= free.sum()
+    # a pinned feature that separates the clusters not at all is floored, not dropped
+    floored = solve_lasso_pinned(np.array([1., .9, 0.]), kappa, np.array([False, False, True]))
+    assert floored[2] > 0.
+    try:
+        solve_lasso_pinned(scores, kappa, np.zeros(3, bool))
+        raise AssertionError("길이가 다른 마스크는 ValueError를 내야 합니다.")
+    except ValueError:
+        pass
+
+
+def test_pinned_sparse_jump_model_run():
+    """A pinned feature carries a positive weight at every refit, dropped or not without it."""
+    X, ret = _toy_features()
+    kwargs = dict(model="sjm", jump_penalty=10., window=300, min_window=250, n_init=2,
+                  max_feats=1.5, verbose=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        free = run_rolling_jm(X, ret, **kwargs)
+        pinned = run_rolling_jm(X, ret, pin_feats=["noise_a"], **kwargs)
+    assert free.pinned_features == [] and pinned.pinned_features == ["noise_a"]
+    assert (free.feat_weights["noise_a"] == 0.).any()        # dropped when left to the selection
+    assert (pinned.feat_weights["noise_a"] > 0.).all()       # never dropped once pinned
+    # the informative features are still there, and the unpinned noise column is still droppable
+    assert (pinned.feat_weights[["ret_20", "DD_10"]] > 0.).all().all()
+    assert pinned.feat_weights["noise_a"].mean() > pinned.feat_weights["noise_b"].mean()
+    assert set(pinned.regimes.regime.unique()) <= {0, 1}
+
+    # an unknown feature is a typo, not something to pin silently
+    try:
+        run_rolling_jm(X, ret, pin_feats=["없는피처"], **kwargs)
+        raise AssertionError("존재하지 않는 고정 피처는 KeyError를 내야 합니다.")
+    except KeyError:
+        pass
+
+
+def test_pinning_is_ignored_by_the_discrete_model():
+    """The discrete JM has no feature selection to override, so a pin is dropped with a warning."""
+    X, ret = _toy_features()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = run_rolling_jm(X, ret, model="jm", jump_penalty=10., window=300, min_window=250,
+                                n_init=2, pin_feats=["noise_a"], verbose=False)
+    assert result.pinned_features == [] and result.feat_weights is None
+    assert any("sjm" in str(w.message) for w in caught), [str(w.message) for w in caught]
 
 
 def test_jump_model_run_has_no_feature_weights():

@@ -26,7 +26,8 @@ from backtest import (DEFAULT_COST_BPS, DEFAULT_MAX_CASH, DEFAULT_MIN_CASH,
                       regime_summary, resolve_cash_limits, resolve_cost_bps, run_0_1_strategy)
 from data_io import (RF_UNITS, TRADING_DAYS, join_extra_table, load_extra_table,
                      load_market_data, normalize_header)
-from features import FEATURE_SETS, build_extra_features, build_features, parse_extra_spec
+from features import (FEATURE_SETS, build_extra_features, build_features, parse_extra_spec,
+                      resolve_pinned_features)
 from rolling import MODELS, run_rolling_jm
 
 
@@ -73,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
                             "커스텀 변수로 피처를 늘렸을 때 sjm이 노이즈 피처를 걸러 줍니다")
     group.add_argument("--max-feats", type=float, default=None,
                        help="sjm 전용. 남길 유효 피처 개수(kappa^2). 미지정 시 피처 개수의 절반")
+    group.add_argument("--pin-feature", action="append", default=None, metavar="NAME",
+                       help="sjm 전용. 재추정마다 항상 남길 피처. 피처 세트 이름(paper/example/extra), "
+                            "커스텀 변수 전체를 뜻하는 custom, 전체를 뜻하는 all, 개별 피처 이름"
+                            "(예: sortino_60), 또는 커스텀 변수 지정(예: VIX:ewm:20)을 받습니다. "
+                            "여러 번 지정할 수 있습니다")
     group.add_argument("--jump-penalty", type=float, default=50., help="점프 페널티 lambda")
     group.add_argument("--window", type=int, default=3000, help="학습창 길이 (거래일)")
     group.add_argument("--min-window", type=int, default=500,
@@ -219,6 +225,7 @@ def run_pipeline(input_path: str,
                  extra_date_col: str = None,
                  model: str = "jm",
                  max_feats: float = None,
+                 pin_features=None,
                  jump_penalty: float = 50.,
                  window: int = 3000,
                  min_window: int = 500,
@@ -254,8 +261,9 @@ def run_pipeline(input_path: str,
     re-estimate the jump model every six months over a rolling window while inferring the
     regimes online in between, optionally run the rolling HMM benchmark, and backtest the
     0/1 strategy -- under the main trading delay and, for the robustness table, under
-    several delays. `min_cash`/`max_cash` bound the share held in the risk-free asset, and
-    `buy_cost_bps`/`sell_cost_bps` charge the two legs of a trade separately.
+    several delays. `min_cash`/`max_cash` bound the share held in the risk-free asset,
+    `buy_cost_bps`/`sell_cost_bps` charge the two legs of a trade separately, and
+    `pin_features` names the features the sparse model must keep at every re-estimation.
 
     Parameters
     ----------
@@ -300,11 +308,16 @@ def run_pipeline(input_path: str,
     if verbose:
         print(f"피처({feature_set}): {list(X.columns)} / {len(X)}행, {X.index[0]} ~ {X.index[-1]}")
 
+    # feature-set names such as "paper" become the columns they stand for
+    pinned = resolve_pinned_features(X.columns, pin_features, ver=feature_set, log_dd=log_dd)
+    if verbose and pinned and model == "sjm":       # `run_rolling_jm` warns and ignores them otherwise
+        print(f"고정 피처: {pinned} ({len(pinned)}/{X.shape[1]}개, 재추정마다 항상 유지)")
+
     # 3) semiannual refits on a rolling window + online inference in between
     result = run_rolling_jm(X, data.excess_ret, jump_penalty=jump_penalty, window=window,
                             min_window=min_window, n_components=n_components, clip_mul=clip_mul,
                             n_init=n_init, random_state=random_state, start_date=refit_start,
-                            model=model, max_feats=max_feats, verbose=verbose)
+                            model=model, max_feats=max_feats, pin_feats=pinned, verbose=verbose)
 
     # 4) 0/1 strategy backtest on the online inferred signal
     strategy = run_0_1_strategy(result.regimes.regime, data.ret, data.rf,
@@ -395,7 +408,8 @@ def run_pipeline(input_path: str,
         written.append(plot_weights(strategy, os.path.join(outdir, "weights.png")))
         if result.feat_weights is not None:
             written.append(plot_feat_weights(result.feat_weights,
-                                             os.path.join(outdir, "feat_weights.png")))
+                                             os.path.join(outdir, "feat_weights.png"),
+                                             pinned=result.pinned_features))
 
     if verbose:
         print("\n" + "=" * 72)
@@ -408,9 +422,12 @@ def run_pipeline(input_path: str,
         if result.feat_weights is not None:
             mean_weights = result.feat_weights.mean().sort_values(ascending=False)
             kept = (result.feat_weights > 0).mean()
-            print("피처 가중(재추정 평균) / 선택된 비율:")
+            pinned_set = set(result.pinned_features)
+            note = " (*: 고정한 피처)" if pinned_set else ""
+            print(f"피처 가중(재추정 평균) / 선택된 비율{note}:")
             for feat, weight in mean_weights.items():
-                print(f"  {feat:<24} {weight:.3f}   {kept[feat]:.0%}")
+                mark = "*" if feat in pinned_set else " "
+                print(f" {mark}{feat:<24} {weight:.3f}   {kept[feat]:.0%}")
         if hmm_summary is not None:
             print(f"HMM 고변동성 비중: {hmm_summary['bear_share']:.1%}, "
                   f"레짐 전환 {hmm_summary['n_shifts']}회 (연 {hmm_summary['shifts_per_year']:.2f}회)")
@@ -443,7 +460,7 @@ def main(argv=None) -> int:
                  feature_set=args.feature_set, log_dd=args.log_dd, warmup=args.warmup,
                  extra_features=args.extra_feature, extra_file=args.extra_file,
                  extra_sheet=args.extra_sheet, extra_date_col=args.extra_date_col,
-                 model=args.model, max_feats=args.max_feats,
+                 model=args.model, max_feats=args.max_feats, pin_features=args.pin_feature,
                  jump_penalty=args.jump_penalty, window=args.window, min_window=args.min_window,
                  n_components=args.n_components, clip_mul=args.clip_mul, n_init=args.n_init,
                  random_state=args.random_state, refit_start=args.refit_start,

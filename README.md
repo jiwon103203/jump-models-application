@@ -4,7 +4,7 @@ csv/엑셀 파일 하나(날짜·종가·무위험금리)를 넣으면 논문 [S
 
 1. 초과수익률 계산
 2. 지수가중이동(EWM) downside deviation·Sortino ratio 피처 생성 (+ 원하면 **확장 피처 세트**나 **사용자 커스텀 변수** 추가)
-3. **6개월마다(1월·7월 첫 영업일) 3000거래일 학습창으로 점프 모델 재추정** + 재추정 사이 구간은 온라인 추론
+3. **6개월마다(1월·7월 첫 영업일) 3000거래일 학습창으로 점프 모델 재추정** + 재추정 사이 구간은 온라인 추론 (sparse JM을 쓸 때는 **꼭 남기고 싶은 피처 고정** 가능)
 4. 0/1 전략 백테스트(거래비용·거래지연 반영, **현금 비중 제한**과 **매수/매도 거래비용 분리** 지원) + **거래 지연 로버스트니스 표(논문 Table 5)**
 5. 선택적으로 **HMM 벤치마크(논문 §3.3)** 와 성과 비교
 
@@ -77,6 +77,7 @@ res["performance"]         # 전략 성과표
 | `--warmup` | 252 | EWM 초기 불안정 구간으로 버릴 행 수 |
 | `--model` | `jm` | `jm`: 논문의 원본(이산) 점프 모델 / `sjm`: 피처 선택이 있는 sparse 점프 모델 (3-5 참고) |
 | `--max-feats` | 피처 수의 절반 | `sjm` 전용. 남길 유효 피처 개수 κ² |
+| `--pin-feature` | 없음 | `sjm` 전용. 재추정마다 **항상 남길 피처**. 피처 세트 이름·`custom`·`all`·개별 피처 이름·커스텀 변수 지정을 받고, 여러 번 지정 가능 (3-6 참고) |
 | `--jump-penalty` | 50.0 | 점프 페널티 λ. 클수록 레짐이 덜 바뀝니다(논문 Table 3) |
 | `--window` | 3000 | 학습창 길이(거래일). 논문 기준 약 12년 |
 | `--min-window` | 500 | 허용 최소 학습창. 데이터가 부족한 초기 재추정은 이 길이까지 자동 축소되고 경고를 출력 |
@@ -226,6 +227,40 @@ python run_pipeline.py --input 내데이터.csv --model sjm --feature-set exampl
 - 점프 페널티는 라이브러리 내부에서 `1/√(피처 수)`로 나뉘므로 `--jump-penalty`는 JM과 비슷한 크기를 쓰면 됩니다.
 - 피처가 3개 이하면 경고를 출력합니다. 그 경우엔 `--model jm`이 낫습니다.
 
+### 3-6. 피처 고정 (`--pin-feature`)
+
+`sjm`은 **재추정마다 피처를 다시 고릅니다.** 덕분에 노이즈 피처가 걸러지지만, 반대로 "논문 Table 2의 피처처럼 반드시 들어가야 하는 변수"가 어떤 시기에는 탈락합니다. `--pin-feature`로 고정한 피처는 **모든 재추정에서 가중이 0이 되지 않습니다.**
+
+```bash
+# paper 3개 피처를 고정하고 나머지 31개는 sjm이 알아서 고르게 (사실상 "논문 피처 + 보조 피처")
+python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm     --pin-feature paper
+
+# example 9개 전체 + 내가 넣은 VIX를 고정
+python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm     --extra-feature VIX:ewm:20 --pin-feature example --pin-feature VIX:ewm:20
+
+# 특정 변수만 골라서 고정
+python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm     --pin-feature sortino_60 --pin-feature vol-log_20
+```
+
+`--pin-feature`에 줄 수 있는 값은 네 가지이고, 여러 번 지정하면 합집합이 됩니다.
+
+| 지정 | 뜻 |
+|---|---|
+| `paper` / `example` / `extra` | 해당 피처 세트가 만드는 열 전체 (`--feature-set`과 같은 이름) |
+| `custom` | `--extra-feature`·`--extra-file`로 넣은 커스텀 변수 전체 |
+| `all` | 전체 피처 (= 피처 선택을 끄는 것과 같음) |
+| `sortino_60`, `VIX_ewm20`, `VIX:ewm:20` | 개별 피처. 커스텀 변수는 `--extra-feature`에 준 지정을 그대로 써도 됩니다 |
+
+동작 방식과 주의사항은 다음과 같습니다.
+
+- **고정한 피처는 soft-threshold를 적용받지 않습니다.** 즉 자기 BCSS가 주는 가중을 그대로 쓰고, 나머지 피처만 `‖w‖₁ ≤ κ` 예산을 두고 경쟁합니다. 고정은 **"항상 들어간다"는 보장이지 "중요하게 쓰인다"는 보장이 아닙니다** — 레짐 구분력이 없는 피처를 고정하면 가중이 0은 아니되 아주 작아집니다.
+- 원래 잘렸을 피처가 다시 들어오므로 **유효 피처 수가 `--max-feats`를 조금 넘길 수 있습니다.** 이게 고정의 비용입니다.
+- `--max-feats`가 고정한 피처 개수보다 작으면 그 개수까지 자동으로 늘리고 경고합니다(고정한 피처는 어차피 모두 남으므로 그보다 줄일 수 없습니다). 미지정 시 기본값도 `max(2, 피처 수/2, 고정 개수)`가 됩니다.
+- 고정한 피처가 하나도 없으면 계산은 기존 `SparseJumpModel`과 **완전히 동일**합니다(`test_solve_lasso_pinned`에서 검증).
+- **`--feature-set`에 없는 열은 고정할 수 없습니다.** 예를 들어 `--feature-set example --pin-feature paper`는 두 세트가 공유하는 `sortino_20`·`sortino_60`만 고정하고, paper의 `DD_10`(반감기 10일)은 example 세트가 만들지 않으므로 경고와 함께 건너뜁니다. 세 피처를 모두 고정하려면 `--feature-set paper`를 쓰세요.
+- `--model jm`에는 피처 선택 자체가 없으므로 지정해도 경고만 내고 무시합니다.
+- 실제로 무엇이 고정됐는지는 실행 로그(`고정 피처: [...]`, 가중 요약의 `*` 표시)와 `feat_weights.png`(고정 피처는 실선)에서 확인할 수 있습니다.
+
 ## 4. 출력물 (`--outdir`)
 
 | 파일 | 내용 |
@@ -240,7 +275,7 @@ python run_pipeline.py --input 내데이터.csv --model sjm --feature-set exampl
 | `weights.png` | 위험자산 비중 추이 (현금 비중 제한을 걸면 `1 − max_cash` ~ `1 − min_cash` 사이에서 움직임) |
 | `delay_robustness.csv` | 거래 지연 1/5/10일 성과 비교 (논문 Table 5) |
 | `feat_weights.csv` | `--model sjm` 사용 시 재추정별 피처 가중(0이면 그 시점에 탈락) |
-| `feat_weights.png` | 재추정에 따른 피처 가중의 시간 변화 |
+| `feat_weights.png` | 재추정에 따른 피처 가중의 시간 변화. 고정한 피처는 실선, 나머지는 점선 |
 | `hmm_regimes.csv` | `--hmm` 사용 시 HMM의 원(raw) 상태·평활된 레짐·사용된 재추정 시점 |
 | `hmm_refit_params.csv` | HMM 재추정별 상태 조건부 연율 수익률·변동성·자기전이확률·로그우도 |
 | `hmm_strategy.csv` | HMM 신호로 돌린 0/1 전략의 일별 결과 |
@@ -261,6 +296,7 @@ python run_pipeline.py --input 내데이터.csv --model sjm --feature-set exampl
 | Table 5 거래 지연 1/5/10일 로버스트니스 | `backtest.delay_robustness_table` |
 | §3.3 HMM 벤치마크(3000일 롤링, Viterbi 온라인 추론, median filter) | `hmm_benchmark.run_rolling_hmm` |
 | §3.4.1 각주의 sparse JM (Nystrup et al. 2021) | `rolling.init_model(model="sjm")` → `SparseJumpModel` |
+| (논문 밖) 특정 피처를 선택에서 제외하고 항상 유지 | `features.resolve_pinned_features` → `sparse_pin.PinnedSparseJumpModel` |
 
 ## 6. 구현상의 선택과 주의사항
 
@@ -348,3 +384,5 @@ SJM은 회전율을 크게 낮추고 레짐을 더 지속적으로 만들지만,
 | sortino_5 | 0.034 | 26% |
 | ret_5 | 0.007 | 19% |
 | 변동성지수_diff5 (커스텀) | 0.005 | 13% |
+
+논문 Table 2의 피처인 `sortino_20`도 재추정의 26%에서 탈락하는데, 이렇게 "꼭 남기고 싶은 피처가 시기마다 빠지는" 상황이 `--pin-feature`(3-6)를 쓰는 자리입니다. `--pin-feature paper`를 붙이면 이 열들의 선택 비율이 전부 100%가 됩니다.
