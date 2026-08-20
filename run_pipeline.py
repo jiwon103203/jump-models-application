@@ -52,11 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
     group = parser.add_argument_group("피처")
     group.add_argument("--feature-set", default="paper", choices=FEATURE_SETS,
                        help="paper: 논문 Table 2의 3개 피처 / example: 레포 예제의 9개 피처 / "
-                            "extra: example 9개 + 수익률·변동성 파생 25개 + paper의 DD_10 = 35개 "
-                            "(--model sjm 권장)")
+                            "extra: example의 수익률·Sortino 6개 + 수익률·변동성 파생 25개 + "
+                            "DD_10/DD_20/DD_60 = 34개 (--model sjm 권장)")
     group.add_argument("--log-dd", action="store_true",
-                       help="paper·extra 피처 세트가 공유하는 반감기 10일 downside deviation"
-                            "(DD_10 → DD-log_10)을 로그 변환")
+                       help="paper·extra의 downside deviation을 로그 변환 (DD_10 → DD-log_10). "
+                            "example 세트는 원래 로그 스케일이라 영향이 없습니다")
     group.add_argument("--warmup", type=int, default=252, help="EWM 워밍업으로 버릴 초기 행 수")
 
     group = parser.add_argument_group("커스텀 변수")
