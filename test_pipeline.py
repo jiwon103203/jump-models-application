@@ -18,8 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from backtest import (build_weights, delay_robustness_table, resolve_cash_limits,
                       resolve_cost_bps, run_0_1_strategy)
-from features import (EXAMPLE_HLS, EXTRA_WINDOWS, FEATURE_SETS, apply_transform,
-                      build_extra_features, feature_engineer, feature_set_columns,
+from features import (EXAMPLE_HLS, EXTRA_WINDOWS, FEATURE_SETS, PAPER_DD_HL, apply_transform,
+                      build_extra_features, compute_ewm_DD, feature_engineer, feature_set_columns,
                       parse_extra_spec, resolve_pinned_features)
 from hmm_benchmark import smooth_states
 from rolling import (init_model, refit_schedule, resolve_max_feats, run_rolling_jm,
@@ -53,7 +53,7 @@ def test_extra_feature_set():
     assert list(extra.columns)[:len(example.columns)] == list(example.columns)
     assert extra[example.columns].equals(example)
     added = [col for col in extra.columns if col not in example.columns]
-    assert len(added) == 25 and len(extra.columns) == 34, (len(added), len(extra.columns))
+    assert len(added) == 26 and len(extra.columns) == 35, (len(added), len(extra.columns))
     # every statistic of the list the set was built from is present
     for name in ("ret-simple", "ret-log", "ret-abs", "ret-sq", "ret-cumlog"):
         assert name in added, name
@@ -63,6 +63,14 @@ def test_extra_feature_set():
     for hl in EXAMPLE_HLS:
         assert f"vol-log_{hl:.0f}" in added and f"vol-chg_{hl:.0f}" in added, hl
     assert "vol-ratio_5-20" in added and "vol-ratio_20-60" in added
+    # ... and so is the downside deviation of the "paper" set, the one column of that set the
+    # "example" one does not hold; --log-dd renames it, as it does in the "paper" set
+    assert added[-1] == "DD_10"
+    assert np.allclose(extra["DD_10"], compute_ewm_DD(ret, PAPER_DD_HL))
+    logged = feature_engineer(ret, ver="extra", log_dd=True)
+    assert "DD_10" not in logged.columns
+    assert np.allclose(logged["DD-log_10"], np.log(extra["DD_10"]))
+    assert logged.drop(columns="DD-log_10").equals(extra.drop(columns="DD_10"))
 
     # the definitions that are easy to get wrong
     assert np.allclose(extra["ret-simple"], ret)
@@ -93,8 +101,9 @@ def test_feature_set_columns():
     ret = pd.Series(np.linspace(-.02, .02, 400), index=pd.bdate_range("2020-01-01", periods=400).date)
     for ver in FEATURE_SETS:
         assert feature_set_columns(ver) == list(feature_engineer(ret, ver=ver).columns), ver
-    assert feature_set_columns("paper", log_dd=True) == \
-           list(feature_engineer(ret, ver="paper", log_dd=True).columns)
+    for ver in ("paper", "extra"):       # the two sets holding the 10-day downside deviation
+        assert feature_set_columns(ver, log_dd=True) == \
+               list(feature_engineer(ret, ver=ver, log_dd=True).columns), ver
     try:
         feature_set_columns("없는세트")
         raise AssertionError("알 수 없는 피처 세트는 NotImplementedError를 내야 합니다.")
@@ -115,6 +124,16 @@ def test_resolve_pinned_features():
         warnings.simplefilter("always")
         assert resolve(["paper"]) == ["sortino_20", "sortino_60"]
         assert any("DD_10" in str(w.message) for w in caught), [str(w.message) for w in caught]
+    # the extra set does compute that downside deviation, so there "paper" resolves in full and
+    # the column can also be pinned on its own -- with the name --log-dd gives it
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                     # nothing missing, so nothing to warn
+        for log_dd, DD in ((False, "DD_10"), (True, "DD-log_10")):
+            columns_extra = feature_set_columns("extra", log_dd=log_dd)
+            resolve_extra = lambda specs: resolve_pinned_features(columns_extra, specs,
+                                                                  ver="extra", log_dd=log_dd)
+            assert resolve_extra(["paper"]) == ["sortino_20", "sortino_60", DD], log_dd
+            assert resolve_extra([DD]) == [DD], log_dd
     # individual columns, and the spec a custom variable was added with (its halflife default
     # included), which saves having to know the column name the spec was turned into
     assert resolve(["sortino_60", "VIX:ewm:20"]) == ["sortino_60", "VIX_ewm20"]
