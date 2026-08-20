@@ -57,7 +57,7 @@ def test_extra_feature_set():
     assert extra[shared].equals(example[shared])
     assert not [col for col in extra.columns if col.startswith("DD-log")]
     added = [col for col in extra.columns if col not in example.columns]
-    assert len(added) == 28 and len(extra.columns) == 34, (len(added), len(extra.columns))
+    assert len(added) == 29 and len(extra.columns) == 35, (len(added), len(extra.columns))
     # every statistic of the list the set was built from is present
     for name in ("ret-simple", "ret-log", "ret-abs", "ret-sq", "ret-cumlog"):
         assert name in added, name
@@ -69,16 +69,17 @@ def test_extra_feature_set():
     assert "vol-ratio_5-20" in added and "vol-ratio_20-60" in added
     # ... and so is the downside deviation family that closes the set, on the raw scale
     DD_columns = [f"DD_{hl:.0f}" for hl in EXTRA_DD_HLS]
-    assert added[-3:] == DD_columns == ["DD_10", "DD_20", "DD_60"]
+    assert added[-4:] == DD_columns == ["DD_5", "DD_10", "DD_20", "DD_60"]
     for hl in EXTRA_DD_HLS:
         assert np.allclose(extra[f"DD_{hl:.0f}"], compute_ewm_DD(ret, hl)), hl
-    # --log-dd logs that family in place and changes nothing else; on the log scale the 20-
-    # and 60-day ones are exactly what the "example" set reports
+    # --log-dd logs that family in place and changes nothing else; on the log scale the 5-,
+    # 20- and 60-day ones are exactly what the "example" set reports
     log_columns = [f"DD-log_{hl:.0f}" for hl in EXTRA_DD_HLS]
     logged = feature_engineer(ret, ver="extra", log_dd=True)
-    assert list(logged.columns) == list(extra.columns)[:-3] + log_columns
+    assert list(logged.columns) == list(extra.columns)[:-len(EXTRA_DD_HLS)] + log_columns
     assert np.allclose(logged[log_columns], np.log(extra[DD_columns]))
-    assert np.allclose(logged["DD-log_20"], example["DD-log_20"])
+    for hl in EXAMPLE_HLS:
+        assert np.allclose(logged[f"DD-log_{hl:.0f}"], example[f"DD-log_{hl:.0f}"]), hl
     assert logged.drop(columns=log_columns).equals(extra.drop(columns=DD_columns))
 
     # the definitions that are easy to get wrong
@@ -137,12 +138,12 @@ def test_resolve_pinned_features():
     # and each downside deviation can be pinned on its own, under the name --log-dd gives it
     with warnings.catch_warnings():
         warnings.simplefilter("error")                     # nothing missing, so nothing to warn
-        for log_dd, DDs in ((False, ["DD_10", "DD_20", "DD_60"]),
-                            (True, ["DD-log_10", "DD-log_20", "DD-log_60"])):
+        for log_dd, DDs in ((False, ["DD_5", "DD_10", "DD_20", "DD_60"]),
+                            (True, ["DD-log_5", "DD-log_10", "DD-log_20", "DD-log_60"])):
             columns_extra = feature_set_columns("extra", log_dd=log_dd)
             resolve_extra = lambda specs: resolve_pinned_features(columns_extra, specs,
                                                                   ver="extra", log_dd=log_dd)
-            assert resolve_extra(["paper"]) == ["sortino_20", "sortino_60", DDs[0]], log_dd
+            assert resolve_extra(["paper"]) == ["sortino_20", "sortino_60", DDs[1]], log_dd
             assert resolve_extra(DDs[::-1]) == DDs, log_dd
     # "example" is now the group the extra matrix only partly holds: the DD-log columns are
     # that set's own, so on the raw scale none of the three is there ...
@@ -154,14 +155,13 @@ def test_resolve_pinned_features():
                                        ver="extra") == returns_and_sortinos
         assert any("DD-log_5" in str(w.message) and "DD-log_60" in str(w.message)
                    for w in caught), [str(w.message) for w in caught]
-    # ... while under --log-dd the set's own family covers two of them and only the 5-day
-    # halflife, which no other set computes, is missing
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
+    # ... while under --log-dd the set's own family covers all three halflives of the
+    # "example" set, so the group resolves in full and there is nothing left to warn about
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         assert resolve_pinned_features(feature_set_columns("extra", log_dd=True), ["example"],
                                        ver="extra", log_dd=True) == \
-               returns_and_sortinos + ["DD-log_20", "DD-log_60"]
-        assert any("['DD-log_5']" in str(w.message) for w in caught), [str(w.message) for w in caught]
+               returns_and_sortinos + ["DD-log_5", "DD-log_20", "DD-log_60"]
     try:
         resolve_pinned_features(feature_set_columns("extra", log_dd=True), ["DD_20"],
                                 ver="extra", log_dd=True)
