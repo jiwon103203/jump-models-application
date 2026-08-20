@@ -14,15 +14,17 @@ Three feature sets are provided:
   return and volatility statistics -- the plain, log, absolute, squared and cumulative
   return, the rolling standard deviation, variance, mean absolute return and RMS return
   over 5/20/60-day windows, and the EWMA volatility with its change over time and its
-  ratio across horizons -- plus the downside deviation at halflives of 10, 20 and 60 days.
-  34 features in total; pair it with ``--model sjm``, which drops the ones that carry no
+  ratio across horizons -- plus the downside deviation at halflives of 5, 10, 20 and 60 days.
+  35 features in total; pair it with ``--model sjm``, which drops the ones that carry no
   regime information.
 
 The downside deviation is the one feature the sets treat differently. ``"example"`` is the
 only one that keeps it on the log scale, under the ``DD-log`` names its source example uses;
 ``"paper"`` and ``"extra"`` carry the statistic itself, on the raw scale by default and on
 the log scale under ``--log-dd``, so that it never appears twice under two names. Every
-column of ``"paper"`` is therefore a column of ``"extra"`` too, whichever scale is in force.
+column of ``"paper"`` is therefore a column of ``"extra"`` too, whichever scale is in force,
+and ``--log-dd`` makes every column of ``"example"`` one as well, since ``"extra"`` carries
+the downside deviation at all three halflives that set uses.
 
 Any subset of the resulting columns can be *pinned* so that the sparse jump model never
 drops it -- see `resolve_pinned_features` and `sparse_pin.PinnedSparseJumpModel`.
@@ -47,9 +49,10 @@ EXAMPLE_HLS = (5., 20., 60.)
 # simple-window statistics and as halflives for the exponentially weighted ones
 EXTRA_WINDOWS = (5, 20, 60)
 EXTRA_VOL_RATIO_PAIRS = ((5., 20.), (20., 60.))
-# halflives the "extra" set carries the downside deviation at on the raw scale: the 10 days
-# of the "paper" set, which no other feature uses, and the 20 and 60 of the longer horizons
-EXTRA_DD_HLS = (PAPER_DD_HL, 20., 60.)
+# halflives the "extra" set carries the downside deviation at on the raw scale: the three of
+# the "example" set, which is what lets ``--log-dd`` cover that set's ``DD-log`` columns in
+# full, plus the 10 days of the "paper" set, which no other feature of the set uses
+EXTRA_DD_HLS = (5., PAPER_DD_HL, 20., 60.)
 
 
 def compute_ewm_DD(ret_ser: pd.Series, hl: float) -> pd.Series:
@@ -267,7 +270,7 @@ def feature_engineer(ret_ser: pd.Series, ver: str = "paper", log_dd: bool = Fals
         One of "paper" (three features, Table 2 of the article), "example" (the nine
         features used in the Nasdaq example of this repo) or "extra" (six of those nine plus
         the return and volatility statistics of `extra_features` and the downside deviations
-        of `_extra_DD_features`, 34 in total).
+        of `_extra_DD_features`, 35 in total).
 
     log_dd : bool, optional (default=False)
         Whether to take the log of the downside deviation of the "paper" and "extra" sets,
@@ -559,8 +562,10 @@ def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = F
     feature matrix does not hold are skipped with a warning -- pinning "paper" while running
     ``--feature-set example`` keeps the two Sortino ratios the two sets share, since the
     downside deviation of the paper set uses a halflife the example set does not compute.
-    ``--feature-set extra`` does compute it, so there "paper" resolves in full; "example" is
-    the group that then loses its three ``DD-log`` columns, which only that set builds.
+    ``--feature-set extra`` does compute it, so there "paper" resolves in full, and so does
+    "example" under ``--log-dd``, which names the extra set's downside deviations the way that
+    set names its own; on the raw scale "example" is the group that loses its three ``DD-log``
+    columns, since only that set builds them.
 
     Parameters
     ----------

@@ -72,7 +72,7 @@ res["performance"]         # 전략 성과표
 
 | 옵션 | 기본값 | 설명 |
 |---|---|---|
-| `--feature-set` | `paper` | `paper`: 논문 Table 2의 3개 피처(DD hl=10, Sortino hl=20·60). `example`: 저장소 나스닥 예제의 9개 피처(hl 5·20·60 × 수익률·log DD·Sortino). `extra`: `example`의 수익률·Sortino 6개 + 수익률·변동성 파생 25개 + `DD_10`·`DD_20`·`DD_60` = 34개 (3-1 참고) |
+| `--feature-set` | `paper` | `paper`: 논문 Table 2의 3개 피처(DD hl=10, Sortino hl=20·60). `example`: 저장소 나스닥 예제의 9개 피처(hl 5·20·60 × 수익률·log DD·Sortino). `extra`: `example`의 수익률·Sortino 6개 + 수익률·변동성 파생 25개 + `DD_5`·`DD_10`·`DD_20`·`DD_60` = 35개 (3-1 참고) |
 | `--log-dd` | 꺼짐 | `paper`·`extra`의 downside deviation을 로그 변환(`DD_10` → `DD-log_10`). `example`은 원래 로그 스케일이라 영향이 없습니다 |
 | `--warmup` | 252 | EWM 초기 불안정 구간으로 버릴 행 수 |
 | `--model` | `jm` | `jm`: 논문의 원본(이산) 점프 모델 / `sjm`: 피처 선택이 있는 sparse 점프 모델 (3-5 참고) |
@@ -96,21 +96,21 @@ res["performance"]         # 전략 성과표
 
 ### 3-1. 확장 피처 세트 (`--feature-set extra`)
 
-`example`의 수익률·Sortino 6개에, 수익률과 변동성에서 흔히 쓰는 파생 변수 25개와 downside deviation 3개(`DD_10`·`DD_20`·`DD_60`)를 더한 **34개 피처** 세트입니다. 수익률 시계열 하나만으로 만들 수 있는 통계를 폭넓게 깔아 두고 모델이 고르게 하는 용도이므로, **`--model sjm`과 함께 쓰는 것을 권장합니다.**
+`example`의 수익률·Sortino 6개에, 수익률과 변동성에서 흔히 쓰는 파생 변수 25개와 downside deviation 4개(`DD_5`·`DD_10`·`DD_20`·`DD_60`)를 더한 **35개 피처** 세트입니다. 수익률 시계열 하나만으로 만들 수 있는 통계를 폭넓게 깔아 두고 모델이 고르게 하는 용도이므로, **`--model sjm`과 함께 쓰는 것을 권장합니다.**
 
 ```bash
 python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm
 ```
 
-`example`에서는 `ret_5/20/60`과 `sortino_5/20/60` **6개만** 그대로 가져오고, 로그 downside deviation(`DD-log_5/20/60`)은 가져오지 않습니다. 같은 통계를 로그·원 스케일 두 벌로 들고 있을 이유가 없어서, `extra`는 아래의 `DD_10/20/60` 한 벌만 씁니다(`--log-dd`를 주면 이 한 벌이 로그 스케일이 됩니다).
+`example`에서는 `ret_5/20/60`과 `sortino_5/20/60` **6개만** 그대로 가져오고, 로그 downside deviation(`DD-log_5/20/60`)은 가져오지 않습니다. 같은 통계를 로그·원 스케일 두 벌로 들고 있을 이유가 없어서, `extra`는 아래의 `DD_5/10/20/60` 한 벌만 씁니다(`--log-dd`를 주면 이 한 벌이 로그 스케일이 됩니다). 반감기 5·20·60일은 `example`이 쓰는 것과 같으므로, `--log-dd`를 주면 `example`의 로그 DD 3개가 그대로 `extra` 안에 들어옵니다.
 
 | 세트 | downside deviation |
 |---|---|
 | `example` | `DD-log_5`, `DD-log_20`, `DD-log_60` (항상 로그) |
 | `paper` | `DD_10` → `--log-dd` 시 `DD-log_10` |
-| `extra` | `DD_10`, `DD_20`, `DD_60` → `--log-dd` 시 `DD-log_10/20/60` |
+| `extra` | `DD_5`, `DD_10`, `DD_20`, `DD_60` → `--log-dd` 시 `DD-log_5/10/20/60` |
 
-`example`의 6개 외에 추가되는 28개는 아래와 같습니다.
+`example`의 6개 외에 추가되는 29개는 아래와 같습니다.
 
 | 피처 | 개수 | 계산 |
 |---|---|---|
@@ -126,13 +126,13 @@ python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm
 | `vol-log_5/20/60` | 3 | 반감기 5·20·60일 EWMA 변동성(로그 스케일) |
 | `vol-chg_5/20/60` | 3 | 위 변동성의 자기 horizon(5·20·60일) 대비 변화 |
 | `vol-ratio_5-20`, `vol-ratio_20-60` | 2 | 단기/장기 변동성 비율 (로그 스케일이므로 차이가 곧 비율) |
-| `DD_10`, `DD_20`, `DD_60` | 3 | 반감기 10·20·60일 downside deviation. 기본은 원(raw) 스케일, `--log-dd`를 주면 `DD-log_10/20/60`. `DD_10`은 논문 Table 2의 피처입니다 |
+| `DD_5`, `DD_10`, `DD_20`, `DD_60` | 4 | 반감기 5·10·20·60일 downside deviation. 기본은 원(raw) 스케일, `--log-dd`를 주면 `DD-log_5/10/20/60`. `DD_10`은 논문 Table 2의 피처, `DD_5/20/60`은 `example`이 쓰는 반감기입니다 |
 
 - **Rolling Return은 넣지 않았습니다.** `example`의 `ret_5/20/60`(EWM 평균 수익률)이 이미 "과거 구간의 평균 수익률"이라 가중 방식만 다른 같은 통계이기 때문입니다. 단순 창(window) 방식의 누적수익률이 따로 필요하면 `features.extra_features`에 한 줄 추가하면 됩니다.
 - EWMA 변동성(`vol-*`)은 **로그 스케일**을 씁니다. 양수·우측 꼬리 분포라 로그가 다루기 좋고, 로그의 차이가 곧 변화율·비율이 되어 `vol-chg`·`vol-ratio`가 자연스럽게 정의됩니다. downside deviation은 `--log-dd`로 정하며 기본은 원 스케일입니다.
 - `DD` 계열이 하방 변동성만 보는 데 반해 `vol-log`는 양방향 변동성이라, 둘을 같이 쓰면 "하락"과 "변동성 확대"를 구분하는 데 도움이 됩니다.
-- **downside deviation은 `--log-dd` 하나로 스케일이 정해집니다.** 기본은 원 스케일 `DD_10/20/60`, `--log-dd`를 주면 `DD-log_10/20/60`이고 열 개수는 34개로 같습니다. `log(DD_20) == DD-log_20`이라 두 스케일은 정보량이 같지만, 군집 거리(윈저라이징·표준화 후 유클리드)는 스케일에 따라 달라지므로 결과는 조금 달라집니다. `vol-log` 계열과 스케일을 맞추려면 `--log-dd`를 켜세요.
-- **반감기 10일은 `example`에 없던 horizon입니다.** `DD_10`은 논문 Table 2의 대표 피처라 넣었고(그래서 `--pin-feature paper`가 `extra`에서 온전히 동작합니다), 반대로 `example`이 쓰던 5일 반감기 DD는 `extra`에 없습니다. 단기 하방 변동성은 `vol-log_5`·`rms_5`·`mad_5`가 대신 커버합니다. 반감기를 바꾸거나 5일을 되살리려면 `features.EXTRA_DD_HLS`에 추가하면 됩니다.
+- **downside deviation은 `--log-dd` 하나로 스케일이 정해집니다.** 기본은 원 스케일 `DD_5/10/20/60`, `--log-dd`를 주면 `DD-log_5/10/20/60`이고 열 개수는 35개로 같습니다. `log(DD_20) == DD-log_20`이라 두 스케일은 정보량이 같지만, 군집 거리(윈저라이징·표준화 후 유클리드)는 스케일에 따라 달라지므로 결과는 조금 달라집니다. `vol-log` 계열과 스케일을 맞추려면 `--log-dd`를 켜세요.
+- **DD 반감기는 두 세트의 합집합입니다.** `DD_10`은 논문 Table 2의 대표 피처라 넣었고(그래서 `--pin-feature paper`가 `extra`에서 온전히 동작합니다), `DD_5/20/60`은 `example`이 쓰는 반감기라 그대로 가져왔습니다(`--log-dd`와 함께 쓰면 `--pin-feature example`도 온전히 동작합니다). `DD_5`는 `vol-log_5`·`rms_5`·`mad_5`가 보는 단기 변동성의 하방 전용 버전이라, 짧은 horizon에서 "하락"과 "변동성 확대"를 나눠 보는 데 쓰입니다. 반감기를 바꾸거나 빼려면 `features.EXTRA_DD_HLS`를 고치면 됩니다.
 - `std`와 `var`는 서로 제곱 관계라 정보가 같습니다. 요청하신 목록을 그대로 반영해 둘 다 넣었고, `sjm`을 쓰면 보통 한쪽만 남습니다.
 - ⚠️ `ret-cumlog`는 **정상(stationary) 시계열이 아닙니다.** 표본 전체에 걸쳐 추세를 그리므로 군집 좌표로는 적절하지 않고, 학습창 밖 구간에서는 윈저라이징(±`--clip-mul`σ) 경계에 붙어 상수처럼 동작합니다. 요청 목록에 있어 포함했지만 `sjm`은 대개 이 열의 가중을 0으로 떨어뜨립니다.
 - 일반적으로 `ret-simple`·`ret-log`·`ret-sq`처럼 평활하지 않은 당일 값은 노이즈가 커서 `sjm`에서 먼저 탈락하고, 변동성 계열(`std`·`rms`·`vol-log`·`vol-ratio`)이 남는 경향이 있습니다. 어떤 변수가 실제로 선택됐는지는 `feat_weights.csv`·`feat_weights.png`와 실행 로그에서 확인하세요.
@@ -243,7 +243,7 @@ python run_pipeline.py --input 내데이터.csv --model sjm --feature-set exampl
 `sjm`은 **재추정마다 피처를 다시 고릅니다.** 덕분에 노이즈 피처가 걸러지지만, 반대로 "논문 Table 2의 피처처럼 반드시 들어가야 하는 변수"가 어떤 시기에는 탈락합니다. `--pin-feature`로 고정한 피처는 **모든 재추정에서 가중이 0이 되지 않습니다.**
 
 ```bash
-# paper 3개 피처(DD_10·sortino_20·sortino_60)를 고정하고 나머지 31개는 sjm이 알아서 고르게
+# paper 3개 피처(DD_10·sortino_20·sortino_60)를 고정하고 나머지 32개는 sjm이 알아서 고르게
 # (사실상 "논문 피처 + 보조 피처")
 python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm     --pin-feature paper
 
@@ -269,8 +269,8 @@ python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm
 - 원래 잘렸을 피처가 다시 들어오므로 **유효 피처 수가 `--max-feats`를 조금 넘길 수 있습니다.** 이게 고정의 비용입니다.
 - `--max-feats`가 고정한 피처 개수보다 작으면 그 개수까지 자동으로 늘리고 경고합니다(고정한 피처는 어차피 모두 남으므로 그보다 줄일 수 없습니다). 미지정 시 기본값도 `max(2, 피처 수/2, 고정 개수)`가 됩니다.
 - 고정한 피처가 하나도 없으면 계산은 기존 `SparseJumpModel`과 **완전히 동일**합니다(`test_solve_lasso_pinned`에서 검증).
-- **`--feature-set`에 없는 열은 고정할 수 없습니다.** 예를 들어 `--feature-set example --pin-feature paper`는 두 세트가 공유하는 `sortino_20`·`sortino_60`만 고정하고, paper의 `DD_10`(반감기 10일)은 example 세트가 만들지 않으므로 경고와 함께 건너뜁니다. 세 피처를 모두 고정하려면 `--feature-set paper`나 `--feature-set extra`를 쓰세요 — `extra`는 `paper`의 세 열을 모두 포함하므로 `--pin-feature paper`가 온전히 적용되고, `--pin-feature DD_10`·`DD_20`·`DD_60`처럼 개별 지정도 됩니다.
-- **반대로 `--feature-set extra --pin-feature example`은 부분만 고정됩니다.** `extra`는 `DD-log_5/20/60`을 만들지 않으므로(3-1 참고) `ret_5/20/60`·`sortino_5/20/60` 6개만 고정하고 나머지는 경고와 함께 건너뜁니다. `--log-dd`를 같이 주면 `extra`가 `DD-log_20`·`DD-log_60`을 만들므로 `DD-log_5`만 빠집니다.
+- **`--feature-set`에 없는 열은 고정할 수 없습니다.** 예를 들어 `--feature-set example --pin-feature paper`는 두 세트가 공유하는 `sortino_20`·`sortino_60`만 고정하고, paper의 `DD_10`(반감기 10일)은 example 세트가 만들지 않으므로 경고와 함께 건너뜁니다. 세 피처를 모두 고정하려면 `--feature-set paper`나 `--feature-set extra`를 쓰세요 — `extra`는 `paper`의 세 열을 모두 포함하므로 `--pin-feature paper`가 온전히 적용되고, `--pin-feature DD_5`·`DD_10`·`DD_20`·`DD_60`처럼 개별 지정도 됩니다.
+- **반대로 `--feature-set extra --pin-feature example`은 `--log-dd` 여부에 따라 갈립니다.** 기본(원 스케일)에서는 `extra`가 `DD-log_5/20/60`을 만들지 않으므로(3-1 참고) `ret_5/20/60`·`sortino_5/20/60` 6개만 고정하고 나머지는 경고와 함께 건너뜁니다. `--log-dd`를 같이 주면 `extra`의 DD 반감기(5·10·20·60)가 `example`의 5·20·60을 모두 덮으므로 `example` 9개가 전부 고정됩니다.
 - **`--log-dd`는 고정할 이름도 바꿉니다.** `DD_10` → `DD-log_10`이 되므로 개별 지정도 그에 맞춰야 하고, `--pin-feature paper`처럼 그룹으로 지정하면 이름은 알아서 맞춰집니다.
 - `--model jm`에는 피처 선택 자체가 없으므로 지정해도 경고만 내고 무시합니다.
 - 실제로 무엇이 고정됐는지는 실행 로그(`고정 피처: [...]`, 가중 요약의 `*` 표시)와 `feat_weights.png`(고정 피처는 실선)에서 확인할 수 있습니다.
