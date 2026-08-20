@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from backtest import (build_weights, delay_robustness_table, resolve_cash_limits,
                       resolve_cost_bps, run_0_1_strategy)
-from features import (EXAMPLE_HLS, EXTRA_WINDOWS, FEATURE_SETS, PAPER_DD_HL, apply_transform,
+from features import (EXAMPLE_HLS, EXTRA_DD_HLS, EXTRA_WINDOWS, FEATURE_SETS, apply_transform,
                       build_extra_features, compute_ewm_DD, feature_engineer, feature_set_columns,
                       parse_extra_spec, resolve_pinned_features)
 from hmm_benchmark import smooth_states
@@ -53,7 +53,7 @@ def test_extra_feature_set():
     assert list(extra.columns)[:len(example.columns)] == list(example.columns)
     assert extra[example.columns].equals(example)
     added = [col for col in extra.columns if col not in example.columns]
-    assert len(added) == 26 and len(extra.columns) == 35, (len(added), len(extra.columns))
+    assert len(added) == 28 and len(extra.columns) == 37, (len(added), len(extra.columns))
     # every statistic of the list the set was built from is present
     for name in ("ret-simple", "ret-log", "ret-abs", "ret-sq", "ret-cumlog"):
         assert name in added, name
@@ -63,14 +63,19 @@ def test_extra_feature_set():
     for hl in EXAMPLE_HLS:
         assert f"vol-log_{hl:.0f}" in added and f"vol-chg_{hl:.0f}" in added, hl
     assert "vol-ratio_5-20" in added and "vol-ratio_20-60" in added
-    # ... and so is the downside deviation of the "paper" set, the one column of that set the
-    # "example" one does not hold; --log-dd renames it, as it does in the "paper" set
-    assert added[-1] == "DD_10"
-    assert np.allclose(extra["DD_10"], compute_ewm_DD(ret, PAPER_DD_HL))
+    # ... and so are the raw-scale downside deviations, among them the 10-day one the
+    # "example" set does not hold at all
+    assert added[-3:] == [f"DD_{hl:.0f}" for hl in EXTRA_DD_HLS] == ["DD_10", "DD_20", "DD_60"]
+    for hl in EXTRA_DD_HLS:
+        assert np.allclose(extra[f"DD_{hl:.0f}"], compute_ewm_DD(ret, hl)), hl
+    # the 20- and 60-day ones are the raw twins of the example set's DD-log columns, so under
+    # --log-dd they would *be* those columns and only the 10-day one is left to add
+    assert np.allclose(np.log(extra["DD_20"]), extra["DD-log_20"])
     logged = feature_engineer(ret, ver="extra", log_dd=True)
-    assert "DD_10" not in logged.columns
+    assert [col for col in logged.columns if col.startswith("DD")] == \
+           ["DD-log_5", "DD-log_20", "DD-log_60", "DD-log_10"]
     assert np.allclose(logged["DD-log_10"], np.log(extra["DD_10"]))
-    assert logged.drop(columns="DD-log_10").equals(extra.drop(columns="DD_10"))
+    assert logged.drop(columns="DD-log_10").equals(extra.drop(columns=["DD_10", "DD_20", "DD_60"]))
 
     # the definitions that are easy to get wrong
     assert np.allclose(extra["ret-simple"], ret)
@@ -124,8 +129,8 @@ def test_resolve_pinned_features():
         warnings.simplefilter("always")
         assert resolve(["paper"]) == ["sortino_20", "sortino_60"]
         assert any("DD_10" in str(w.message) for w in caught), [str(w.message) for w in caught]
-    # the extra set does compute that downside deviation, so there "paper" resolves in full and
-    # the column can also be pinned on its own -- with the name --log-dd gives it
+    # the extra set holds every column of the other two, so there both groups resolve in full
+    # and the 10-day downside deviation can be pinned on its own, under the name --log-dd gives it
     with warnings.catch_warnings():
         warnings.simplefilter("error")                     # nothing missing, so nothing to warn
         for log_dd, DD in ((False, "DD_10"), (True, "DD-log_10")):
@@ -134,6 +139,16 @@ def test_resolve_pinned_features():
                                                                   ver="extra", log_dd=log_dd)
             assert resolve_extra(["paper"]) == ["sortino_20", "sortino_60", DD], log_dd
             assert resolve_extra([DD]) == [DD], log_dd
+            assert resolve_extra(["example"]) == feature_set_columns("example"), log_dd
+        # the raw twins of those DD-log columns are pinnable too, on the raw scale only
+        assert resolve_pinned_features(feature_set_columns("extra"), ["DD_60", "DD_20"],
+                                       ver="extra") == ["DD_20", "DD_60"]
+    try:
+        resolve_pinned_features(feature_set_columns("extra", log_dd=True), ["DD_20"],
+                                ver="extra", log_dd=True)
+        raise AssertionError("--log-dd 아래에는 DD_20 열이 없으므로 KeyError를 내야 합니다.")
+    except KeyError:
+        pass
     # individual columns, and the spec a custom variable was added with (its halflife default
     # included), which saves having to know the column name the spec was turned into
     assert resolve(["sortino_60", "VIX:ewm:20"]) == ["sortino_60", "VIX_ewm20"]
