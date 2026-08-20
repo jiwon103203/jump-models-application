@@ -72,8 +72,8 @@ res["performance"]         # 전략 성과표
 
 | 옵션 | 기본값 | 설명 |
 |---|---|---|
-| `--feature-set` | `paper` | `paper`: 논문 Table 2의 3개 피처(DD hl=10, Sortino hl=20·60). `example`: 저장소 나스닥 예제의 9개 피처(hl 5·20·60 × 수익률·log DD·Sortino). `extra`: `example` 9개 + 수익률·변동성 파생 25개 = 34개 (3-1 참고) |
-| `--log-dd` | 꺼짐 | `paper` 피처의 downside deviation을 로그 변환 |
+| `--feature-set` | `paper` | `paper`: 논문 Table 2의 3개 피처(DD hl=10, Sortino hl=20·60). `example`: 저장소 나스닥 예제의 9개 피처(hl 5·20·60 × 수익률·log DD·Sortino). `extra`: `example` 9개 + 수익률·변동성 파생 25개 + `paper`의 `DD_10` = 35개 (3-1 참고) |
+| `--log-dd` | 꺼짐 | `paper`·`extra`가 공유하는 반감기 10일 downside deviation(`DD_10` → `DD-log_10`)을 로그 변환 |
 | `--warmup` | 252 | EWM 초기 불안정 구간으로 버릴 행 수 |
 | `--model` | `jm` | `jm`: 논문의 원본(이산) 점프 모델 / `sjm`: 피처 선택이 있는 sparse 점프 모델 (3-5 참고) |
 | `--max-feats` | 피처 수의 절반 | `sjm` 전용. 남길 유효 피처 개수 κ² |
@@ -96,7 +96,7 @@ res["performance"]         # 전략 성과표
 
 ### 3-1. 확장 피처 세트 (`--feature-set extra`)
 
-`example`의 9개 피처에, 수익률과 변동성에서 흔히 쓰는 파생 변수 25개를 더한 **34개 피처** 세트입니다. 수익률 시계열 하나만으로 만들 수 있는 통계를 폭넓게 깔아 두고 모델이 고르게 하는 용도이므로, **`--model sjm`과 함께 쓰는 것을 권장합니다.**
+`example`의 9개 피처에, 수익률과 변동성에서 흔히 쓰는 파생 변수 25개와 `paper` 세트의 `DD_10`을 더한 **35개 피처** 세트입니다. 세 피처 세트를 모두 포함하므로 `--pin-feature paper`·`--pin-feature example`이 빠짐없이 적용됩니다(3-6 참고). 수익률 시계열 하나만으로 만들 수 있는 통계를 폭넓게 깔아 두고 모델이 고르게 하는 용도이므로, **`--model sjm`과 함께 쓰는 것을 권장합니다.**
 
 ```bash
 python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm
@@ -118,10 +118,12 @@ python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm
 | `vol-log_5/20/60` | 3 | 반감기 5·20·60일 EWMA 변동성(로그 스케일) |
 | `vol-chg_5/20/60` | 3 | 위 변동성의 자기 horizon(5·20·60일) 대비 변화 |
 | `vol-ratio_5-20`, `vol-ratio_20-60` | 2 | 단기/장기 변동성 비율 (로그 스케일이므로 차이가 곧 비율) |
+| `DD_10` | 1 | 논문 Table 2의 반감기 10일 downside deviation. `--log-dd`를 주면 `DD-log_10`으로 로그 변환됩니다 |
 
 - **Rolling Return은 넣지 않았습니다.** `example`의 `ret_5/20/60`(EWM 평균 수익률)이 이미 "과거 구간의 평균 수익률"이라 가중 방식만 다른 같은 통계이기 때문입니다. 단순 창(window) 방식의 누적수익률이 따로 필요하면 `features.extra_features`에 한 줄 추가하면 됩니다.
 - 변동성은 `example`의 `DD-log`와 마찬가지로 **로그 스케일**을 씁니다. 양수·우측 꼬리 분포라 로그가 다루기 좋고, 로그의 차이가 곧 변화율·비율이 되어 `vol-chg`·`vol-ratio`가 자연스럽게 정의됩니다.
 - `DD-log`가 하방 변동성만 보는 데 반해 `vol-log`는 양방향 변동성이라, 둘을 같이 쓰면 "하락"과 "변동성 확대"를 구분하는 데 도움이 됩니다.
+- **`DD_10`은 `paper` 세트에서 그대로 가져온 열입니다.** 반감기 10일은 `example`·`extra`의 어떤 피처도 쓰지 않는 horizon이라, 이 열이 없으면 `--feature-set extra`에서는 논문의 대표 피처를 고정할 수 없었습니다. 다른 세트와 달리 기본값이 원(raw) 스케일인데, 이는 `paper` 세트와 이름·정의를 정확히 맞추기 위해서입니다. 변동성 계열과 스케일을 통일하고 싶으면 `--log-dd`를 주면 됩니다(그러면 열 이름도 `DD-log_10`이 됩니다).
 - `std`와 `var`는 서로 제곱 관계라 정보가 같습니다. 요청하신 목록을 그대로 반영해 둘 다 넣었고, `sjm`을 쓰면 보통 한쪽만 남습니다.
 - ⚠️ `ret-cumlog`는 **정상(stationary) 시계열이 아닙니다.** 표본 전체에 걸쳐 추세를 그리므로 군집 좌표로는 적절하지 않고, 학습창 밖 구간에서는 윈저라이징(±`--clip-mul`σ) 경계에 붙어 상수처럼 동작합니다. 요청 목록에 있어 포함했지만 `sjm`은 대개 이 열의 가중을 0으로 떨어뜨립니다.
 - 일반적으로 `ret-simple`·`ret-log`·`ret-sq`처럼 평활하지 않은 당일 값은 노이즈가 커서 `sjm`에서 먼저 탈락하고, 변동성 계열(`std`·`rms`·`vol-log`·`vol-ratio`)이 남는 경향이 있습니다. 어떤 변수가 실제로 선택됐는지는 `feat_weights.csv`·`feat_weights.png`와 실행 로그에서 확인하세요.
@@ -232,7 +234,8 @@ python run_pipeline.py --input 내데이터.csv --model sjm --feature-set exampl
 `sjm`은 **재추정마다 피처를 다시 고릅니다.** 덕분에 노이즈 피처가 걸러지지만, 반대로 "논문 Table 2의 피처처럼 반드시 들어가야 하는 변수"가 어떤 시기에는 탈락합니다. `--pin-feature`로 고정한 피처는 **모든 재추정에서 가중이 0이 되지 않습니다.**
 
 ```bash
-# paper 3개 피처를 고정하고 나머지 31개는 sjm이 알아서 고르게 (사실상 "논문 피처 + 보조 피처")
+# paper 3개 피처(DD_10·sortino_20·sortino_60)를 고정하고 나머지 32개는 sjm이 알아서 고르게
+# (사실상 "논문 피처 + 보조 피처")
 python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm     --pin-feature paper
 
 # example 9개 전체 + 내가 넣은 VIX를 고정
@@ -257,7 +260,7 @@ python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm
 - 원래 잘렸을 피처가 다시 들어오므로 **유효 피처 수가 `--max-feats`를 조금 넘길 수 있습니다.** 이게 고정의 비용입니다.
 - `--max-feats`가 고정한 피처 개수보다 작으면 그 개수까지 자동으로 늘리고 경고합니다(고정한 피처는 어차피 모두 남으므로 그보다 줄일 수 없습니다). 미지정 시 기본값도 `max(2, 피처 수/2, 고정 개수)`가 됩니다.
 - 고정한 피처가 하나도 없으면 계산은 기존 `SparseJumpModel`과 **완전히 동일**합니다(`test_solve_lasso_pinned`에서 검증).
-- **`--feature-set`에 없는 열은 고정할 수 없습니다.** 예를 들어 `--feature-set example --pin-feature paper`는 두 세트가 공유하는 `sortino_20`·`sortino_60`만 고정하고, paper의 `DD_10`(반감기 10일)은 example 세트가 만들지 않으므로 경고와 함께 건너뜁니다. 세 피처를 모두 고정하려면 `--feature-set paper`를 쓰세요.
+- **`--feature-set`에 없는 열은 고정할 수 없습니다.** 예를 들어 `--feature-set example --pin-feature paper`는 두 세트가 공유하는 `sortino_20`·`sortino_60`만 고정하고, paper의 `DD_10`(반감기 10일)은 example 세트가 만들지 않으므로 경고와 함께 건너뜁니다. 세 피처를 모두 고정하려면 `--feature-set paper`나 `--feature-set extra`를 쓰세요 — `extra`는 `DD_10`을 포함하므로 `--pin-feature paper`도, `--pin-feature DD_10`처럼 그 열만 지정하는 것도 그대로 동작합니다(`--log-dd`를 같이 주면 이름이 `DD-log_10`이 되니 개별 지정도 그 이름으로 하세요).
 - `--model jm`에는 피처 선택 자체가 없으므로 지정해도 경고만 내고 무시합니다.
 - 실제로 무엇이 고정됐는지는 실행 로그(`고정 피처: [...]`, 가중 요약의 `*` 표시)와 `feat_weights.png`(고정 피처는 실선)에서 확인할 수 있습니다.
 

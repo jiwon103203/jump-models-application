@@ -14,8 +14,12 @@ Three feature sets are provided:
   volatility statistics -- the plain, log, absolute, squared and cumulative return,
   the rolling standard deviation, variance, mean absolute return and RMS return
   over 5/20/60-day windows, and the EWMA volatility with its change over time and
-  its ratio across horizons. 34 features in total; pair it with ``--model sjm``,
-  which drops the ones that carry no regime information.
+  its ratio across horizons -- plus the 10-day downside deviation of the ``"paper"``
+  set, the one feature the other two sets do not share. 35 features in total; pair it
+  with ``--model sjm``, which drops the ones that carry no regime information.
+
+``"extra"`` is therefore a superset of the other two sets, so every column of ``"paper"``
+and of ``"example"`` can be pinned while running it.
 
 Any subset of the resulting columns can be *pinned* so that the sparse jump model never
 drops it -- see `resolve_pinned_features` and `sparse_pin.PinnedSparseJumpModel`.
@@ -109,6 +113,17 @@ def compute_ewm_sortino(ret_ser: pd.Series, hl: float) -> pd.Series:
         The EWM Sortino ratio.
     """
     return ret_ser.ewm(halflife=hl).mean().div(compute_ewm_DD(ret_ser, hl))
+
+
+def _paper_DD_column(log_dd: bool = False) -> str:
+    """Name of the downside deviation of the "paper" set, which the log transform renames."""
+    return f"DD{'-log' if log_dd else ''}_{PAPER_DD_HL:.0f}"
+
+
+def _paper_DD(ret_ser: pd.Series, log_dd: bool = False) -> pd.Series:
+    """The downside deviation of the "paper" set, logged when `log_dd` asks for it."""
+    DD = compute_ewm_DD(ret_ser, PAPER_DD_HL)
+    return np.log(DD) if log_dd else DD
 
 
 def example_features(ret_ser: pd.Series) -> dict:
@@ -224,11 +239,13 @@ def feature_engineer(ret_ser: pd.Series, ver: str = "paper", log_dd: bool = Fals
     ver : str, optional (default="paper")
         One of "paper" (three features, Table 2 of the article), "example" (the nine
         features used in the Nasdaq example of this repo) or "extra" (those nine plus the
-        return and volatility statistics of `extra_features`, 34 in total).
+        return and volatility statistics of `extra_features` and the 10-day downside
+        deviation of the "paper" set, 35 in total).
 
     log_dd : bool, optional (default=False)
-        Whether to take the log of the downside deviation feature in the "paper"
-        feature set. The "example" and "extra" sets always use the log scale.
+        Whether to take the log of the 10-day downside deviation, the feature the "paper"
+        and "extra" sets share. The downside deviations the "example" and "extra" sets
+        compute over their own halflives of 5, 20 and 60 days are always on the log scale.
 
     Returns
     -------
@@ -236,8 +253,7 @@ def feature_engineer(ret_ser: pd.Series, ver: str = "paper", log_dd: bool = Fals
         The feature matrix, indexed like `ret_ser`.
     """
     if ver == "paper":
-        DD = compute_ewm_DD(ret_ser, PAPER_DD_HL)
-        feat_dict = {f"DD{'-log' if log_dd else ''}_{PAPER_DD_HL:.0f}": np.log(DD) if log_dd else DD}
+        feat_dict = {_paper_DD_column(log_dd): _paper_DD(ret_ser, log_dd)}
         for hl in PAPER_SORTINO_HLS:
             feat_dict[f"sortino_{hl:.0f}"] = compute_ewm_sortino(ret_ser, hl)
         return pd.DataFrame(feat_dict)
@@ -246,7 +262,11 @@ def feature_engineer(ret_ser: pd.Series, ver: str = "paper", log_dd: bool = Fals
         return pd.DataFrame(example_features(ret_ser))
 
     if ver == "extra":
-        return pd.DataFrame({**example_features(ret_ser), **extra_features(ret_ser)})
+        # the 10-day downside deviation is the one column of the "paper" set the "example"
+        # one does not hold -- appending it here makes "extra" a superset of both, so that
+        # the feature the article leads with can be pinned while running this set
+        return pd.DataFrame({**example_features(ret_ser), **extra_features(ret_ser),
+                             _paper_DD_column(log_dd): _paper_DD(ret_ser, log_dd)})
 
     raise NotImplementedError(f"지원하지 않는 피처 세트입니다: {ver}. 가능한 값: {FEATURE_SETS}")
 
@@ -265,8 +285,9 @@ def feature_set_columns(ver: str = "paper", log_dd: bool = False) -> list:
         The feature set, one of `FEATURE_SETS`.
 
     log_dd : bool, optional (default=False)
-        Whether the downside deviation of the "paper" set is log-transformed, which changes
-        its column name. Ignored by the other sets, which always use the log scale.
+        Whether the 10-day downside deviation -- the last column of the "extra" set as well
+        as the first of the "paper" one -- is log-transformed, which changes its column
+        name. Ignored by "example", whose downside deviations are always on the log scale.
 
     Returns
     -------
@@ -274,7 +295,7 @@ def feature_set_columns(ver: str = "paper", log_dd: bool = False) -> list:
         The column names, in the order `feature_engineer` returns them.
     """
     if ver == "paper":
-        return ([f"DD{'-log' if log_dd else ''}_{PAPER_DD_HL:.0f}"]
+        return ([_paper_DD_column(log_dd)]
                 + [f"sortino_{hl:.0f}" for hl in PAPER_SORTINO_HLS])
 
     if ver in ("example", "extra"):
@@ -290,7 +311,7 @@ def feature_set_columns(ver: str = "paper", log_dd: bool = False) -> list:
             columns += [f"vol-log_{hl:.0f}", f"vol-chg_{hl:.0f}"]
         columns += [f"vol-ratio_{short_hl:.0f}-{long_hl:.0f}"
                     for short_hl, long_hl in EXTRA_VOL_RATIO_PAIRS]
-        return columns
+        return columns + [_paper_DD_column(log_dd)]
 
     raise NotImplementedError(f"지원하지 않는 피처 세트입니다: {ver}. 가능한 값: {FEATURE_SETS}")
 
@@ -509,6 +530,7 @@ def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = F
     feature matrix does not hold are skipped with a warning -- pinning "paper" while running
     ``--feature-set example`` keeps the two Sortino ratios the two sets share, since the
     downside deviation of the paper set uses a halflife the example set does not compute.
+    ``--feature-set extra`` does compute it, so there "paper" resolves in full.
 
     Parameters
     ----------
@@ -523,7 +545,8 @@ def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = F
         the custom variables.
 
     log_dd : bool, optional (default=False)
-        Whether the "paper" downside deviation was log-transformed, see `feature_engineer`.
+        Whether the 10-day downside deviation was log-transformed, see `feature_engineer`;
+        it decides the name that set's pin specification resolves to.
 
     Returns
     -------
