@@ -269,12 +269,15 @@ def plot_weights(strategy_df: pd.DataFrame, filepath: str, figsize=(16, 3.)) -> 
 def plot_feat_weights(feat_weights: pd.DataFrame,
                       filepath: str,
                       title: str = "Feature weights of the sparse JM across re-estimations",
+                      pinned=None,
                       figsize=(16, 6)) -> str:
     """
     Plot how the feature weights of the sparse jump model evolve across re-estimations.
 
     A weight of zero means the Lasso-like constraint dropped that feature at that
     re-estimation, so the figure shows which variables actually drive the regimes over time.
+    Pinned features, which the constraint may never drop, are drawn as solid lines and the
+    ones left to the selection as dashed lines.
 
     Parameters
     ----------
@@ -288,6 +291,9 @@ def plot_feat_weights(feat_weights: pd.DataFrame,
     title : str, optional
         The figure title.
 
+    pinned : iterable of str, optional
+        The pinned features, i.e. `pinned_features` of `rolling.RollingJMResult`.
+
     figsize : tuple, optional
         The figure size, in inches.
 
@@ -298,9 +304,13 @@ def plot_feat_weights(feat_weights: pd.DataFrame,
     """
     _warn_missing_font(feat_weights.columns)
     dates = pd.to_datetime(pd.Index(feat_weights.index))
+    pinned = set(pinned or ())
     fig, ax = plt.subplots(figsize=figsize)
     for column in feat_weights.columns:
-        ax.plot(dates, feat_weights[column], marker="o", ms=3, lw=1.3, label=column)
+        is_pinned = column in pinned
+        ax.plot(dates, feat_weights[column], marker="o", ms=3,
+                lw=2.2 if is_pinned else 1.3, ls="-" if is_pinned else "--",
+                label=f"{column} (pinned)" if is_pinned else column)
     ax.set(title=title, ylabel="Feature weight", ylim=(-.02, None))
     ax.grid(alpha=.25)
     ax.legend(loc="upper left", ncol=2, fontsize="small")

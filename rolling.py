@@ -27,18 +27,23 @@ from jumpmodels.preprocess import DataClipperStd, StandardScalerPD
 from jumpmodels.sparse_jump import SparseJumpModel
 from jumpmodels.utils import weighted_mean_cluster
 
+from sparse_pin import PinnedSparseJumpModel
+
 TRADING_DAYS = 252
 REFIT_MONTHS = (1, 7)          # January and July, i.e. a semiannual refit
 MAX_ANCHOR_GAP_DAYS = 45       # tolerance between the 1st of the month and the first trading day
 MODELS = ("jm", "sjm")         # the original discrete JM, and the sparse JM with feature selection
 
 
-def resolve_max_feats(max_feats, n_features: int) -> float:
+def resolve_max_feats(max_feats, n_features: int, n_pinned: int = 0) -> float:
     """
     Validate the `max_feats` parameter of the sparse jump model, or pick a default.
 
     `max_feats` is the square of kappa in Nystrup et al. (2021) and roughly represents the
     effective number of features kept by the Lasso-like constraint on the feature weights.
+    Pinned features are kept whatever their weight, so the budget cannot be smaller than
+    their number without being violated on every re-estimation; it is raised to `n_pinned`
+    when it is, and the default never falls below it either.
 
     Parameters
     ----------
@@ -48,16 +53,24 @@ def resolve_max_feats(max_feats, n_features: int) -> float:
     n_features : int
         The number of features in the feature matrix.
 
+    n_pinned : int, optional (default=0)
+        The number of pinned features, see `sparse_pin.PinnedSparseJumpModel`.
+
     Returns
     -------
     float
         The value to pass to `SparseJumpModel`.
     """
     if max_feats is None:
-        return max(2., n_features / 2.)
+        return max(2., n_features / 2., float(n_pinned))
     max_feats = float(max_feats)
     if max_feats < 1.:
         raise ValueError(f"max_feats는 1 이상이어야 합니다. 입력값: {max_feats}")
+    if max_feats < n_pinned:
+        warnings.warn(
+            f"max_feats({max_feats:g})가 고정한 피처 개수({n_pinned})보다 작아 {n_pinned}로 늘립니다. "
+            f"고정한 피처는 어차피 모두 남으므로 그보다 적게 줄일 수 없습니다.")
+        max_feats = float(n_pinned)
     if max_feats > n_features:
         warnings.warn(
             f"max_feats({max_feats:g})가 피처 개수({n_features})보다 커서 {n_features}로 줄입니다. "
@@ -72,7 +85,8 @@ def init_model(model: str = "jm",
                n_init: int = 10,
                random_state: int = 0,
                max_feats: float = None,
-               n_features: int = None):
+               n_features: int = None,
+               pin_mask=None):
     """
     Build the model instance used at each re-estimation.
 
@@ -101,19 +115,28 @@ def init_model(model: str = "jm",
     n_features : int, optional
         The number of features, needed to resolve `max_feats`.
 
+    pin_mask : array-like of bool, optional
+        Sparse model only: True for the features the selection may never drop, aligned with
+        the columns of the feature matrix. When it selects at least one feature, the pinned
+        variant of the sparse model is returned.
+
     Returns
     -------
-    JumpModel or SparseJumpModel
+    JumpModel, SparseJumpModel or PinnedSparseJumpModel
         The unfitted model instance.
     """
     if model == "jm":
         return JumpModel(n_components=n_components, jump_penalty=jump_penalty, cont=False,
                          n_init=n_init, random_state=random_state)
     if model == "sjm":
-        return SparseJumpModel(n_components=n_components,
-                               max_feats=resolve_max_feats(max_feats, n_features),
-                               jump_penalty=jump_penalty, cont=False,
-                               n_init_jm=n_init, random_state=random_state)
+        n_pinned = 0 if pin_mask is None else int(np.count_nonzero(pin_mask))
+        kwargs = dict(n_components=n_components,
+                      max_feats=resolve_max_feats(max_feats, n_features, n_pinned=n_pinned),
+                      jump_penalty=jump_penalty, cont=False,
+                      n_init_jm=n_init, random_state=random_state)
+        if n_pinned:
+            return PinnedSparseJumpModel(pin_mask=np.asarray(pin_mask, dtype=bool), **kwargs)
+        return SparseJumpModel(**kwargs)
     raise ValueError(f"지원하지 않는 모델입니다: {model}. 가능한 값: {MODELS}")
 
 
@@ -222,6 +245,10 @@ class RollingJMResult:
     feat_weights : pd.DataFrame or None
         Sparse model only: the feature weights of every re-estimation, indexed by refit
         date with one column per feature. A zero weight means the feature was dropped.
+
+    pinned_features : list of str
+        Sparse model only: the features pinned into the model, i.e. those whose weight is
+        positive at every re-estimation by construction. Empty when nothing was pinned.
     """
     regimes: pd.DataFrame
     params: pd.DataFrame
@@ -231,6 +258,7 @@ class RollingJMResult:
     window: int = 3000
     model: str = "jm"
     feat_weights: pd.DataFrame = None
+    pinned_features: list = field(default_factory=list)
 
 
 def run_rolling_jm(X: pd.DataFrame,
@@ -245,6 +273,7 @@ def run_rolling_jm(X: pd.DataFrame,
                    start_date=None,
                    model: str = "jm",
                    max_feats: float = None,
+                   pin_feats=None,
                    verbose: bool = True) -> RollingJMResult:
     """
     Re-estimate a jump model every six months and infer the regimes online in between.
@@ -297,6 +326,11 @@ def run_rolling_jm(X: pd.DataFrame,
         Sparse model only: the effective number of features to keep. Defaults to half of
         the features, see `resolve_max_feats`.
 
+    pin_feats : iterable of str, optional
+        Sparse model only: the columns of `X` the feature selection may never drop. Use
+        `features.resolve_pinned_features` to turn feature-set names such as "paper" into
+        the column names expected here.
+
     verbose : bool, optional (default=True)
         Whether to print the progress of the re-estimations.
 
@@ -315,6 +349,25 @@ def run_rolling_jm(X: pd.DataFrame,
         warnings.warn(
             f"피처가 {X.shape[1]}개뿐이라 sparse JM의 피처 선택 효과가 거의 없습니다. "
             f"커스텀 변수를 추가하거나 --model jm 을 쓰는 편이 낫습니다.")
+
+    requested = [str(name) for name in (pin_feats or [])]
+    unknown = [name for name in requested if name not in X.columns]
+    if unknown:
+        raise KeyError(
+            f"고정할 피처 {unknown}을 피처 행렬에서 찾을 수 없습니다. "
+            f"사용 가능한 피처: {list(X.columns)}")
+    pinned = [col for col in X.columns if col in set(requested)]
+    if pinned and model != "sjm":
+        warnings.warn(
+            f"피처 고정은 피처를 선택하는 sparse JM 전용이라 --model {model} 에서는 무시합니다. "
+            f"고정이 필요하면 --model sjm 을 쓰세요.")
+        pinned = []
+    if pinned and len(pinned) == X.shape[1]:
+        warnings.warn(
+            f"피처 {X.shape[1]}개를 모두 고정해 sparse JM의 피처 선택이 사실상 꺼집니다. "
+            f"가중은 여전히 BCSS에 따라 달라지지만 탈락하는 피처는 없습니다.")
+    pin_mask = X.columns.isin(pinned) if pinned else None
+
     ret_ser = ret_ser.reindex(X.index)
     if ret_ser.isna().any():
         raise ValueError("수익률 시리즈가 피처 행렬의 모든 날짜를 포함하지 않습니다.")
@@ -348,7 +401,7 @@ def run_rolling_jm(X: pd.DataFrame,
 
         model_ins = init_model(model, n_components=n_components, jump_penalty=jump_penalty,
                                n_init=n_init, random_state=random_state, max_feats=max_feats,
-                               n_features=X.shape[1])
+                               n_features=X.shape[1], pin_mask=pin_mask)
         model_ins.fit(X_train_processed, ret_train, sort_by="cumret")
 
         # online inference from this refit date until the next one
@@ -407,6 +460,8 @@ def run_rolling_jm(X: pd.DataFrame,
                 weights = weight_rows[refit_date]
                 kept = weights[weights > 0]
                 selected = f", 선택된 피처 {len(kept)}/{len(weights)}"
+                if pinned:
+                    selected += f" (고정 {len(pinned)})"
             print(f"[{i + 1}/{len(schedule)}] refit {refit_date}: "
                   f"학습창 {X_train.index[0]} ~ {X_train.index[-1]} ({win}일), "
                   f"온라인 추론 {seg.index[0]} ~ {seg.index[-1]} ({len(seg)}일), "
@@ -425,4 +480,5 @@ def run_rolling_jm(X: pd.DataFrame,
                            feature_names=list(X.columns),
                            window=window,
                            model=model,
-                           feat_weights=feat_weights)
+                           feat_weights=feat_weights,
+                           pinned_features=pinned)
