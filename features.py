@@ -14,9 +14,10 @@ Three feature sets are provided:
   volatility statistics -- the plain, log, absolute, squared and cumulative return,
   the rolling standard deviation, variance, mean absolute return and RMS return
   over 5/20/60-day windows, and the EWMA volatility with its change over time and
-  its ratio across horizons -- plus the 10-day downside deviation of the ``"paper"``
-  set, the one feature the other two sets do not share. 35 features in total; pair it
-  with ``--model sjm``, which drops the ones that carry no regime information.
+  its ratio across horizons -- plus the downside deviation on the raw scale at halflives
+  of 10, 20 and 60 days, the 10-day one being the feature of the ``"paper"`` set. 37
+  features in total, 35 under ``--log-dd`` (see `_extra_DD_hls`); pair it with
+  ``--model sjm``, which drops the ones that carry no regime information.
 
 ``"extra"`` is therefore a superset of the other two sets, so every column of ``"paper"``
 and of ``"example"`` can be pinned while running it.
@@ -44,6 +45,9 @@ EXAMPLE_HLS = (5., 20., 60.)
 # simple-window statistics and as halflives for the exponentially weighted ones
 EXTRA_WINDOWS = (5, 20, 60)
 EXTRA_VOL_RATIO_PAIRS = ((5., 20.), (20., 60.))
+# halflives the "extra" set carries the downside deviation at on the raw scale: the 10 days
+# of the "paper" set, which no other feature uses, and the 20 and 60 of the longer horizons
+EXTRA_DD_HLS = (PAPER_DD_HL, 20., 60.)
 
 
 def compute_ewm_DD(ret_ser: pd.Series, hl: float) -> pd.Series:
@@ -115,15 +119,34 @@ def compute_ewm_sortino(ret_ser: pd.Series, hl: float) -> pd.Series:
     return ret_ser.ewm(halflife=hl).mean().div(compute_ewm_DD(ret_ser, hl))
 
 
-def _paper_DD_column(log_dd: bool = False) -> str:
-    """Name of the downside deviation of the "paper" set, which the log transform renames."""
-    return f"DD{'-log' if log_dd else ''}_{PAPER_DD_HL:.0f}"
+def _DD_column(hl: float, log_dd: bool = False) -> str:
+    """Name of a downside deviation column, which the log transform renames."""
+    return f"DD{'-log' if log_dd else ''}_{hl:.0f}"
 
 
-def _paper_DD(ret_ser: pd.Series, log_dd: bool = False) -> pd.Series:
-    """The downside deviation of the "paper" set, logged when `log_dd` asks for it."""
-    DD = compute_ewm_DD(ret_ser, PAPER_DD_HL)
+def _DD_feature(ret_ser: pd.Series, hl: float, log_dd: bool = False) -> pd.Series:
+    """The downside deviation at a halflife, logged when `log_dd` asks for it."""
+    DD = compute_ewm_DD(ret_ser, hl)
     return np.log(DD) if log_dd else DD
+
+
+def _extra_DD_hls(log_dd: bool = False) -> tuple:
+    """
+    The halflives of `EXTRA_DD_HLS` the "extra" set really adds.
+
+    On the raw scale all of them: the 10-day one is the feature of the "paper" set, and the
+    20- and 60-day ones are the raw counterparts of the `DD-log` columns of the "example"
+    set -- the same statistic on a scale the clustering measures distances on differently.
+    Under `log_dd` those two would be `DD-log_20` and `DD-log_60`, i.e. bit for bit the
+    columns `example_features` already builds, so only the 10-day one is left to add.
+    """
+    return tuple(hl for hl in EXTRA_DD_HLS if not (log_dd and hl in EXAMPLE_HLS))
+
+
+def _extra_DD_features(ret_ser: pd.Series, log_dd: bool = False) -> dict:
+    """Build the downside deviation columns the "extra" set adds, see `_extra_DD_hls`."""
+    return {_DD_column(hl, log_dd): _DD_feature(ret_ser, hl, log_dd)
+            for hl in _extra_DD_hls(log_dd)}
 
 
 def example_features(ret_ser: pd.Series) -> dict:
@@ -239,13 +262,14 @@ def feature_engineer(ret_ser: pd.Series, ver: str = "paper", log_dd: bool = Fals
     ver : str, optional (default="paper")
         One of "paper" (three features, Table 2 of the article), "example" (the nine
         features used in the Nasdaq example of this repo) or "extra" (those nine plus the
-        return and volatility statistics of `extra_features` and the 10-day downside
-        deviation of the "paper" set, 35 in total).
+        return and volatility statistics of `extra_features` and the raw-scale downside
+        deviations of `_extra_DD_features`, 37 in total).
 
     log_dd : bool, optional (default=False)
-        Whether to take the log of the 10-day downside deviation, the feature the "paper"
-        and "extra" sets share. The downside deviations the "example" and "extra" sets
-        compute over their own halflives of 5, 20 and 60 days are always on the log scale.
+        Whether to take the log of the downside deviations kept on the raw scale: the 10-day
+        feature of the "paper" set, and the 10-, 20- and 60-day ones of the "extra" set. The
+        `DD-log` columns of the "example" set are logged either way, so under `log_dd` the
+        "extra" set holds two columns fewer -- it stops repeating them, see `_extra_DD_hls`.
 
     Returns
     -------
@@ -253,7 +277,7 @@ def feature_engineer(ret_ser: pd.Series, ver: str = "paper", log_dd: bool = Fals
         The feature matrix, indexed like `ret_ser`.
     """
     if ver == "paper":
-        feat_dict = {_paper_DD_column(log_dd): _paper_DD(ret_ser, log_dd)}
+        feat_dict = {_DD_column(PAPER_DD_HL, log_dd): _DD_feature(ret_ser, PAPER_DD_HL, log_dd)}
         for hl in PAPER_SORTINO_HLS:
             feat_dict[f"sortino_{hl:.0f}"] = compute_ewm_sortino(ret_ser, hl)
         return pd.DataFrame(feat_dict)
@@ -262,11 +286,11 @@ def feature_engineer(ret_ser: pd.Series, ver: str = "paper", log_dd: bool = Fals
         return pd.DataFrame(example_features(ret_ser))
 
     if ver == "extra":
-        # the 10-day downside deviation is the one column of the "paper" set the "example"
-        # one does not hold -- appending it here makes "extra" a superset of both, so that
-        # the feature the article leads with can be pinned while running this set
+        # the raw-scale downside deviations close the set: the 10-day one is the column of
+        # the "paper" set the "example" one does not hold, which makes "extra" a superset of
+        # both, and the 20- and 60-day ones put that statistic next to its log twin
         return pd.DataFrame({**example_features(ret_ser), **extra_features(ret_ser),
-                             _paper_DD_column(log_dd): _paper_DD(ret_ser, log_dd)})
+                             **_extra_DD_features(ret_ser, log_dd)})
 
     raise NotImplementedError(f"지원하지 않는 피처 세트입니다: {ver}. 가능한 값: {FEATURE_SETS}")
 
@@ -285,9 +309,10 @@ def feature_set_columns(ver: str = "paper", log_dd: bool = False) -> list:
         The feature set, one of `FEATURE_SETS`.
 
     log_dd : bool, optional (default=False)
-        Whether the 10-day downside deviation -- the last column of the "extra" set as well
-        as the first of the "paper" one -- is log-transformed, which changes its column
-        name. Ignored by "example", whose downside deviations are always on the log scale.
+        Whether the raw-scale downside deviations -- the first column of the "paper" set and
+        the last ones of the "extra" set -- are log-transformed, which renames them and, for
+        "extra", drops the two that then duplicate the "example" columns. Ignored by
+        "example" itself, whose downside deviations are always on the log scale.
 
     Returns
     -------
@@ -295,7 +320,7 @@ def feature_set_columns(ver: str = "paper", log_dd: bool = False) -> list:
         The column names, in the order `feature_engineer` returns them.
     """
     if ver == "paper":
-        return ([_paper_DD_column(log_dd)]
+        return ([_DD_column(PAPER_DD_HL, log_dd)]
                 + [f"sortino_{hl:.0f}" for hl in PAPER_SORTINO_HLS])
 
     if ver in ("example", "extra"):
@@ -311,7 +336,7 @@ def feature_set_columns(ver: str = "paper", log_dd: bool = False) -> list:
             columns += [f"vol-log_{hl:.0f}", f"vol-chg_{hl:.0f}"]
         columns += [f"vol-ratio_{short_hl:.0f}-{long_hl:.0f}"
                     for short_hl, long_hl in EXTRA_VOL_RATIO_PAIRS]
-        return columns + [_paper_DD_column(log_dd)]
+        return columns + [_DD_column(hl, log_dd) for hl in _extra_DD_hls(log_dd)]
 
     raise NotImplementedError(f"지원하지 않는 피처 세트입니다: {ver}. 가능한 값: {FEATURE_SETS}")
 
