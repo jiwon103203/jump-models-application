@@ -74,6 +74,7 @@ res["performance"]         # 전략 성과표
 |---|---|---|
 | `--feature-set` | `paper` | `paper`: 논문 Table 2의 3개 피처(DD hl=10, Sortino hl=20·60). `example`: 저장소 나스닥 예제의 9개 피처(hl 5·20·60 × 수익률·log DD·Sortino). `extra`: `example`의 수익률·Sortino 6개 + 수익률·변동성 파생 25개 + `DD_5`·`DD_10`·`DD_20`·`DD_60` = 35개 (3-1 참고) |
 | `--log-dd` | 꺼짐 | `paper`·`extra`의 downside deviation을 로그 변환(`DD_10` → `DD-log_10`). `example`은 원래 로그 스케일이라 영향이 없습니다 |
+| `--remove-series` | 없음 | 피처 **시리즈를 통째로 제거**. `--remove-series var` 는 `var_5`·`var_20`·`var_60`을 모두 뺍니다. 개별 피처 이름·커스텀 변수 지정도 받고, 여러 번 지정 가능 (3-7 참고) |
 | `--warmup` | 252 | EWM 초기 불안정 구간으로 버릴 행 수 |
 | `--model` | `jm` | `jm`: 논문의 원본(이산) 점프 모델 / `sjm`: 피처 선택이 있는 sparse 점프 모델 (3-5 참고) |
 | `--max-feats` | 피처 수의 절반 | `sjm` 전용. 남길 유효 피처 개수 κ² |
@@ -132,9 +133,9 @@ python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm
 - EWMA 변동성(`vol-*`)은 **로그 스케일**을 씁니다. 양수·우측 꼬리 분포라 로그가 다루기 좋고, 로그의 차이가 곧 변화율·비율이 되어 `vol-chg`·`vol-ratio`가 자연스럽게 정의됩니다. downside deviation은 `--log-dd`로 정하며 기본은 원 스케일입니다.
 - `DD` 계열이 하방 변동성만 보는 데 반해 `vol-log`는 양방향 변동성이라, 둘을 같이 쓰면 "하락"과 "변동성 확대"를 구분하는 데 도움이 됩니다.
 - **downside deviation은 `--log-dd` 하나로 스케일이 정해집니다.** 기본은 원 스케일 `DD_5/10/20/60`, `--log-dd`를 주면 `DD-log_5/10/20/60`이고 열 개수는 35개로 같습니다. `log(DD_20) == DD-log_20`이라 두 스케일은 정보량이 같지만, 군집 거리(윈저라이징·표준화 후 유클리드)는 스케일에 따라 달라지므로 결과는 조금 달라집니다. `vol-log` 계열과 스케일을 맞추려면 `--log-dd`를 켜세요.
-- **DD 반감기는 두 세트의 합집합입니다.** `DD_10`은 논문 Table 2의 대표 피처라 넣었고(그래서 `--pin-feature paper`가 `extra`에서 온전히 동작합니다), `DD_5/20/60`은 `example`이 쓰는 반감기라 그대로 가져왔습니다(`--log-dd`와 함께 쓰면 `--pin-feature example`도 온전히 동작합니다). `DD_5`는 `vol-log_5`·`rms_5`·`mad_5`가 보는 단기 변동성의 하방 전용 버전이라, 짧은 horizon에서 "하락"과 "변동성 확대"를 나눠 보는 데 쓰입니다. 반감기를 바꾸거나 빼려면 `features.EXTRA_DD_HLS`를 고치면 됩니다.
-- `std`와 `var`는 서로 제곱 관계라 정보가 같습니다. 요청하신 목록을 그대로 반영해 둘 다 넣었고, `sjm`을 쓰면 보통 한쪽만 남습니다.
-- ⚠️ `ret-cumlog`는 **정상(stationary) 시계열이 아닙니다.** 표본 전체에 걸쳐 추세를 그리므로 군집 좌표로는 적절하지 않고, 학습창 밖 구간에서는 윈저라이징(±`--clip-mul`σ) 경계에 붙어 상수처럼 동작합니다. 요청 목록에 있어 포함했지만 `sjm`은 대개 이 열의 가중을 0으로 떨어뜨립니다.
+- **DD 반감기는 두 세트의 합집합입니다.** `DD_10`은 논문 Table 2의 대표 피처라 넣었고(그래서 `--pin-feature paper`가 `extra`에서 온전히 동작합니다), `DD_5/20/60`은 `example`이 쓰는 반감기라 그대로 가져왔습니다(`--log-dd`와 함께 쓰면 `--pin-feature example`도 온전히 동작합니다). `DD_5`는 `vol-log_5`·`rms_5`·`mad_5`가 보는 단기 변동성의 하방 전용 버전이라, 짧은 horizon에서 "하락"과 "변동성 확대"를 나눠 보는 데 쓰입니다. 반감기를 바꾸려면 `features.EXTRA_DD_HLS`를 고치고, 몇 개만 빼려면 `--remove-series DD_5`처럼 지정하세요(3-7).
+- `std`와 `var`는 서로 제곱 관계라 정보가 같습니다. 요청하신 목록을 그대로 반영해 둘 다 넣었고, `sjm`을 쓰면 보통 한쪽만 남습니다. 아예 빼고 싶으면 `--remove-series var`를 쓰세요(3-7).
+- ⚠️ `ret-cumlog`는 **정상(stationary) 시계열이 아닙니다.** 표본 전체에 걸쳐 추세를 그리므로 군집 좌표로는 적절하지 않고, 학습창 밖 구간에서는 윈저라이징(±`--clip-mul`σ) 경계에 붙어 상수처럼 동작합니다. 요청 목록에 있어 포함했지만 `sjm`은 대개 이 열의 가중을 0으로 떨어뜨립니다. `--remove-series ret-cumlog`로 아예 뺄 수 있습니다(3-7).
 - 일반적으로 `ret-simple`·`ret-log`·`ret-sq`처럼 평활하지 않은 당일 값은 노이즈가 커서 `sjm`에서 먼저 탈락하고, 변동성 계열(`std`·`rms`·`vol-log`·`vol-ratio`)이 남는 경향이 있습니다. 어떤 변수가 실제로 선택됐는지는 `feat_weights.csv`·`feat_weights.png`와 실행 로그에서 확인하세요.
 - 모든 통계는 과거만 참조합니다(`test_extra_feature_set_is_causal`에서 검증).
 - 롤링 창 60일과 `vol-chg_60`의 60일 시차 때문에 앞부분이 잘려 나가므로, 기본 `--warmup 252`면 충분합니다.
@@ -272,8 +273,54 @@ python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm
 - **`--feature-set`에 없는 열은 고정할 수 없습니다.** 예를 들어 `--feature-set example --pin-feature paper`는 두 세트가 공유하는 `sortino_20`·`sortino_60`만 고정하고, paper의 `DD_10`(반감기 10일)은 example 세트가 만들지 않으므로 경고와 함께 건너뜁니다. 세 피처를 모두 고정하려면 `--feature-set paper`나 `--feature-set extra`를 쓰세요 — `extra`는 `paper`의 세 열을 모두 포함하므로 `--pin-feature paper`가 온전히 적용되고, `--pin-feature DD_5`·`DD_10`·`DD_20`·`DD_60`처럼 개별 지정도 됩니다.
 - **반대로 `--feature-set extra --pin-feature example`은 `--log-dd` 여부에 따라 갈립니다.** 기본(원 스케일)에서는 `extra`가 `DD-log_5/20/60`을 만들지 않으므로(3-1 참고) `ret_5/20/60`·`sortino_5/20/60` 6개만 고정하고 나머지는 경고와 함께 건너뜁니다. `--log-dd`를 같이 주면 `extra`의 DD 반감기(5·10·20·60)가 `example`의 5·20·60을 모두 덮으므로 `example` 9개가 전부 고정됩니다.
 - **`--log-dd`는 고정할 이름도 바꿉니다.** `DD_10` → `DD-log_10`이 되므로 개별 지정도 그에 맞춰야 하고, `--pin-feature paper`처럼 그룹으로 지정하면 이름은 알아서 맞춰집니다.
+- **`--remove-series`로 뺀 피처는 고정할 수 없습니다.** 두 옵션이 정면으로 모순되므로 경고가 아니라 오류입니다. 반대로 `--pin-feature extra`처럼 그룹으로 지정하면 남아 있는 열만 고정하고 제거한 열은 조용히 건너뜁니다(제거는 의도한 것이므로 경고하지 않습니다).
 - `--model jm`에는 피처 선택 자체가 없으므로 지정해도 경고만 내고 무시합니다.
 - 실제로 무엇이 고정됐는지는 실행 로그(`고정 피처: [...]`, 가중 요약의 `*` 표시)와 `feat_weights.png`(고정 피처는 실선)에서 확인할 수 있습니다.
+
+### 3-7. 피처 시리즈 제거 (`--remove-series`)
+
+`--feature-set`은 정해진 묶음이라 "extra는 쓰고 싶은데 이 계열만 빼고 싶다"는 조정이 안 됩니다. `--remove-series`가 그 자리로, **같은 통계를 horizon만 바꿔 만든 열 묶음(시리즈)을 통째로** 뺍니다.
+
+```bash
+# var_5·var_20·var_60을 빼고 extra 32개로 실행 (std가 이미 같은 정보를 담고 있으므로)
+python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm     --remove-series var
+
+# 여러 번 지정하면 합집합 — 분산 3개 + 비정상 시계열 1개를 빼고 31개
+python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm     --remove-series var --remove-series ret-cumlog
+
+# 시리즈 전체가 아니라 특정 열 하나만
+python run_pipeline.py --input 내데이터.xlsx --feature-set extra --remove-series DD_5
+```
+
+**시리즈 이름은 열 이름에서 `_` 앞부분**입니다. `var_20` → `var`, `vol-ratio_5-20` → `vol-ratio`, `DD_10` → `DD` 이고, `_`가 없는 `ret-cumlog`·`ret-simple` 같은 열은 그 자체가 하나의 시리즈입니다. `extra` 세트의 시리즈는 아래 15개입니다.
+
+| 시리즈 | 제거되는 열 |
+|---|---|
+| `ret` | `ret_5`, `ret_20`, `ret_60` (EWM 평균 수익률) |
+| `sortino` | `sortino_5`, `sortino_20`, `sortino_60` |
+| `ret-simple` / `ret-log` / `ret-abs` / `ret-sq` / `ret-cumlog` | 같은 이름의 열 1개씩 |
+| `std` / `var` / `mad` / `rms` | `*_5`, `*_20`, `*_60` |
+| `vol-log` / `vol-chg` | `*_5`, `*_20`, `*_60` |
+| `vol-ratio` | `vol-ratio_5-20`, `vol-ratio_20-60` |
+| `DD` | `DD_5`, `DD_10`, `DD_20`, `DD_60` (`--log-dd` 시 `DD-log`) |
+
+`--remove-series`에 줄 수 있는 값은 세 가지이고, 여러 번 지정하면 합집합이 됩니다.
+
+| 지정 | 뜻 |
+|---|---|
+| `var`, `vol-chg`, `DD` | 시리즈 전체 |
+| `var_20`, `ret-cumlog` | 개별 피처 한 개 |
+| `VIX:ewm:20`, `VIX_ewm20` | 커스텀 변수. `--extra-feature`에 준 지정을 그대로 써도 되고, 변수 이름만 주면(`VIX`) 그 변수의 모든 변환이 빠집니다 |
+
+주의사항은 다음과 같습니다.
+
+- **`paper`·`example` 세트에도 그대로 적용됩니다.** 다만 열이 3~9개뿐이라 실익은 `extra`나 커스텀 변수를 많이 넣었을 때 큽니다.
+- **`ret`와 `ret-simple`은 다른 시리즈입니다.** `--remove-series ret`은 EWM 평균 수익률 3개만 빼고 `ret-simple`·`ret-log`·`ret-abs`·`ret-sq`·`ret-cumlog`는 남깁니다. 앞글자가 같다고 함께 빠지지 않습니다.
+- **아무 열도 맞지 않는 지정은 오류입니다.** 오타(`--remove-series vaar`)로 아무것도 제거되지 않은 채 실행이 끝나는 편보다, 사용 가능한 시리즈 목록과 함께 즉시 멈추는 편이 낫기 때문입니다(`--pin-feature`의 그룹 지정이 경고로 넘어가는 것과 다릅니다).
+- **모든 피처를 제거하면 오류입니다.** 최소 한 개는 남아야 합니다.
+- **`--log-dd`를 함께 쓰면 이름이 바뀝니다.** 시리즈 이름은 `DD` → `DD-log`, 개별 열은 `DD_5` → `DD-log_5`가 되므로 제거 지정도 그에 맞춰야 합니다.
+- **제거는 행을 버리기 전에 일어납니다.** 즉 `vol-chg_60`(60일 시차)처럼 앞부분이 길게 NaN인 열을 빼면 그만큼 데이터가 되살아납니다. `--warmup`이 그보다 크면 차이는 없습니다.
+- 무엇이 빠졌는지는 실행 로그의 `제거한 피처: [...]` 줄에서 확인할 수 있고, 제거한 열은 `feat_weights.csv`·`feat_weights.png`와 `refit_params.csv`에도 아예 나타나지 않습니다.
 
 ## 4. 출력물 (`--outdir`)
 
@@ -311,6 +358,7 @@ python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm
 | §3.3 HMM 벤치마크(3000일 롤링, Viterbi 온라인 추론, median filter) | `hmm_benchmark.run_rolling_hmm` |
 | §3.4.1 각주의 sparse JM (Nystrup et al. 2021) | `rolling.init_model(model="sjm")` → `SparseJumpModel` |
 | (논문 밖) 특정 피처를 선택에서 제외하고 항상 유지 | `features.resolve_pinned_features` → `sparse_pin.PinnedSparseJumpModel` |
+| (논문 밖) 피처 시리즈를 모델에 넣기 전에 제거 | `features.resolve_removed_features` → `features.build_features(remove_series=...)` |
 
 ## 6. 구현상의 선택과 주의사항
 
