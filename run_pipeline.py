@@ -7,6 +7,7 @@ Example
 -------
     python run_pipeline.py --input my_index.xlsx --outdir out
     python run_pipeline.py --input my_index.xlsx --hmm --extra-feature VIX:ewm:20
+    python run_pipeline.py --input my_index.xlsx --feature-set extra --remove-series var
 
 Run `python run_pipeline.py --help` for the full list of options.
 """
@@ -26,8 +27,8 @@ from backtest import (DEFAULT_COST_BPS, DEFAULT_MAX_CASH, DEFAULT_MIN_CASH,
                       regime_summary, resolve_cash_limits, resolve_cost_bps, run_0_1_strategy)
 from data_io import (RF_UNITS, TRADING_DAYS, join_extra_table, load_extra_table,
                      load_market_data, normalize_header)
-from features import (FEATURE_SETS, build_extra_features, build_features, parse_extra_spec,
-                      resolve_pinned_features)
+from features import (FEATURE_SETS, build_extra_features, build_features,
+                      feature_set_columns, parse_extra_spec, resolve_pinned_features)
 from rolling import MODELS, run_rolling_jm
 
 
@@ -57,6 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--log-dd", action="store_true",
                        help="paper·extra의 downside deviation을 로그 변환 (DD_10 → DD-log_10). "
                             "example 세트는 원래 로그 스케일이라 영향이 없습니다")
+    group.add_argument("--remove-series", action="append", default=None, metavar="NAME",
+                       help="피처 시리즈를 통째로 제거. 예: --remove-series var 는 var_5·var_20·var_60을 "
+                            "모두 뺍니다. 개별 피처 이름(var_20, ret-cumlog)이나 커스텀 변수 지정"
+                            "(VIX:ewm:20)도 받으며, 여러 번 지정할 수 있습니다")
     group.add_argument("--warmup", type=int, default=252, help="EWM 워밍업으로 버릴 초기 행 수")
 
     group = parser.add_argument_group("커스텀 변수")
@@ -220,6 +225,7 @@ def run_pipeline(input_path: str,
                  end_date=None,
                  feature_set: str = "paper",
                  log_dd: bool = False,
+                 remove_series=None,
                  warmup: int = 252,
                  extra_features=None,
                  extra_file: str = None,
@@ -263,7 +269,8 @@ def run_pipeline(input_path: str,
     re-estimate the jump model every six months over a rolling window while inferring the
     regimes online in between, optionally run the rolling HMM benchmark, and backtest the
     0/1 strategy -- under the main trading delay and, for the robustness table, under
-    several delays. `min_cash`/`max_cash` bound the share held in the risk-free asset,
+    several delays. `remove_series` takes whole families of columns back out of the feature
+    matrix, `min_cash`/`max_cash` bound the share held in the risk-free asset,
     `buy_cost_bps`/`sell_cost_bps` charge the two legs of a trade separately, and
     `pin_features` names the features the sparse model must keep at every re-estimation.
 
@@ -306,12 +313,18 @@ def run_pipeline(input_path: str,
 
     # 2) features from the excess return series (+ custom variables)
     X = build_features(data.excess_ret, ver=feature_set, warmup=warmup, log_dd=log_dd,
-                       extra_features=extra_df)
+                       extra_features=extra_df, remove_series=remove_series)
     if verbose:
+        if remove_series:
+            built = (feature_set_columns(feature_set, log_dd=log_dd)
+                     + (list(extra_df.columns) if extra_df is not None else []))
+            dropped = [col for col in built if col not in set(X.columns)]
+            print(f"제거한 피처: {dropped} ({len(dropped)}/{len(built)}개, 지정: {list(remove_series)})")
         print(f"피처({feature_set}): {list(X.columns)} / {len(X)}행, {X.index[0]} ~ {X.index[-1]}")
 
     # feature-set names such as "paper" become the columns they stand for
-    pinned = resolve_pinned_features(X.columns, pin_features, ver=feature_set, log_dd=log_dd)
+    pinned = resolve_pinned_features(X.columns, pin_features, ver=feature_set, log_dd=log_dd,
+                                     remove_series=remove_series)
     if verbose and pinned and model == "sjm":       # `run_rolling_jm` warns and ignores them otherwise
         print(f"고정 피처: {pinned} ({len(pinned)}/{X.shape[1]}개, 재추정마다 항상 유지)")
 
@@ -459,7 +472,8 @@ def main(argv=None) -> int:
                  date_col=args.date_col, close_col=args.close_col, rf_col=args.rf_col,
                  rf_unit=args.rf_unit, trading_days=args.trading_days,
                  start_date=args.start_date, end_date=args.end_date,
-                 feature_set=args.feature_set, log_dd=args.log_dd, warmup=args.warmup,
+                 feature_set=args.feature_set, log_dd=args.log_dd,
+                 remove_series=args.remove_series, warmup=args.warmup,
                  extra_features=args.extra_feature, extra_file=args.extra_file,
                  extra_sheet=args.extra_sheet, extra_date_col=args.extra_date_col,
                  model=args.model, max_feats=args.max_feats, pin_features=args.pin_feature,

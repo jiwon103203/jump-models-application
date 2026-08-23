@@ -26,6 +26,11 @@ column of ``"paper"`` is therefore a column of ``"extra"`` too, whichever scale 
 and ``--log-dd`` makes every column of ``"example"`` one as well, since ``"extra"`` carries
 the downside deviation at all three halflives that set uses.
 
+Whole *series* of columns can be dropped from any of the sets: the columns of a set come in
+families that share a statistic and differ only in their horizon, and ``--remove-series var``
+takes the rolling variance out of the "extra" set at every window at once -- see
+`resolve_removed_features`.
+
 Any subset of the resulting columns can be *pinned* so that the sparse jump model never
 drops it -- see `resolve_pinned_features` and `sparse_pin.PinnedSparseJumpModel`.
 """
@@ -301,13 +306,14 @@ def feature_engineer(ret_ser: pd.Series, ver: str = "paper", log_dd: bool = Fals
     raise NotImplementedError(f"지원하지 않는 피처 세트입니다: {ver}. 가능한 값: {FEATURE_SETS}")
 
 
-def feature_set_columns(ver: str = "paper", log_dd: bool = False) -> list:
+def feature_set_columns(ver: str = "paper", log_dd: bool = False, remove_series=None) -> list:
     """
-    List the columns `feature_engineer` produces for a feature set, without computing them.
+    List the columns a feature set contributes to the matrix, without computing them.
 
     Pinning a whole feature set by name needs its column names before -- or without -- the
-    features themselves; `test_feature_set_columns` checks this list against the real output
-    of `feature_engineer`, so the two cannot drift apart unnoticed.
+    features themselves, and so does removing a series from one; `test_feature_set_columns`
+    checks this list against the real output of `feature_engineer` and `test_remove_series`
+    checks it against `build_features` under a removal, so they cannot drift apart unnoticed.
 
     Parameters
     ----------
@@ -319,33 +325,40 @@ def feature_set_columns(ver: str = "paper", log_dd: bool = False) -> list:
         which changes their column names. Ignored by "example", which is always on the log
         scale.
 
+    remove_series : iterable of str, optional
+        Series or columns of the set to leave out, see `resolve_removed_features`. Nothing is
+        checked here: a specification naming a custom variable, or nothing at all, simply
+        drops no column of this set.
+
     Returns
     -------
     list of str
-        The column names, in the order `feature_engineer` returns them.
+        The column names, in the order the feature matrix holds them.
     """
     if ver == "paper":
-        return ([_DD_column(PAPER_DD_HL, log_dd)]
-                + [f"sortino_{hl:.0f}" for hl in PAPER_SORTINO_HLS])
+        columns = ([_DD_column(PAPER_DD_HL, log_dd)]
+                   + [f"sortino_{hl:.0f}" for hl in PAPER_SORTINO_HLS])
 
-    if ver in ("example", "extra"):
+    elif ver in ("example", "extra"):
         columns = []
         for hl in EXAMPLE_HLS:
             # the log downside deviation belongs to the "example" set alone, see `feature_engineer`
             columns += ([f"ret_{hl:.0f}"] + ([_DD_column(hl, log_dd=True)] if ver == "example" else [])
                         + [f"sortino_{hl:.0f}"])
-        if ver == "example":
-            return columns
-        columns += ["ret-simple", "ret-log", "ret-abs", "ret-sq", "ret-cumlog"]
-        for window in EXTRA_WINDOWS:
-            columns += [f"{stat}_{window:d}" for stat in ("std", "var", "mad", "rms")]
-        for hl in EXAMPLE_HLS:
-            columns += [f"vol-log_{hl:.0f}", f"vol-chg_{hl:.0f}"]
-        columns += [f"vol-ratio_{short_hl:.0f}-{long_hl:.0f}"
-                    for short_hl, long_hl in EXTRA_VOL_RATIO_PAIRS]
-        return columns + [_DD_column(hl, log_dd) for hl in EXTRA_DD_HLS]
+        if ver == "extra":
+            columns += ["ret-simple", "ret-log", "ret-abs", "ret-sq", "ret-cumlog"]
+            for window in EXTRA_WINDOWS:
+                columns += [f"{stat}_{window:d}" for stat in ("std", "var", "mad", "rms")]
+            for hl in EXAMPLE_HLS:
+                columns += [f"vol-log_{hl:.0f}", f"vol-chg_{hl:.0f}"]
+            columns += [f"vol-ratio_{short_hl:.0f}-{long_hl:.0f}"
+                        for short_hl, long_hl in EXTRA_VOL_RATIO_PAIRS]
+            columns += [_DD_column(hl, log_dd) for hl in EXTRA_DD_HLS]
 
-    raise NotImplementedError(f"지원하지 않는 피처 세트입니다: {ver}. 가능한 값: {FEATURE_SETS}")
+    else:
+        raise NotImplementedError(f"지원하지 않는 피처 세트입니다: {ver}. 가능한 값: {FEATURE_SETS}")
+
+    return _drop_removed(columns, remove_series) if remove_series else columns
 
 
 ############################################
@@ -473,11 +486,136 @@ def build_extra_features(df: pd.DataFrame, specs) -> pd.DataFrame:
     return pd.DataFrame(out, index=df.index)
 
 
+def _spec_column_name(spec: str):
+    """
+    Return the column a custom variable specification builds, or None when `spec` is not one.
+
+    It lets a variable be pinned (`resolve_pinned_features`) or removed
+    (`resolve_removed_features`) under the same ``column[:transform[:param]]`` string it was
+    added with, rather than under the name `build_extra_features` derived from it.
+    """
+    try:
+        return _extra_feature_name(*parse_extra_spec(spec))
+    except ValueError:
+        return None
+
+
+############################################
+## Removing a feature series
+############################################
+
+def feature_series_name(column: str) -> str:
+    """
+    Return the series a feature column belongs to, its name up to the first ``_``.
+
+    The columns of a feature set come in families that share a statistic and differ only in
+    their horizon, and the ``_`` is what separates the two: ``var_5``, ``var_20`` and
+    ``var_60`` are the rolling variance over three windows and form the ``var`` series. A
+    column without a horizon -- ``ret-cumlog``, or a custom variable used as is -- is a
+    series of its own.
+    """
+    return str(column).split("_", 1)[0]
+
+
+def feature_series(columns) -> list:
+    """List the distinct series of `columns`, in order of first appearance."""
+    return list(dict.fromkeys(feature_series_name(col) for col in columns))
+
+
+def _spec_removal_names(spec: str) -> set:
+    """
+    The names one removal specification matches: the specification itself, which is compared
+    against both the series and the column names, plus -- for a custom variable specification
+    such as ``VIX:ewm:20`` -- the column it builds, so that the variable can be removed under
+    the string it was added with.
+    """
+    name = str(spec).strip()
+    if not name:
+        raise ValueError("제거할 피처 시리즈 이름이 비어 있습니다.")
+    column = _spec_column_name(name)
+    return {name} if column is None else {name, column}
+
+
+def _removal_names(specs) -> set:
+    """The names a whole set of removal specifications matches."""
+    names = set()
+    for spec in specs or ():
+        names |= _spec_removal_names(spec)
+    return names
+
+
+def _is_removed(column: str, names: set) -> bool:
+    """Whether `names` removes a column, by naming it directly or by naming its series."""
+    return column in names or feature_series_name(column) in names
+
+
+def _drop_removed(columns, specs) -> list:
+    """`columns` minus the ones `specs` names, without checking that each spec matched one."""
+    names = _removal_names(specs)
+    return [col for col in columns if not _is_removed(col, names)]
+
+
+def resolve_removed_features(columns, specs) -> list:
+    """
+    Expand removal specifications into the feature columns they take out of the matrix.
+
+    A feature set is a fixed list, and not every one of its columns is worth carrying: the
+    rolling variance is the squared rolling standard deviation, so ``var`` and ``std`` hold
+    the same information twice, and dropping one of the two is cheaper than paying for it in
+    the feature budget of the sparse model. Removing a series is the blunt instrument for
+    that -- it happens before the model ever sees the matrix, so a removed column is absent
+    from the fit, from ``feat_weights.csv`` and from the plots alike.
+
+    A specification is either
+
+    - a series name, e.g. ``"var"`` for ``var_5``, ``var_20`` and ``var_60``, or ``"DD"`` for
+      the whole downside deviation family (`feature_series_name` gives the series of a column);
+    - the exact name of a single column, e.g. ``"var_20"`` or ``"ret-cumlog"``; or
+    - the specification a custom variable was added with, e.g. ``"VIX:ewm:20"``, which removes
+      that transform of the variable while leaving any other one in place.
+
+    Unlike a pin, a specification that matches no column is an error rather than a warning:
+    it is a typo, and silently keeping the series it was meant to remove would go unnoticed.
+
+    Parameters
+    ----------
+    columns : iterable of str
+        The columns of the feature matrix, in order, custom variables included.
+
+    specs : iterable of str, optional
+        The specifications to expand. None or empty gives an empty list.
+
+    Returns
+    -------
+    list of str
+        The columns to drop, ordered as in `columns` and free of duplicates.
+    """
+    columns = [str(col) for col in columns]
+    removed = set()
+
+    for spec in specs or ():
+        names = _spec_removal_names(spec)
+        hit = [col for col in columns if _is_removed(col, names)]
+        if not hit:
+            raise KeyError(
+                f"제거할 피처 '{str(spec).strip()}'을 찾을 수 없습니다. 시리즈 이름(예: 'var'), "
+                f"개별 피처 이름(예: 'var_20'), 또는 커스텀 변수 지정(예: 'VIX:ewm:20') 중 "
+                f"하나여야 합니다. 사용 가능한 시리즈: {feature_series(columns)}")
+        removed.update(hit)
+
+    return [col for col in columns if col in removed]
+
+
+############################################
+## The feature matrix
+############################################
+
 def build_features(ret_ser: pd.Series,
                    ver: str = "paper",
                    warmup: int = 252,
                    log_dd: bool = False,
-                   extra_features: pd.DataFrame = None) -> pd.DataFrame:
+                   extra_features: pd.DataFrame = None,
+                   remove_series=None) -> pd.DataFrame:
     """
     Build the feature matrix and discard the burn-in period of the exponential weights.
 
@@ -503,6 +641,12 @@ def build_features(ret_ser: pd.Series,
         Custom features to append to the return-based ones, typically the output of
         `build_extra_features`. They are aligned on the index of the return series.
 
+    remove_series : iterable of str, optional
+        Series or columns to leave out of the matrix, custom variables included, see
+        `resolve_removed_features`. They are dropped before the rows are, so a series that
+        needs a long lookback -- ``vol-chg``, whose 60-day column is NaN over the first 60
+        rows -- stops costing rows once it is removed.
+
     Returns
     -------
     pd.DataFrame
@@ -514,6 +658,11 @@ def build_features(ret_ser: pd.Series,
         if overlap:
             raise ValueError(f"커스텀 변수 이름이 기본 피처와 겹칩니다: {overlap}")
         X = X.join(extra_features.reindex(X.index), how="left")
+    if remove_series:
+        X = X.drop(columns=resolve_removed_features(X.columns, remove_series))
+        if not len(X.columns):
+            raise ValueError(
+                f"제거 지정 {list(remove_series)}이 모든 피처를 없앴습니다. 최소 한 개는 남아야 합니다.")
     if warmup > 0:
         X = X.iloc[warmup:]
     X = X.replace([np.inf, -np.inf], np.nan).dropna()
@@ -527,20 +676,8 @@ def build_features(ret_ser: pd.Series,
 ## Pinned (always-kept) features
 ############################################
 
-def _spec_column_name(spec: str):
-    """
-    Return the column a custom variable specification builds, or None when `spec` is not one.
-
-    It lets a variable be pinned under the same ``column[:transform[:param]]`` string it was
-    added with, rather than under the name `build_extra_features` derived from it.
-    """
-    try:
-        return _extra_feature_name(*parse_extra_spec(spec))
-    except ValueError:
-        return None
-
-
-def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = False) -> list:
+def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = False,
+                            remove_series=None) -> list:
     """
     Expand pin specifications into the feature columns they name.
 
@@ -583,6 +720,12 @@ def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = F
         Whether the 10-day downside deviation was log-transformed, see `feature_engineer`;
         it decides the name that set's pin specification resolves to.
 
+    remove_series : iterable of str, optional
+        The series left out of the matrix, see `resolve_removed_features`. A group only ever
+        pins what the matrix still holds, so telling the two apart lets a removed column be
+        reported as removed rather than as missing, and keeps a group from warning about
+        columns that were dropped on purpose.
+
     Returns
     -------
     list of str
@@ -590,7 +733,8 @@ def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = F
     """
     columns = [str(col) for col in columns]
     known = set(columns)
-    base = set(feature_set_columns(ver, log_dd=log_dd))
+    base = set(feature_set_columns(ver, log_dd=log_dd, remove_series=remove_series))
+    removed_names = _removal_names(remove_series)
     pinned = set()
 
     for spec in specs or ():
@@ -602,6 +746,10 @@ def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = F
         if group not in PIN_GROUPS:
             column = name if name in known else _spec_column_name(name)
             if column not in known:
+                if _is_removed(column or name, removed_names):
+                    raise KeyError(
+                        f"고정할 피처 '{name}'은 제거 지정으로 이미 빠진 피처입니다. "
+                        "고정하려면 제거 목록에서 빼 주세요.")
                 raise KeyError(
                     f"고정할 피처 '{name}'을 찾을 수 없습니다. 피처 이름, 커스텀 변수 지정"
                     f"(예: 'VIX:ewm:20'), 또는 그룹 이름 {PIN_GROUPS} 중 하나여야 합니다. "
@@ -620,7 +768,7 @@ def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = F
             if not wanted:
                 warnings.warn("커스텀 변수가 없어 'custom' 고정 지정이 아무 피처도 선택하지 않았습니다.")
         else:
-            wanted = feature_set_columns(group, log_dd=log_dd)
+            wanted = feature_set_columns(group, log_dd=log_dd, remove_series=remove_series)
             missing = [col for col in wanted if col not in known]
             if missing:
                 warnings.warn(

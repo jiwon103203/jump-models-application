@@ -19,8 +19,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from backtest import (build_weights, delay_robustness_table, resolve_cash_limits,
                       resolve_cost_bps, run_0_1_strategy)
 from features import (EXAMPLE_HLS, EXTRA_DD_HLS, EXTRA_WINDOWS, FEATURE_SETS, apply_transform,
-                      build_extra_features, compute_ewm_DD, feature_engineer, feature_set_columns,
-                      parse_extra_spec, resolve_pinned_features)
+                      build_extra_features, build_features, compute_ewm_DD, feature_engineer,
+                      feature_series, feature_series_name, feature_set_columns, parse_extra_spec,
+                      resolve_pinned_features, resolve_removed_features)
 from hmm_benchmark import smooth_states
 from rolling import (init_model, refit_schedule, resolve_max_feats, run_rolling_jm,
                      semiannual_anchors)
@@ -119,6 +120,93 @@ def test_feature_set_columns():
         raise AssertionError("알 수 없는 피처 세트는 NotImplementedError를 내야 합니다.")
     except NotImplementedError:
         pass
+
+
+def _extra_ret(n=400):
+    """A return series long enough for the 60-day windows of the "extra" set."""
+    return pd.Series(np.linspace(-.02, .02, n), index=pd.bdate_range("2020-01-01", periods=n).date)
+
+
+def test_remove_series():
+    """A removal specification takes out a whole family of columns, and only that family."""
+    ret, columns = _extra_ret(), feature_set_columns("extra")
+    # a series is the column name up to the horizon the "_" separates; a column carrying no
+    # horizon is a series of its own
+    assert feature_series_name("var_20") == "var"
+    assert feature_series_name("vol-ratio_5-20") == "vol-ratio"
+    assert feature_series_name("ret-cumlog") == "ret-cumlog"
+    assert feature_series(columns)[:2] == ["ret", "sortino"]
+    assert {"var", "std", "vol-chg", "DD", "ret-simple"} <= set(feature_series(columns))
+
+    assert resolve_removed_features(columns, None) == []
+    assert resolve_removed_features(columns, ["var"]) == ["var_5", "var_20", "var_60"]
+    assert resolve_removed_features(columns, ["DD"]) == ["DD_5", "DD_10", "DD_20", "DD_60"]
+    # "ret" is the EWM return series, not every column whose name starts with those letters
+    assert resolve_removed_features(columns, ["ret"]) == ["ret_5", "ret_20", "ret_60"]
+    assert resolve_removed_features(columns, ["ret-simple"]) == ["ret-simple"]
+    # individual columns, and several specifications at once: column order, no duplicates
+    assert resolve_removed_features(columns, ["var_20", "ret-cumlog"]) == ["ret-cumlog", "var_20"]
+    assert resolve_removed_features(columns, ["var_20", "var"]) == ["var_5", "var_20", "var_60"]
+
+    # what `feature_set_columns` advertises is what `build_features` builds, removals included
+    for specs in (["var"], ["var", "vol-chg", "ret-cumlog"], ["std", "var", "mad", "rms"]):
+        advertised = feature_set_columns("extra", remove_series=specs)
+        assert advertised == [col for col in columns
+                              if col not in resolve_removed_features(columns, specs)], specs
+        assert list(build_features(ret, ver="extra", warmup=100,
+                                   remove_series=specs).columns) == advertised, specs
+    # removed before the rows are, so a series is no longer paid for in warmup rows
+    assert len(build_features(ret, ver="extra", warmup=0, remove_series=["vol-chg"])) > \
+           len(build_features(ret, ver="extra", warmup=0))
+    # ... and the columns that stay are untouched
+    full = build_features(ret, ver="extra", warmup=100)
+    assert full.drop(columns=["var_5", "var_20", "var_60"]).equals(
+        build_features(ret, ver="extra", warmup=100, remove_series=["var"]))
+
+    # a specification that matches nothing is a typo, not a silent no-op
+    for bad in (["없는시리즈"], ["var_30"], ["Var"], [" "]):
+        try:
+            resolve_removed_features(columns, bad)
+            raise AssertionError(f"{bad}는 KeyError나 ValueError를 내야 합니다.")
+        except (KeyError, ValueError):
+            pass
+    try:
+        build_features(ret, ver="paper", warmup=100, remove_series=["DD", "sortino"])
+        raise AssertionError("피처를 모두 제거하면 ValueError를 내야 합니다.")
+    except ValueError:
+        pass
+
+
+def test_remove_custom_variable():
+    """Custom variables are removed by their series or by the specification they came in as."""
+    ret = _extra_ret()
+    raw = pd.DataFrame({"VIX": np.linspace(15., 30., len(ret))}, index=ret.index)
+    extra = build_extra_features(raw, ["VIX:ewm:20", "VIX:diff:5"])
+    build = lambda specs: list(build_features(ret, ver="paper", warmup=100, extra_features=extra,
+                                              remove_series=specs).columns)
+    paper = feature_set_columns("paper")
+    assert build(None) == paper + ["VIX_ewm20", "VIX_diff5"]
+    # the specification the variable was added with removes that transform alone ...
+    assert build(["VIX:ewm:20"]) == paper + ["VIX_diff5"]
+    assert build(["VIX_diff5"]) == paper + ["VIX_ewm20"]
+    # ... while the variable's name is the series both transforms belong to
+    assert build(["VIX"]) == paper
+
+
+def test_pinning_a_removed_series():
+    """Pinning knows what was removed: a group skips it quietly, a name is refused loudly."""
+    columns = feature_set_columns("extra", remove_series=["var"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")      # the group asks for nothing the matrix lacks
+        assert resolve_pinned_features(columns, ["extra"], ver="extra",
+                                       remove_series=["var"]) == columns
+    # a pin naming a removed column is a contradiction between two options, not an unknown name
+    for pin in ("var_20", "var"):
+        try:
+            resolve_pinned_features(columns, [pin], ver="extra", remove_series=["var"])
+            raise AssertionError(f"제거한 '{pin}'을 고정하면 KeyError를 내야 합니다.")
+        except KeyError as err:
+            assert "제거" in str(err), str(err)
 
 
 def test_resolve_pinned_features():
