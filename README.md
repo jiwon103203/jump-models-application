@@ -63,7 +63,7 @@ python test_pipeline.py      # 또는 pytest test_pipeline.py
 from run_pipeline import run_pipeline
 
 res = run_pipeline("내데이터.xlsx", outdir="out", jump_penalty=50.)
-res["result"].regimes      # 온라인 추론 레짐
+res["result"].regimes      # 온라인 추론 레짐 (regime + proba_0·proba_1 확률)
 res["result"].params       # 재추정별 추정 파라미터
 res["performance"]         # 전략 성과표
 ```
@@ -76,7 +76,9 @@ res["performance"]         # 전략 성과표
 | `--log-dd` | 꺼짐 | `paper`·`extra`의 downside deviation을 로그 변환(`DD_10` → `DD-log_10`). `example`은 원래 로그 스케일이라 영향이 없습니다 |
 | `--remove-series` | 없음 | 피처 **시리즈를 통째로 제거**. `--remove-series var` 는 `var_5`·`var_20`·`var_60`을 모두 뺍니다. 개별 피처 이름·커스텀 변수 지정도 받고, 여러 번 지정 가능 (3-7 참고) |
 | `--warmup` | 252 | EWM 초기 불안정 구간으로 버릴 행 수 |
-| `--model` | `jm` | `jm`: 논문의 원본(이산) 점프 모델 / `sjm`: 피처 선택이 있는 sparse 점프 모델 (3-5 참고) |
+| `--model` | `jm` | `jm`: 논문의 원본 점프 모델 / `sjm`: 피처 선택이 있는 sparse 점프 모델 (3-5 참고) |
+| `--no-cont` | 꺼짐(=연속형 사용) | 기본은 **연속형 점프 모델(CJM)** 이라 `regimes.csv`의 `proba_*`가 확률값입니다. 이 옵션을 주면 논문의 이산 모델로 돌아가 `proba_*`가 0/1 원핫이 됩니다 (3-8 참고) |
+| `--grid-size` | 0.05 | 연속형 모델의 확률 격자 간격. 출력 확률의 해상도이자 계산량을 정합니다 (3-8 참고) |
 | `--max-feats` | 피처 수의 절반 | `sjm` 전용. 남길 유효 피처 개수 κ² |
 | `--pin-feature` | 없음 | `sjm` 전용. 재추정마다 **항상 남길 피처**. 피처 세트 이름·`custom`·`all`·개별 피처 이름·커스텀 변수 지정을 받고, 여러 번 지정 가능 (3-6 참고) |
 | `--jump-penalty` | 50.0 | 점프 페널티 λ. 클수록 레짐이 덜 바뀝니다(논문 Table 3) |
@@ -322,11 +324,34 @@ python run_pipeline.py --input 내데이터.xlsx --feature-set extra --remove-se
 - **제거는 행을 버리기 전에 일어납니다.** 즉 `vol-chg_60`(60일 시차)처럼 앞부분이 길게 NaN인 열을 빼면 그만큼 데이터가 되살아납니다. `--warmup`이 그보다 크면 차이는 없습니다.
 - 무엇이 빠졌는지는 실행 로그의 `제거한 피처: [...]` 줄에서 확인할 수 있고, 제거한 열은 `feat_weights.csv`·`feat_weights.png`와 `refit_params.csv`에도 아예 나타나지 않습니다.
 
+### 3-8. 연속형 점프 모델과 레짐 확률 (`--no-cont`, `--grid-size`)
+
+`regimes.csv`의 `proba_0`·`proba_1`은 기본적으로 **확률값**입니다. 논문의 이산 점프 모델은 매일을 한 레짐에 딱 배정하기 때문에 두 열이 `1,0` 아니면 `0,1`인 원핫이 되고 `regime` 열을 되풀이할 뿐입니다. 그래서 이 저장소는 Nystrup, Lindström and Madsen (2020)의 **연속형 점프 모델(CJM)** 을 기본으로 씁니다. CJM은 동적계획법의 상태공간을 단체(simplex)의 꼭짓점이 아니라 그 위의 격자점으로 두기 때문에, 각 날짜의 해가 `proba_0 = 0.65` 같은 확률 벡터로 나옵니다.
+
+```bash
+# 기본 — proba_0·proba_1이 0.05 간격의 확률값
+python run_pipeline.py --input 내데이터.xlsx
+
+# 확률 해상도를 0.01로 (격자점이 늘어 온라인 추론이 느려집니다)
+python run_pipeline.py --input 내데이터.xlsx --grid-size 0.01
+
+# 논문 원본대로 이산 모델 — proba_0·proba_1이 0/1 원핫
+python run_pipeline.py --input 내데이터.xlsx --no-cont
+```
+
+알아둘 점은 다음과 같습니다.
+
+- **`regime` 열과 그 아래의 모든 결과는 성격이 바뀌지 않습니다.** `regime`은 여전히 확률이 가장 큰 상태(argmax)이고, 0/1 전략·성과표·그림은 그 신호를 그대로 씁니다. 다만 CJM과 이산 JM은 서로 다른 최적화 문제라 **추론된 레짐 경로 자체가 조금 달라지므로 백테스트 숫자도 달라집니다.** 논문 수치를 그대로 재현하려면 `--no-cont`를 쓰세요.
+- **확률은 `--grid-size` 배수로만 나옵니다.** 기본 0.05면 `0, 0.05, ..., 1`의 21개 값입니다. 연속적인 실수가 필요하면 `--grid-size 0.01`처럼 줄이면 되지만, 격자점 수는 레짐 `n`개에 대해 `C(1/grid + n − 1, n − 1)`이고 동적계획법 비용은 그 **제곱**이라 금방 무거워집니다. 레짐 3개에 `--grid-size 0.01`은 5151개 격자점이라 실행 전에 오류로 막습니다(`--n-components 2`면 101개로 가볍습니다).
+- **λ가 크면 대부분의 날은 여전히 0/1에 붙습니다.** CJM의 점프 페널티는 확률 벡터 사이 거리의 제곱에 비례해서, λ가 클수록 중간 확률을 쓰는 비용이 커집니다. 합성 데이터 예시에서 중간 확률(0 < `proba_0` < 1)이 나온 날의 비중은 λ=50에서 0.4%, λ=25에서 1.2%, λ=10에서 3.5%였습니다. 확률이 완만하게 움직이길 원한다면 `--jump-penalty`를 함께 낮춰야 합니다.
+- **`--grid-size`의 역수는 정수여야 합니다.** `0.1`·`0.05`·`0.02`·`0.01`처럼 1을 나누는 값을 쓰세요. 아니면 가장 가까운 격자로 내림하면서 경고를 출력합니다.
+- **`--model sjm`에도 그대로 적용됩니다.** sparse JM은 내부의 점프 모델에 설정을 그대로 넘기므로, 피처 가중·선택 결과와 무관하게 확률 출력이 됩니다.
+
 ## 4. 출력물 (`--outdir`)
 
 | 파일 | 내용 |
 |---|---|
-| `regimes.csv` | 날짜별 온라인 추론 레짐(0=bull, 1=bear), 레짐 확률, 사용된 재추정 시점, 종가·수익률·무위험금리·초과수익률, 전략 비중과 전략 수익률 |
+| `regimes.csv` | 날짜별 온라인 추론 레짐(0=bull, 1=bear), 레짐 확률(`proba_0`·`proba_1`), 사용된 재추정 시점, 종가·수익률·무위험금리·초과수익률, 전략 비중과 전략 수익률. 기본(연속형)에서는 `proba_*`가 `--grid-size` 간격의 확률값이고, `--no-cont`를 주면 0/1 원핫입니다 (3-8 참고) |
 | `refit_params.csv` | 재추정 시점 × 레짐별 학습창 구간, 학습창 내 비중·연율 수익률·연율 변동성, 자기전이확률, **원래 피처 단위로 되돌린 군집 중심** |
 | `strategy.csv` | 일별 비중·매수량(`bought`)·매도량(`sold`)·총 거래량(`traded`)·거래비용(`cost`)·무위험금리·매수보유 수익률·전략 수익률 |
 | `performance.csv` | 매수보유 vs JM 0/1 전략 성과(CAGR, 변동성, Sharpe, MDD, Calmar, ES 5%, Turnover, Leverage, 연율 거래비용 `Cost`) |
@@ -357,6 +382,7 @@ python run_pipeline.py --input 내데이터.xlsx --feature-set extra --remove-se
 | Table 5 거래 지연 1/5/10일 로버스트니스 | `backtest.delay_robustness_table` |
 | §3.3 HMM 벤치마크(3000일 롤링, Viterbi 온라인 추론, median filter) | `hmm_benchmark.run_rolling_hmm` |
 | §3.4.1 각주의 sparse JM (Nystrup et al. 2021) | `rolling.init_model(model="sjm")` → `SparseJumpModel` |
+| (논문 밖) 연속형 JM (Nystrup et al. 2020) — 확률로 나오는 레짐 | `rolling.init_model(cont=True)` → `JumpModel(cont=True)` |
 | (논문 밖) 특정 피처를 선택에서 제외하고 항상 유지 | `features.resolve_pinned_features` → `sparse_pin.PinnedSparseJumpModel` |
 | (논문 밖) 피처 시리즈를 모델에 넣기 전에 제거 | `features.resolve_removed_features` → `features.build_features(remove_series=...)` |
 
@@ -366,6 +392,7 @@ python run_pipeline.py --input 내데이터.xlsx --feature-set extra --remove-se
 - **온라인 추론 lookback**: 논문은 매일 길이 3000의 고정 lookback으로 DP를 풉니다. 여기서는 각 6개월 구간마다 `[재추정일 − window, 구간 끝]` 데이터를 `predict_proba_online`에 한 번 넣습니다. 구간 내 각 날짜의 lookback은 3000일 이상 3000+약 125일 이하가 되며, 어떤 날짜의 신호도 그 날짜 이후 정보를 쓰지 않습니다.
 - **첫 영업일 기준**: 재추정 시점은 데이터에 실제로 존재하는 거래일 중 1월 1일·7월 1일 **이후 첫 거래일**입니다. 데이터 공백으로 45일 이상 떨어진 경우와 데이터의 첫 행은 제외합니다.
 - **데이터가 짧을 때**: `--window`를 채우지 못하는 초기 재추정은 가용한 최대 길이(단, `--min-window` 이상)로 자동 축소하고 경고합니다. 학습창이 짧으면 군집이 불안정하므로, 초기 구간을 성과 평가에서 빼려면 `--refit-start`를 쓰세요.
+- **연속형 모델이 기본**: `regimes.csv`에 레짐 확률을 남기기 위해 기본값을 연속형 JM(CJM)으로 두었습니다. 논문 수치를 재현할 때는 `--no-cont`로 이산 모델을 쓰세요(3-8 참고). 어느 쪽이든 `regime` 열은 확률이 가장 큰 상태이고, 확률이 정확히 반씩 갈리는 날은 낮은 번호(bull) 쪽으로 배정됩니다.
 - **λ 선택**: 논문 §3.4.3의 시계열 교차검증(매월, 8년 검증창, Sharpe 최대화)은 구현하지 않았습니다. `--jump-penalty`로 고정값을 주며, 논문의 대표값은 50.0입니다. HMM의 median filter 길이 `k`도 같은 이유로 고정값(기본 6)입니다.
 - **HMM 재추정 주기**: 논문은 3000일 창을 매일 재적합하지만 EM 적합 1회가 약 0.8초라 30년 데이터에서 몇 시간이 걸립니다. 기본값은 21거래일(월 1회)이고 `--hmm-refit-every 1`로 논문과 동일하게 맞출 수 있습니다. 상태 디코딩(Viterbi)은 재추정 주기와 무관하게 매일 수행됩니다.
 - **HMM 비교 구간**: HMM은 JM의 첫 온라인 추론일부터 시작하도록 맞춰 두 모델의 평가 구간이 같습니다. 다만 HMM은 워밍업으로 버린 수익률까지 학습에 쓸 수 있어 같은 시점에서 학습창이 더 길 수 있습니다(JM 피처는 `--warmup`만큼 늦게 시작).
@@ -379,11 +406,11 @@ python run_pipeline.py --input 내데이터.xlsx --feature-set extra --remove-se
 
 ## 7. 실행 예시 결과
 
-`make_sample_data.py`로 만든 샘플(나스닥 100 종가 + 합성 무위험금리, 1989–2024, λ=50, 3000일 학습창, 1일 지연, 10bp)에 HMM 벤치마크를 함께 돌린 결과입니다.
+`make_sample_data.py`로 만든 샘플(나스닥 100 종가 + 합성 무위험금리, 1989–2024, λ=50, 3000일 학습창, 1일 지연, 10bp)에 HMM 벤치마크를 함께 돌린 결과입니다. 아래 7절의 숫자는 모두 **논문의 이산 모델**(`--no-cont`)로 얻은 것입니다. 기본값인 연속형 모델(3-8)은 레짐 경로가 조금 달라 성과 숫자도 그대로 재현되지는 않습니다.
 
 ```bash
 python make_sample_data.py --output sample_input.csv
-python run_pipeline.py --input sample_input.csv --hmm --outdir out
+python run_pipeline.py --input sample_input.csv --hmm --no-cont --outdir out
 ```
 
 ```
@@ -420,7 +447,7 @@ HMM 재추정 주기는 기본값 21거래일(월 1회)이며, 위 실행은 약
 
 ### 7-1. 피처를 늘렸을 때 JM vs Sparse JM
 
-같은 샘플에 예제 9피처 + 커스텀 2개(`변동성지수:ewm:20`, `변동성지수:diff:5`) = 11피처를 넣고, 2009–2024 구간을 비교한 결과입니다(`--n-init 3`).
+같은 샘플에 예제 9피처 + 커스텀 2개(`변동성지수:ewm:20`, `변동성지수:diff:5`) = 11피처를 넣고, 2009–2024 구간을 비교한 결과입니다(`--n-init 3`, `--no-cont`).
 
 | | JM | SJM (κ²=5.5, 기본) | SJM (κ²=3) |
 |---|---|---|---|
