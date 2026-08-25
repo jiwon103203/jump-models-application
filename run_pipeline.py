@@ -29,7 +29,7 @@ from data_io import (RF_UNITS, TRADING_DAYS, join_extra_table, load_extra_table,
                      load_market_data, normalize_header)
 from features import (FEATURE_SETS, build_extra_features, build_features,
                       feature_set_columns, parse_extra_spec, resolve_pinned_features)
-from rolling import MODELS, run_rolling_jm
+from rolling import DEFAULT_GRID_SIZE, MODELS, run_rolling_jm
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -95,6 +95,11 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--n-init", type=int, default=10, help="좌표하강 알고리즘 재시작 횟수")
     group.add_argument("--random-state", type=int, default=0, help="초기화 난수 시드")
     group.add_argument("--refit-start", default=None, help="이 날짜 이후의 재추정 시점만 사용")
+    group.add_argument("--no-cont", action="store_true",
+                       help="연속형 점프 모델(CJM) 대신 논문의 이산 모델을 사용 "
+                            "(regimes.csv의 proba_* 열이 0/1 원핫이 됨)")
+    group.add_argument("--grid-size", type=float, default=DEFAULT_GRID_SIZE,
+                       help="연속형 모델의 확률 격자 간격 (출력 확률의 해상도)")
 
     group = parser.add_argument_group("HMM 벤치마크 (hmmlearn 필요)")
     group.add_argument("--hmm", action="store_true", help="2-state 가우시안 HMM 벤치마크를 함께 실행")
@@ -242,6 +247,8 @@ def run_pipeline(input_path: str,
                  n_init: int = 10,
                  random_state: int = 0,
                  refit_start=None,
+                 cont: bool = True,
+                 grid_size: float = DEFAULT_GRID_SIZE,
                  hmm: bool = False,
                  hmm_window: int = None,
                  hmm_refit_every: int = 21,
@@ -273,6 +280,9 @@ def run_pipeline(input_path: str,
     matrix, `min_cash`/`max_cash` bound the share held in the risk-free asset,
     `buy_cost_bps`/`sell_cost_bps` charge the two legs of a trade separately, and
     `pin_features` names the features the sparse model must keep at every re-estimation.
+    `cont` selects the continuous jump model, which is the default here: the `proba_*`
+    columns of `regimes.csv` then hold genuine regime probabilities, spaced by `grid_size`,
+    rather than the 0/1 one-hot rows of the discrete model of the article.
 
     Parameters
     ----------
@@ -328,11 +338,17 @@ def run_pipeline(input_path: str,
     if verbose and pinned and model == "sjm":       # `run_rolling_jm` warns and ignores them otherwise
         print(f"고정 피처: {pinned} ({len(pinned)}/{X.shape[1]}개, 재추정마다 항상 유지)")
 
+    if verbose:
+        variant = (f"연속형(CJM, grid_size={grid_size:g}) → regimes.csv의 proba_* 열이 확률값"
+                   if cont else "이산형(논문 원본) → regimes.csv의 proba_* 열이 0/1 원핫")
+        print(f"모델: {model.upper()} {variant}")
+
     # 3) semiannual refits on a rolling window + online inference in between
     result = run_rolling_jm(X, data.excess_ret, jump_penalty=jump_penalty, window=window,
                             min_window=min_window, n_components=n_components, clip_mul=clip_mul,
                             n_init=n_init, random_state=random_state, start_date=refit_start,
-                            model=model, max_feats=max_feats, pin_feats=pinned, verbose=verbose)
+                            model=model, max_feats=max_feats, pin_feats=pinned,
+                            cont=cont, grid_size=grid_size, verbose=verbose)
 
     # 4) 0/1 strategy backtest on the online inferred signal
     strategy = run_0_1_strategy(result.regimes.regime, data.ret, data.rf,
@@ -479,6 +495,7 @@ def main(argv=None) -> int:
                  model=args.model, max_feats=args.max_feats, pin_features=args.pin_feature,
                  jump_penalty=args.jump_penalty, window=args.window, min_window=args.min_window,
                  n_components=args.n_components, clip_mul=args.clip_mul, n_init=args.n_init,
+                 cont=not args.no_cont, grid_size=args.grid_size,
                  random_state=args.random_state, refit_start=args.refit_start,
                  hmm=args.hmm, hmm_window=args.hmm_window, hmm_refit_every=args.hmm_refit_every,
                  hmm_smooth_k=args.hmm_smooth_k, hmm_n_init=args.hmm_n_init,

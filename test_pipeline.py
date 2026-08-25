@@ -23,8 +23,8 @@ from features import (EXAMPLE_HLS, EXTRA_DD_HLS, EXTRA_WINDOWS, FEATURE_SETS, ap
                       feature_series, feature_series_name, feature_set_columns, parse_extra_spec,
                       resolve_pinned_features, resolve_removed_features)
 from hmm_benchmark import smooth_states
-from rolling import (init_model, refit_schedule, resolve_max_feats, run_rolling_jm,
-                     semiannual_anchors)
+from rolling import (DEFAULT_GRID_SIZE, init_model, refit_schedule, resolve_grid_size,
+                     resolve_max_feats, run_rolling_jm, semiannual_anchors)
 from sparse_pin import PinnedSparseJumpModel, solve_lasso_pinned
 
 DATES = pd.date_range("2020-01-01", periods=12, freq="D").date
@@ -403,8 +403,31 @@ def test_resolve_max_feats():
         assert resolve_max_feats(2., 10, n_pinned=3) == 3.
 
 
+def test_resolve_grid_size():
+    """The simplex mesh is validated, snapped to a divisor of one, and capped in size."""
+    assert resolve_grid_size(.05, 2) == .05
+    assert resolve_grid_size(.1, 3) == .1
+    for bad in (0., -.1, 1.5):
+        try:
+            resolve_grid_size(bad, 2)
+            raise AssertionError(f"grid_size={bad}는 ValueError를 내야 합니다.")
+        except ValueError:
+            pass
+    # the mesh must divide one; 0.03 becomes 1/33, with a warning
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        snapped = resolve_grid_size(.03, 2)
+    assert int(1. / snapped) == 33 and any("grid_size" in str(w.message) for w in caught)
+    # a mesh this fine over three regimes would blow the dynamic program up
+    try:
+        resolve_grid_size(.005, 3)
+        raise AssertionError("격자점이 너무 많으면 ValueError를 내야 합니다.")
+    except ValueError:
+        pass
+
+
 def test_init_model():
-    """The factory returns the discrete jump model or the sparse one, and rejects anything else."""
+    """The factory returns the plain jump model or the sparse one, and rejects anything else."""
     from jumpmodels.jump import JumpModel
     from jumpmodels.sparse_jump import SparseJumpModel
     assert isinstance(init_model("jm", jump_penalty=50.), JumpModel)
@@ -417,8 +440,12 @@ def test_init_model():
                         pin_mask=mask)
     assert isinstance(pinned, PinnedSparseJumpModel)
     assert (pinned.pin_mask == mask).all() and pinned.max_feats == 3.
-    # a mask is meaningless for the discrete model, which does not weigh features
+    # a mask is meaningless for the plain model, which does not weigh features
     assert not hasattr(init_model("jm", pin_mask=mask), "pin_mask")
+    # the continuous variant is the default, and `cont=False` restores the model of the article
+    assert init_model("jm").cont and init_model("jm").grid_size == DEFAULT_GRID_SIZE
+    assert init_model("sjm", n_features=9).cont
+    assert not init_model("jm", cont=False).cont
     try:
         init_model("cjm")
         raise AssertionError("알 수 없는 모델은 ValueError를 내야 합니다.")
@@ -511,8 +538,8 @@ def test_pinned_sparse_jump_model_run():
         pass
 
 
-def test_pinning_is_ignored_by_the_discrete_model():
-    """The discrete JM has no feature selection to override, so a pin is dropped with a warning."""
+def test_pinning_is_ignored_by_the_plain_model():
+    """The plain JM has no feature selection to override, so a pin is dropped with a warning."""
     X, ret = _toy_features()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -522,8 +549,41 @@ def test_pinning_is_ignored_by_the_discrete_model():
     assert any("sjm" in str(w.message) for w in caught), [str(w.message) for w in caught]
 
 
+def test_continuous_model_reports_probabilities():
+    """The default continuous model fills `proba_*` with probabilities, not one-hot rows."""
+    X, ret = _toy_features()
+    kwargs = dict(jump_penalty=10., window=300, min_window=250, n_init=2, verbose=False)
+    for model in ("jm", "sjm"):
+        result = run_rolling_jm(X, ret, model=model, **kwargs)
+        proba = result.regimes[["proba_0", "proba_1"]].to_numpy()
+        assert result.cont and result.grid_size == DEFAULT_GRID_SIZE
+        assert np.allclose(proba.sum(axis=1), 1.) and (proba >= 0.).all()
+        # genuine probabilities: strictly between 0 and 1 somewhere, and on the simplex grid
+        assert ((proba > 0.) & (proba < 1.)).any(), "원핫으로만 나왔습니다"
+        assert np.allclose(proba / DEFAULT_GRID_SIZE, np.round(proba / DEFAULT_GRID_SIZE))
+        # the reported regime stays the most likely state, so the 0/1 signal is unaffected
+        assert (result.regimes.regime.to_numpy() == proba.argmax(axis=1)).all()
+        assert set(result.regimes.regime.unique()) <= {0, 1}
+
+    # a coarser mesh coarsens the reported probabilities
+    coarse = run_rolling_jm(X, ret, model="jm", grid_size=.25, **kwargs)
+    assert coarse.grid_size == .25
+    assert set(np.round(coarse.regimes.proba_0.unique(), 10)) <= {0., .25, .5, .75, 1.}
+
+
+def test_discrete_model_keeps_one_hot_probabilities():
+    """`cont=False` restores the discrete model of the article, whose `proba_*` are 0/1."""
+    X, ret = _toy_features()
+    result = run_rolling_jm(X, ret, model="jm", jump_penalty=10., window=300, min_window=250,
+                            n_init=2, cont=False, verbose=False)
+    proba = result.regimes[["proba_0", "proba_1"]].to_numpy()
+    assert not result.cont
+    assert np.isin(proba, [0., 1.]).all() and np.allclose(proba.sum(axis=1), 1.)
+    assert (result.regimes.regime.to_numpy() == proba.argmax(axis=1)).all()
+
+
 def test_jump_model_run_has_no_feature_weights():
-    """The discrete model produces the same shape of output, without feature weights."""
+    """The plain model produces the same shape of output, without feature weights."""
     X, ret = _toy_features()
     result = run_rolling_jm(X, ret, model="jm", jump_penalty=10., window=300, min_window=250,
                             n_init=2, verbose=False)

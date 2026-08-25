@@ -7,8 +7,14 @@ day on or after January 1st and July 1st -- over a training window of 3000 tradi
 prevailing regime of each day is inferred online, i.e. from the features available at
 the end of that day only, using a lookback window of the same length as the training
 window (Section 3.4.2 of the article).
+
+By default the continuous variant of the model (CJM) is fitted, so that the regime of each
+day comes out as a probability rather than a 0/1 assignment; `cont=False` restores the
+discrete model of the article. Either way the reported `regime` is the most likely state,
+so everything downstream of the signal is unchanged.
 """
 
+import math
 import os
 import sys
 import warnings
@@ -32,7 +38,9 @@ from sparse_pin import PinnedSparseJumpModel
 TRADING_DAYS = 252
 REFIT_MONTHS = (1, 7)          # January and July, i.e. a semiannual refit
 MAX_ANCHOR_GAP_DAYS = 45       # tolerance between the 1st of the month and the first trading day
-MODELS = ("jm", "sjm")         # the original discrete JM, and the sparse JM with feature selection
+MODELS = ("jm", "sjm")         # the JM of the article, and the sparse JM with feature selection
+DEFAULT_GRID_SIZE = 0.05       # simplex mesh of the continuous JM: probabilities are multiples of it
+MAX_GRID_POINTS = 5000         # above this the DP over the simplex gets impractically slow
 
 
 def resolve_max_feats(max_feats, n_features: int, n_pinned: int = 0) -> float:
@@ -79,6 +87,52 @@ def resolve_max_feats(max_feats, n_features: int, n_pinned: int = 0) -> float:
     return max_feats
 
 
+def resolve_grid_size(grid_size: float, n_components: int) -> float:
+    """
+    Validate the simplex mesh of the continuous jump model and report its cost.
+
+    The continuous model solves its dynamic program over the grid points of the probability
+    simplex spaced by `grid_size`, so the inferred probabilities are multiples of it: with
+    the default 0.05 and two regimes the state space is 0., .05, ..., 1. The number of grid
+    points is `C(N + n_components - 1, n_components - 1)` with `N = 1/grid_size`, and the DP
+    costs the square of that per day, which is why a fine mesh gets expensive fast.
+
+    Parameters
+    ----------
+    grid_size : float
+        The requested mesh, in (0, 1]. `1/grid_size` should be an integer; when it is not,
+        the model effectively rounds it down to `1/int(1/grid_size)`.
+
+    n_components : int
+        The number of regimes, i.e. the dimension of the simplex.
+
+    Returns
+    -------
+    float
+        The mesh actually used by the model.
+    """
+    grid_size = float(grid_size)
+    if not 0. < grid_size <= 1.:
+        raise ValueError(f"grid_size는 0 초과 1 이하여야 합니다. 입력값: {grid_size}")
+    n_steps = int(1. / grid_size)       # at least 1, since `grid_size` is at most 1
+    # the model recovers the number of steps as `int(1/grid_size)`, and that round trip is
+    # not exact for every mesh (1/93 comes back as 92), so nudge the value until it is
+    effective = 1. / n_steps
+    while int(1. / effective) < n_steps:
+        effective = float(np.nextafter(effective, 0.))
+    if abs(effective - grid_size) > 1e-12:
+        warnings.warn(
+            f"grid_size({grid_size:g})의 역수가 정수가 아니라 모델이 실제로는 "
+            f"{effective:g}(=1/{n_steps})를 씁니다. 0.1, 0.05, 0.02 처럼 1을 나누는 값을 쓰세요.")
+    n_points = math.comb(n_steps + n_components - 1, n_components - 1)
+    if n_points > MAX_GRID_POINTS:
+        raise ValueError(
+            f"grid_size({grid_size:g})와 레짐 {n_components}개의 조합이 확률 격자점 {n_points}개를 "
+            f"만들어 동적계획법이 너무 느려집니다(한도 {MAX_GRID_POINTS}개). "
+            f"grid_size를 키우거나 --no-cont 로 이산 모델을 쓰세요.")
+    return effective
+
+
 def init_model(model: str = "jm",
                n_components: int = 2,
                jump_penalty: float = 50.,
@@ -86,7 +140,9 @@ def init_model(model: str = "jm",
                random_state: int = 0,
                max_feats: float = None,
                n_features: int = None,
-               pin_mask=None):
+               pin_mask=None,
+               cont: bool = True,
+               grid_size: float = DEFAULT_GRID_SIZE):
     """
     Build the model instance used at each re-estimation.
 
@@ -120,19 +176,28 @@ def init_model(model: str = "jm",
         the columns of the feature matrix. When it selects at least one feature, the pinned
         variant of the sparse model is returned.
 
+    cont : bool, optional (default=True)
+        Whether to fit the continuous jump model (CJM), whose state space is the probability
+        simplex instead of the vertices, so that every day gets a genuine regime probability
+        rather than a 0/1 assignment. False restores the discrete model of the article.
+
+    grid_size : float, optional (default=0.05)
+        Continuous model only: the mesh of the simplex, see `resolve_grid_size`.
+
     Returns
     -------
     JumpModel, SparseJumpModel or PinnedSparseJumpModel
         The unfitted model instance.
     """
+    grid_size = resolve_grid_size(grid_size, n_components) if cont else float(grid_size)
     if model == "jm":
-        return JumpModel(n_components=n_components, jump_penalty=jump_penalty, cont=False,
-                         n_init=n_init, random_state=random_state)
+        return JumpModel(n_components=n_components, jump_penalty=jump_penalty, cont=cont,
+                         grid_size=grid_size, n_init=n_init, random_state=random_state)
     if model == "sjm":
         n_pinned = 0 if pin_mask is None else int(np.count_nonzero(pin_mask))
         kwargs = dict(n_components=n_components,
                       max_feats=resolve_max_feats(max_feats, n_features, n_pinned=n_pinned),
-                      jump_penalty=jump_penalty, cont=False,
+                      jump_penalty=jump_penalty, cont=cont, grid_size=grid_size,
                       n_init_jm=n_init, random_state=random_state)
         if n_pinned:
             return PinnedSparseJumpModel(pin_mask=np.asarray(pin_mask, dtype=bool), **kwargs)
@@ -220,6 +285,9 @@ class RollingJMResult:
     regimes : pd.DataFrame
         Online inferred regimes, indexed by date, with the assigned regime (0 = bull,
         1 = bear), the regime probabilities and the refit date whose parameters were used.
+        With the continuous model (`cont=True`) the `proba_*` columns hold genuine
+        probabilities, multiples of `grid_size` summing to one; with the discrete model
+        they are one-hot and merely restate the `regime` column.
 
     params : pd.DataFrame
         One row per (refit date, state): the training window, the cluster centroid in the
@@ -242,6 +310,13 @@ class RollingJMResult:
     model : str
         The model used, "jm" or "sjm".
 
+    cont : bool
+        Whether the continuous variant was fitted, i.e. whether `regimes` carries genuine
+        probabilities rather than one-hot rows.
+
+    grid_size : float
+        Continuous model only: the mesh of the probability simplex actually used.
+
     feat_weights : pd.DataFrame or None
         Sparse model only: the feature weights of every re-estimation, indexed by refit
         date with one column per feature. A zero weight means the feature was dropped.
@@ -257,6 +332,8 @@ class RollingJMResult:
     feature_names: list = field(default_factory=list)
     window: int = 3000
     model: str = "jm"
+    cont: bool = True
+    grid_size: float = DEFAULT_GRID_SIZE
     feat_weights: pd.DataFrame = None
     pinned_features: list = field(default_factory=list)
 
@@ -274,6 +351,8 @@ def run_rolling_jm(X: pd.DataFrame,
                    model: str = "jm",
                    max_feats: float = None,
                    pin_feats=None,
+                   cont: bool = True,
+                   grid_size: float = DEFAULT_GRID_SIZE,
                    verbose: bool = True) -> RollingJMResult:
     """
     Re-estimate a jump model every six months and infer the regimes online in between.
@@ -331,6 +410,19 @@ def run_rolling_jm(X: pd.DataFrame,
         `features.resolve_pinned_features` to turn feature-set names such as "paper" into
         the column names expected here.
 
+    cont : bool, optional (default=True)
+        Whether to fit the continuous jump model (CJM) of Nystrup, Lindström and Madsen
+        (2020). Its dynamic program runs over the grid points of the probability simplex
+        instead of its vertices, so `RollingJMResult.regimes` reports a regime probability
+        per day -- e.g. `proba_0 = 0.65` -- instead of a one-hot row. The `regime` column is
+        still the argmax of those probabilities, so the 0/1 strategy is unaffected in kind.
+        Set to False for the discrete model of the article, whose `proba_*` columns are 0/1.
+
+    grid_size : float, optional (default=0.05)
+        Continuous model only: the mesh of the probability simplex, i.e. the resolution of
+        the reported probabilities. A finer mesh costs the square of the number of grid
+        points in the online inference, see `resolve_grid_size`.
+
     verbose : bool, optional (default=True)
         Whether to print the progress of the re-estimations.
 
@@ -345,6 +437,7 @@ def run_rolling_jm(X: pd.DataFrame,
         raise TypeError("X는 pandas DataFrame이어야 합니다.")
     if model not in MODELS:
         raise ValueError(f"지원하지 않는 모델입니다: {model}. 가능한 값: {MODELS}")
+    grid_size = resolve_grid_size(grid_size, n_components) if cont else float(grid_size)
     if model == "sjm" and X.shape[1] <= 3:
         warnings.warn(
             f"피처가 {X.shape[1]}개뿐이라 sparse JM의 피처 선택 효과가 거의 없습니다. "
@@ -401,7 +494,8 @@ def run_rolling_jm(X: pd.DataFrame,
 
         model_ins = init_model(model, n_components=n_components, jump_penalty=jump_penalty,
                                n_init=n_init, random_state=random_state, max_feats=max_feats,
-                               n_features=X.shape[1], pin_mask=pin_mask)
+                               n_features=X.shape[1], pin_mask=pin_mask,
+                               cont=cont, grid_size=grid_size)
         model_ins.fit(X_train_processed, ret_train, sort_by="cumret")
 
         # online inference from this refit date until the next one
@@ -480,5 +574,7 @@ def run_rolling_jm(X: pd.DataFrame,
                            feature_names=list(X.columns),
                            window=window,
                            model=model,
+                           cont=cont,
+                           grid_size=grid_size,
                            feat_weights=feat_weights,
                            pinned_features=pinned)
