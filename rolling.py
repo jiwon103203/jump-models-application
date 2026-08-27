@@ -12,6 +12,10 @@ By default the continuous variant of the model (CJM) is fitted, so that the regi
 day comes out as a probability rather than a 0/1 assignment; `cont=False` restores the
 discrete model of the article. Either way the reported `regime` is the most likely state,
 so everything downstream of the signal is unchanged.
+
+Winsorization and feature scaling are refitted on each training window too, so that the
+common scale the model clusters on is defined by past data only; `scaler` picks how that
+scale is defined, see `scaling`.
 """
 
 import math
@@ -29,10 +33,11 @@ try:
 except ImportError:  # a source checkout that has not been pip-installed
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     from jumpmodels.jump import JumpModel
-from jumpmodels.preprocess import DataClipperStd, StandardScalerPD
+from jumpmodels.preprocess import DataClipperStd
 from jumpmodels.sparse_jump import SparseJumpModel
 from jumpmodels.utils import weighted_mean_cluster
 
+from scaling import DEFAULT_SCALER, FeatureScaler, resolve_scaler
 from sparse_pin import PinnedSparseJumpModel
 
 TRADING_DAYS = 252
@@ -317,6 +322,9 @@ class RollingJMResult:
     grid_size : float
         Continuous model only: the mesh of the probability simplex actually used.
 
+    scaler : str
+        The feature scaler refitted on every training window, one of `scaling.SCALERS`.
+
     feat_weights : pd.DataFrame or None
         Sparse model only: the feature weights of every re-estimation, indexed by refit
         date with one column per feature. A zero weight means the feature was dropped.
@@ -334,6 +342,7 @@ class RollingJMResult:
     model: str = "jm"
     cont: bool = True
     grid_size: float = DEFAULT_GRID_SIZE
+    scaler: str = DEFAULT_SCALER
     feat_weights: pd.DataFrame = None
     pinned_features: list = field(default_factory=list)
 
@@ -345,6 +354,7 @@ def run_rolling_jm(X: pd.DataFrame,
                    min_window: int = 500,
                    n_components: int = 2,
                    clip_mul: float = 3.,
+                   scaler: str = DEFAULT_SCALER,
                    n_init: int = 10,
                    random_state: int = 0,
                    start_date=None,
@@ -386,6 +396,13 @@ def run_rolling_jm(X: pd.DataFrame,
 
     clip_mul : float, optional (default=3.)
         Winsorization threshold, in training-window standard deviations.
+
+    scaler : str, optional (default="standard")
+        How the winsorized features are put on a common scale before the model clusters
+        them: "standard" for the z-score of the article, "robust" for the median and the
+        Gaussian-equivalent interquartile range, "minmax" for the [0, 1] range of the
+        training window, or "none" to leave the features in their own units. See
+        `scaling.FeatureScaler`.
 
     n_init : int, optional (default=10)
         Number of restarts of the coordinate descent algorithm.
@@ -437,6 +454,13 @@ def run_rolling_jm(X: pd.DataFrame,
         raise TypeError("X는 pandas DataFrame이어야 합니다.")
     if model not in MODELS:
         raise ValueError(f"지원하지 않는 모델입니다: {model}. 가능한 값: {MODELS}")
+    scaler = resolve_scaler(scaler)
+    if scaler == "none" and X.shape[1] > 1:
+        warnings.warn(
+            f"--scaler none 은 피처 {X.shape[1]}개를 원래 단위 그대로 둡니다. 단위가 다르면 스케일이 큰 "
+            f"피처가 군집 거리를"
+            + ("(그리고 sparse JM의 피처 가중을) " if model == "sjm" else " ")
+            + "지배합니다. 이미 스케일이 맞은 피처가 아니라면 --scaler standard 또는 robust 를 쓰세요.")
     grid_size = resolve_grid_size(grid_size, n_components) if cont else float(grid_size)
     if model == "sjm" and X.shape[1] <= 3:
         warnings.warn(
@@ -488,9 +512,9 @@ def run_rolling_jm(X: pd.DataFrame,
         X_train = X.iloc[train_slice]
         ret_train = ret_ser.iloc[train_slice]
 
-        # clipping and standardization are refitted on the current training window only
-        clipper, scaler = DataClipperStd(mul=clip_mul), StandardScalerPD()
-        X_train_processed = scaler.fit_transform(clipper.fit_transform(X_train))
+        # clipping and scaling are refitted on the current training window only
+        clipper, feat_scaler = DataClipperStd(mul=clip_mul), FeatureScaler(scaler)
+        X_train_processed = feat_scaler.fit_transform(clipper.fit_transform(X_train))
 
         model_ins = init_model(model, n_components=n_components, jump_penalty=jump_penalty,
                                n_init=n_init, random_state=random_state, max_feats=max_feats,
@@ -501,7 +525,7 @@ def run_rolling_jm(X: pd.DataFrame,
         # online inference from this refit date until the next one
         seg_end = schedule[i + 1][1] if i + 1 < len(schedule) else n_obs
         X_context = X.iloc[pos - win:seg_end]      # lookback window + the segment itself
-        proba_online = model_ins.predict_proba_online(scaler.transform(clipper.transform(X_context)))
+        proba_online = model_ins.predict_proba_online(feat_scaler.transform(clipper.transform(X_context)))
         proba_seg = proba_online.iloc[win:]        # drop the lookback rows
 
         seg = pd.DataFrame(np.asarray(proba_seg), index=proba_seg.index, columns=proba_cols)
@@ -511,7 +535,7 @@ def run_rolling_jm(X: pd.DataFrame,
 
         # parameters of this refit, with the centroids mapped back to the feature units.
         # The sparse model stores its centroids in the weighted space, so they are recomputed
-        # on the unweighted features before being un-standardized.
+        # on the unweighted features before the scaling is undone.
         if model == "sjm":
             centers = weighted_mean_cluster(np.asarray(X_train_processed),
                                             np.asarray(model_ins.proba_))
@@ -519,7 +543,7 @@ def run_rolling_jm(X: pd.DataFrame,
                                                 index=X.columns)
         else:
             centers = model_ins.centers_
-        centers_orig = scaler.scaler.inverse_transform(centers)
+        centers_orig = feat_scaler.inverse_transform(centers)
         transmat = getattr(model_ins, "transmat_", None)
         if transmat is None:        # the sparse model keeps it on its inner jump model
             transmat = model_ins.jm_ins.transmat_
@@ -576,5 +600,6 @@ def run_rolling_jm(X: pd.DataFrame,
                            model=model,
                            cont=cont,
                            grid_size=grid_size,
+                           scaler=scaler,
                            feat_weights=feat_weights,
                            pinned_features=pinned)

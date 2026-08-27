@@ -25,6 +25,7 @@ from features import (EXAMPLE_HLS, EXTRA_DD_HLS, EXTRA_WINDOWS, FEATURE_SETS, ap
 from hmm_benchmark import smooth_states
 from rolling import (DEFAULT_GRID_SIZE, init_model, refit_schedule, resolve_grid_size,
                      resolve_max_feats, run_rolling_jm, semiannual_anchors)
+from scaling import (DEFAULT_SCALER, IQR_TO_STD, SCALERS, FeatureScaler, resolve_scaler)
 from sparse_pin import PinnedSparseJumpModel, solve_lasso_pinned
 
 DATES = pd.date_range("2020-01-01", periods=12, freq="D").date
@@ -589,6 +590,151 @@ def test_jump_model_run_has_no_feature_weights():
                             n_init=2, verbose=False)
     assert result.model == "jm" and result.feat_weights is None
     assert set(result.regimes.regime.unique()) <= {0, 1}
+
+
+def _scaler_frame(seed=0):
+    """Four columns on wildly different scales, one of them constant."""
+    rng = np.random.default_rng(seed)
+    index = pd.bdate_range("2015-01-01", periods=400).date
+    return pd.DataFrame({
+        "small": rng.normal(0., .001, 400),          # a return-sized feature
+        "large": rng.normal(300., 40., 400),         # an index-level-sized feature
+        "skewed": rng.lognormal(0., 1.5, 400),       # a heavy right tail
+        "flat": np.full(400, 7.),                    # no spread at all
+    }, index=index)
+
+
+def test_scaler_names():
+    """Only the documented scalers are accepted, and None means the default."""
+    assert resolve_scaler(None) == DEFAULT_SCALER == "standard"
+    for name in SCALERS:
+        assert resolve_scaler(name.upper()) == name
+    for bad in ("zscore", "", "quantile"):
+        try:
+            resolve_scaler(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad!r}를 거부하지 않았습니다")
+
+
+def test_standard_scaler_matches_the_library():
+    """The default scaler reproduces `StandardScalerPD`, so the article's protocol is intact."""
+    from jumpmodels.preprocess import StandardScalerPD
+    X = _scaler_frame()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")             # the constant column
+        ours = FeatureScaler("standard").fit_transform(X)
+    theirs = StandardScalerPD().fit_transform(X)
+    assert np.allclose(ours, theirs)
+    assert list(ours.columns) == list(X.columns) and ours.index.equals(X.index)
+
+
+def test_scalers_put_features_on_one_scale():
+    """Every scaler but "none" leaves the columns comparable; "none" leaves them as they are."""
+    X = _scaler_frame()
+    spreads = {}
+    for name in SCALERS:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")         # the constant column
+            scaled = FeatureScaler(name).fit_transform(X)
+        spreads[name] = scaled.drop(columns="flat").std(ddof=0)
+        # the constant column survives as a constant instead of dividing by zero
+        assert np.isfinite(scaled["flat"]).all() and scaled["flat"].std(ddof=0) == 0.
+
+    for name in ("standard", "robust", "minmax"):
+        assert spreads[name].max() / spreads[name].min() < 5., (name, spreads[name])
+    # untouched, the three columns are orders of magnitude apart
+    assert spreads["none"].max() / spreads["none"].min() > 1e3
+
+
+def test_robust_scaler_uses_the_median_and_iqr():
+    """"robust" divides by the Gaussian-equivalent IQR, so a normal feature comes out unit-scale."""
+    rng = np.random.default_rng(1)
+    X = pd.DataFrame({"x": rng.normal(5., 2., 20000)})
+    scaler = FeatureScaler("robust").fit(X)
+    q25, q75 = np.percentile(X.x, [25, 75])
+    assert abs(scaler.center_[0] - np.median(X.x)) < 1e-12
+    assert abs(scaler.scale_[0] - (q75 - q25) / IQR_TO_STD) < 1e-12
+    assert abs(scaler.scale_[0] - 2.) < .05                    # ... which is the standard deviation
+
+    # a column whose IQR is degenerate falls back to the standard deviation rather than to 1
+    mostly_zero = pd.DataFrame({"dummy": np.where(np.arange(400) % 10 == 0, 1., 0.)})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                          # no "constant column" warning
+        fallback = FeatureScaler("robust").fit(mostly_zero)
+    assert abs(fallback.scale_[0] - mostly_zero.dummy.std(ddof=0)) < 1e-12
+
+
+def test_scaling_is_fitted_on_the_training_window_only():
+    """`transform` reuses the fitted statistics, so later rows cannot change earlier ones."""
+    X = _scaler_frame().drop(columns="flat")
+    train, later = X.iloc[:200], X.iloc[200:]
+    for name in SCALERS:
+        scaler = FeatureScaler(name).fit(train)
+        head = scaler.transform(X).iloc[:200]
+        assert np.allclose(head, scaler.transform(train))       # the tail changed nothing
+        # and the fit really was out of sample: `later` is not renormalized to the same spread
+        assert np.allclose(scaler.transform(later), (later - scaler.center_) / scaler.scale_)
+
+
+def test_scaler_inverse_transform_round_trip():
+    """Centroids are written out in the original units under every scaler."""
+    X = _scaler_frame().drop(columns="flat")
+    rows = np.asarray(X.iloc[:5])
+    for name in SCALERS:
+        scaler = FeatureScaler(name).fit(X)
+        assert np.allclose(scaler.inverse_transform(scaler.transform(X).iloc[:5]), rows)
+
+
+def test_scaler_rejects_a_different_feature_matrix():
+    """A matrix that does not match the fitted columns is an error, not a silent misalignment."""
+    X = _scaler_frame().drop(columns="flat")
+    scaler = FeatureScaler("standard").fit(X)
+    for bad in (X.drop(columns="small"), X.rename(columns={"small": "other"})):
+        try:
+            scaler.transform(bad)
+        except ValueError:
+            continue
+        raise AssertionError("피처 구성이 달라도 통과했습니다")
+
+
+def test_rolling_run_accepts_every_scaler():
+    """The rolling fit runs under each scaler and records the one it used."""
+    X, ret = _toy_features()
+    kwargs = dict(model="jm", jump_penalty=10., window=300, min_window=250, n_init=2,
+                  verbose=False)
+    for name in SCALERS:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")         # "none" warns about the mixed units
+            result = run_rolling_jm(X, ret, scaler=name, **kwargs)
+        assert result.scaler == name
+        assert set(result.regimes.regime.unique()) <= {0, 1}
+        # a state missing from a training window is recorded as NaN; the rest are un-scaled
+        # back into the feature units, so they stay inside the range of the feature
+        centers = result.params[[f"center_{col}" for col in X.columns]].dropna()
+        assert len(centers) > 0
+        for col in X.columns:
+            assert X[col].min() <= centers[f"center_{col}"].min()
+            assert centers[f"center_{col}"].max() <= X[col].max()
+
+    try:
+        run_rolling_jm(X, ret, scaler="zscore", **kwargs)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("알 수 없는 스케일러를 거부하지 않았습니다")
+
+
+def test_default_scaler_leaves_the_run_unchanged():
+    """Not passing `scaler` reproduces the run as it was before the option existed."""
+    X, ret = _toy_features()
+    kwargs = dict(model="sjm", jump_penalty=10., window=300, min_window=250, n_init=2,
+                  verbose=False)
+    before = run_rolling_jm(X, ret, **kwargs)
+    after = run_rolling_jm(X, ret, scaler="standard", **kwargs)
+    assert before.scaler == "standard"
+    assert before.regimes.equals(after.regimes)
+    assert np.allclose(before.feat_weights, after.feat_weights)
 
 
 def main() -> int:

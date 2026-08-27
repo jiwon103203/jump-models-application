@@ -30,6 +30,7 @@ from data_io import (RF_UNITS, TRADING_DAYS, join_extra_table, load_extra_table,
 from features import (FEATURE_SETS, build_extra_features, build_features,
                       feature_set_columns, parse_extra_spec, resolve_pinned_features)
 from rolling import DEFAULT_GRID_SIZE, MODELS, run_rolling_jm
+from scaling import DEFAULT_SCALER, SCALERS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -92,6 +93,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="허용하는 최소 학습창 길이. 데이터가 부족하면 이 길이까지 자동 축소")
     group.add_argument("--n-components", type=int, default=2, help="레짐 개수")
     group.add_argument("--clip-mul", type=float, default=3., help="윈저라이징 표준편차 배수")
+    group.add_argument("--scaler", default=DEFAULT_SCALER, choices=SCALERS,
+                       help="피처 스케일 정렬 방식. standard: 평균·표준편차(z-score, 기본) / "
+                            "robust: 중앙값·사분위범위 / minmax: 학습창 [0,1] / none: 원 단위 유지 "
+                            "(3-9 참고)")
     group.add_argument("--n-init", type=int, default=10, help="좌표하강 알고리즘 재시작 횟수")
     group.add_argument("--random-state", type=int, default=0, help="초기화 난수 시드")
     group.add_argument("--refit-start", default=None, help="이 날짜 이후의 재추정 시점만 사용")
@@ -244,6 +249,7 @@ def run_pipeline(input_path: str,
                  min_window: int = 500,
                  n_components: int = 2,
                  clip_mul: float = 3.,
+                 scaler: str = DEFAULT_SCALER,
                  n_init: int = 10,
                  random_state: int = 0,
                  refit_start=None,
@@ -278,8 +284,9 @@ def run_pipeline(input_path: str,
     0/1 strategy -- under the main trading delay and, for the robustness table, under
     several delays. `remove_series` takes whole families of columns back out of the feature
     matrix, `min_cash`/`max_cash` bound the share held in the risk-free asset,
-    `buy_cost_bps`/`sell_cost_bps` charge the two legs of a trade separately, and
-    `pin_features` names the features the sparse model must keep at every re-estimation.
+    `buy_cost_bps`/`sell_cost_bps` charge the two legs of a trade separately,
+    `pin_features` names the features the sparse model must keep at every re-estimation, and
+    `scaler` picks how the features are put on a common scale on each training window.
     `cont` selects the continuous jump model, which is the default here: the `proba_*`
     columns of `regimes.csv` then hold genuine regime probabilities, spaced by `grid_size`,
     rather than the 0/1 one-hot rows of the discrete model of the article.
@@ -342,11 +349,13 @@ def run_pipeline(input_path: str,
         variant = (f"연속형(CJM, grid_size={grid_size:g}) → regimes.csv의 proba_* 열이 확률값"
                    if cont else "이산형(논문 원본) → regimes.csv의 proba_* 열이 0/1 원핫")
         print(f"모델: {model.upper()} {variant}")
+        print(f"피처 스케일: {scaler} (윈저라이징 ±{clip_mul:g}σ 후 학습창마다 재적합)")
 
     # 3) semiannual refits on a rolling window + online inference in between
     result = run_rolling_jm(X, data.excess_ret, jump_penalty=jump_penalty, window=window,
                             min_window=min_window, n_components=n_components, clip_mul=clip_mul,
-                            n_init=n_init, random_state=random_state, start_date=refit_start,
+                            scaler=scaler, n_init=n_init, random_state=random_state,
+                            start_date=refit_start,
                             model=model, max_feats=max_feats, pin_feats=pinned,
                             cont=cont, grid_size=grid_size, verbose=verbose)
 
@@ -494,7 +503,8 @@ def main(argv=None) -> int:
                  extra_sheet=args.extra_sheet, extra_date_col=args.extra_date_col,
                  model=args.model, max_feats=args.max_feats, pin_features=args.pin_feature,
                  jump_penalty=args.jump_penalty, window=args.window, min_window=args.min_window,
-                 n_components=args.n_components, clip_mul=args.clip_mul, n_init=args.n_init,
+                 n_components=args.n_components, clip_mul=args.clip_mul, scaler=args.scaler,
+                 n_init=args.n_init,
                  cont=not args.no_cont, grid_size=args.grid_size,
                  random_state=args.random_state, refit_start=args.refit_start,
                  hmm=args.hmm, hmm_window=args.hmm_window, hmm_refit_every=args.hmm_refit_every,
