@@ -23,9 +23,15 @@ from features import (EXAMPLE_HLS, EXTRA_DD_HLS, EXTRA_WINDOWS, FEATURE_SETS, ap
                       feature_series, feature_series_name, feature_set_columns, parse_extra_spec,
                       resolve_pinned_features, resolve_removed_features)
 from hmm_benchmark import smooth_states
+from regime_episodes import (align_paths, compare_episode_paths, episode_metrics,
+                             extract_episodes, length_scenarios, normalized_path,
+                             rank_similar_episodes, resolve_target_episode, select_episodes)
 from rolling import (DEFAULT_GRID_SIZE, init_model, refit_schedule, resolve_grid_size,
-                     resolve_max_feats, run_rolling_jm, semiannual_anchors)
+                     resolve_max_feats, run_rolling_jm, semiannual_anchors, state_losses)
 from sparse_pin import PinnedSparseJumpModel, solve_lasso_pinned
+from weights import (CUSTOM_TYPE, GROUPINGS, NO_HORIZON, feature_group_map, feature_group_name,
+                     feature_horizon, feature_type_name, group_feature_weights,
+                     weight_group_summary)
 
 DATES = pd.date_range("2020-01-01", periods=12, freq="D").date
 LEVELS = pd.Series([10., 11, 12, 11, 10, 9, 10, 11, 12, 13, 12, 11], index=DATES, name="x")
@@ -589,6 +595,299 @@ def test_jump_model_run_has_no_feature_weights():
                             n_init=2, verbose=False)
     assert result.model == "jm" and result.feat_weights is None
     assert set(result.regimes.regime.unique()) <= {0, 1}
+
+
+############################################
+## 변수 유형별 가중치
+############################################
+
+def test_feature_grouping_names():
+    """Every column of a feature set lands in a type, and only a custom variable in "custom"."""
+    assert feature_type_name("sortino_20") == "return"
+    assert feature_type_name("std_5") == feature_type_name("ret-abs") == "realized-vol"
+    assert feature_type_name("vol-ratio_5-20") == "log-vol"
+    assert feature_type_name("DD_10") == feature_type_name("DD-log_5") == "downside"
+    assert feature_type_name("VIX_ewm20") == CUSTOM_TYPE
+    # the whole "extra" set is covered by the four named types, custom left for the user
+    columns = feature_set_columns("extra")
+    assert CUSTOM_TYPE not in {feature_type_name(col) for col in columns}
+
+    assert feature_horizon("std_20") == "20"
+    assert feature_horizon("vol-ratio_5-20") == "5-20"
+    # a name with no horizon, and a custom variable whose suffix is a transform, have none
+    assert feature_horizon("ret-cumlog") == feature_horizon("VIX_ewm20") == NO_HORIZON
+
+    assert feature_group_name("std_5", "type-horizon") == "realized-vol_5"
+    assert feature_group_name("std_5", "series") == "std"
+    assert feature_group_name("std_5", "horizon") == "5"
+
+
+def test_feature_group_map_covers_every_column_once():
+    """Each grouping partitions the columns: no column is lost and none is counted twice."""
+    columns = feature_set_columns("extra") + ["VIX_ewm20"]
+    for grouping in GROUPINGS:
+        mapping = feature_group_map(columns, grouping)
+        grouped = [col for cols in mapping.values() for col in cols]
+        assert sorted(grouped) == sorted(columns), grouping
+        assert all(cols for cols in mapping.values()), grouping     # no empty group is kept
+    # the "type" grouping reports its groups in a fixed order, whatever the column order
+    forward = list(feature_group_map(columns, "type"))
+    assert forward == list(feature_group_map(columns[::-1], "type"))
+
+
+def test_group_feature_weights_shares():
+    """The shares of a refit add up to one, and `total` keeps the L1 norm they came from."""
+    columns = ["ret_20", "sortino_20", "std_5", "vol-log_20", "DD_10"]
+    dates = pd.to_datetime(["2020-01-02", "2020-07-01"]).date
+    feat_weights = pd.DataFrame([[.5, .5, 1., 2., 1.], [0., 0., 1., 1., 0.]],
+                                index=dates, columns=columns)
+    shares = group_feature_weights(feat_weights, grouping="type")
+    groups = [col for col in shares.columns if col != "total"]
+    assert np.allclose(shares[groups].sum(axis=1), 1.)
+    assert np.allclose(shares["total"], feat_weights.sum(axis=1))
+    assert abs(shares.loc[dates[0], "return"] - 1. / 5.) < 1e-12        # (.5 + .5) / 5
+    assert abs(shares.loc[dates[1], "log-vol"] - .5) < 1e-12            # 1 / 2, the rest dropped
+    assert shares.loc[dates[1], "return"] == 0.
+
+    summary = weight_group_summary(shares, feat_weights)
+    assert summary.index[0] == "log-vol"                               # the largest mean share
+    assert abs(summary.loc["log-vol", "mean_share"] - .45) < 1e-12     # (2/5 + 1/2) / 2
+    assert summary.loc["return", "n_features"] == 2
+    assert summary.loc["return", "mean_kept"] == 1.                    # 2 kept, then 0
+
+
+def test_group_feature_weights_survives_an_all_zero_refit():
+    """A refit whose weights are all zero gives NaN shares rather than a division by zero."""
+    feat_weights = pd.DataFrame([[1., 1.], [0., 0.]], columns=["std_5", "DD_10"],
+                                index=pd.to_datetime(["2020-01-02", "2020-07-01"]).date)
+    shares = group_feature_weights(feat_weights)
+    assert shares.iloc[0].notna().all()
+    assert shares.iloc[1][["realized-vol", "downside"]].isna().all()
+    assert shares.iloc[1]["total"] == 0.
+
+
+############################################
+## 유사 국면 탐색
+############################################
+
+def _episode_frame():
+    """A regime path with three bear episodes, the last one still running at the end."""
+    n = 40
+    dates = pd.bdate_range("2020-01-01", periods=n).date
+    regime = pd.Series(0, index=dates)
+    regime.iloc[5:10] = 1          # 5 days, a fall
+    regime.iloc[20:23] = 1         # 3 days, a rise -> a false signal
+    regime.iloc[37:] = 1           # 3 days, still running at the end of the sample
+    ret = pd.Series(.001, index=dates)
+    ret.iloc[5:10] = -.02
+    ret.iloc[20:23] = .01
+    ret.iloc[37:] = -.005
+    return regime, ret, dates
+
+
+def test_extract_episodes():
+    """Episodes are the maximal runs of the state, measured on the benchmark return."""
+    regime, ret, dates = _episode_frame()
+    episodes = extract_episodes(regime, ret)
+    assert list(episodes["length"]) == [5, 3, 3]
+    assert list(episodes.index) == [dates[5], dates[20], dates[37]]
+    assert list(episodes["end"]) == [dates[9], dates[22], dates[39]]
+    assert list(episodes["ongoing"]) == [False, False, True]
+    # a rising episode is flagged as a false signal, a falling one is not
+    assert list(episodes["false_signal"]) == [False, True, False]
+    assert abs(episodes["period_ret"].iloc[0] - ((1 - .02) ** 5 - 1)) < 1e-12
+    # the drawdown is measured from the level in force at entry, so a straight fall is
+    # exactly the episode return
+    assert abs(episodes["mdd"].iloc[0] - episodes["period_ret"].iloc[0]) < 1e-12
+    assert episodes["mdd"].iloc[1] == 0.               # a straight rise draws down nothing
+
+
+def test_extract_episodes_handles_the_edges():
+    """An episode may start on the first day of the sample and end on the last."""
+    dates = pd.bdate_range("2020-01-01", periods=6).date
+    regime = pd.Series([1, 1, 0, 0, 1, 1], index=dates)
+    episodes = extract_episodes(regime, pd.Series(-.01, index=dates))
+    assert list(episodes["length"]) == [2, 2]
+    assert list(episodes.index) == [dates[0], dates[4]]
+    assert list(episodes["ongoing"]) == [False, True]
+    # a state that never occurs gives an empty table rather than an error
+    assert extract_episodes(pd.Series(0, index=dates), pd.Series(0., index=dates)).empty
+
+
+def test_select_episodes_filters_are_opt_in():
+    """No filter narrows the table unless it is asked for, except the running episode."""
+    regime, ret, _ = _episode_frame()
+    episodes = extract_episodes(regime, ret)
+    assert len(select_episodes(episodes, drop_ongoing=False)) == 3
+    assert len(select_episodes(episodes)) == 2                     # the running one goes
+    assert len(select_episodes(episodes, drop_false_signal=True)) == 1
+    assert len(select_episodes(episodes, min_length=4)) == 1
+    assert len(select_episodes(episodes, drop_ongoing=False,
+                               exclude=[episodes.index[0]])) == 2
+    # `before` is what keeps a comparison backward-looking: only what had already ended
+    assert len(select_episodes(episodes, drop_ongoing=False, before=episodes.index[2])) == 2
+    assert len(select_episodes(episodes, drop_ongoing=False, before=episodes.index[0])) == 0
+
+
+def test_episode_metrics_split_the_length_into_its_two_causes():
+    """Distance days and penalty days partition the episode, and follow the loss columns."""
+    regime, ret, dates = _episode_frame()
+    close = pd.Series(100. * (1. + ret).cumprod().to_numpy(), index=dates)
+    data = pd.DataFrame({"close": close, "ret": ret}, index=dates)
+    regimes = pd.DataFrame({"regime": regime}, index=dates)
+    # the bull centroid is closer on the last day of the first episode: only the jump
+    # penalty is keeping the model in the bear state there
+    regimes["loss_0"] = 1.
+    regimes["loss_1"] = np.where(regime.to_numpy() == 1, .5, 2.)
+    regimes.loc[dates[9], "loss_1"] = 1.5
+    regimes["refit_date"] = dates[0]
+
+    metrics = episode_metrics(extract_episodes(regime, ret), regimes, data, horizon=4)
+    assert (metrics["distance_days"] + metrics["penalty_days"] == metrics["length"]).all()
+    assert list(metrics["penalty_days"]) == [1., 0., 0.]
+    assert abs(metrics["penalty_share"].iloc[0] - 1. / 5.) < 1e-12
+    assert metrics["loss_diff_mean"].iloc[1] == -.5              # (.5 - 1.) on every day
+    # the forward window looks past the episode and is cut at the end of the sample
+    assert list(metrics["fwd_days"]) == [4., 4., 3.]
+    assert abs(metrics["ret_fwd"].iloc[0] - ((1 - .02) ** 4 - 1)) < 1e-12
+    # no refit parameters, so the two columns that need them are missing rather than wrong
+    assert metrics["vol_ratio_state"].isna().all()
+
+
+def test_episode_metrics_without_loss_columns():
+    """A run whose regimes carry no `loss_*` still yields every other metric."""
+    regime, ret, dates = _episode_frame()
+    close = pd.Series(100. * (1. + ret).cumprod().to_numpy(), index=dates)
+    data = pd.DataFrame({"close": close, "ret": ret}, index=dates)
+    regimes = pd.DataFrame({"regime": regime, "refit_date": dates[0]}, index=dates)
+    metrics = episode_metrics(extract_episodes(regime, ret), regimes, data, horizon=4)
+    assert metrics[["loss_diff_mean", "penalty_days", "penalty_share"]].isna().all().all()
+    assert metrics[["vol_5_mean", "dd_at_entry", "ret_fwd"]].notna().all().all()
+
+
+def test_resolve_target_episode():
+    """A target may be named by its start date, by a day inside it, or left to default."""
+    regime, ret, dates = _episode_frame()
+    episodes = extract_episodes(regime, ret)
+    assert resolve_target_episode(episodes) == dates[37]             # the last one
+    assert resolve_target_episode(episodes, dates[5]) == dates[5]    # its own start
+    assert resolve_target_episode(episodes, dates[7]) == dates[5]    # a day inside it
+    assert resolve_target_episode(episodes, dates[9]) == dates[5]    # its last day
+    try:
+        resolve_target_episode(episodes, dates[15])                  # a bull day
+    except KeyError as exc:
+        assert "국면 안의 날짜" in str(exc)
+    else:
+        raise AssertionError("국면 밖의 날짜인데 오류가 나지 않았습니다.")
+
+
+def test_rank_similar_episodes():
+    """The ranking is by standardized distance, and a missing metric costs nothing."""
+    index = pd.Index(["a", "b", "c", "target"], name="start")
+    metrics = pd.DataFrame({"vol_5_mean": [.10, .30, .11, .10],
+                            "dd_at_entry": [-.01, -.30, -.02, -.01],
+                            "state_flip": [1., 1., 1., 1.]}, index=index)
+    ranking = rank_similar_episodes(metrics, target="target",
+                                    columns=["vol_5_mean", "dd_at_entry", "state_flip"])
+    assert list(ranking.index) == ["a", "c", "b"]
+    assert list(ranking["rank"]) == [1, 2, 3]
+    assert ranking.loc["a", "distance"] == 0.
+    # a metric that never varies carries no information and is dropped from the average
+    assert (ranking["n_metrics"] == 2).all()
+
+    # a metric missing for one episode is skipped for that episode only
+    metrics.loc["b", "vol_5_mean"] = np.nan
+    ranking = rank_similar_episodes(metrics, target="target",
+                                    columns=["vol_5_mean", "dd_at_entry"])
+    assert ranking.loc["b", "n_metrics"] == 1
+    assert ranking.loc["a", "n_metrics"] == 2
+    # the default set is narrowed to the metrics the table holds instead of raising...
+    assert len(rank_similar_episodes(metrics, target="target")) == 3
+    # ...but a metric named explicitly has to be there
+    try:
+        rank_similar_episodes(metrics, target="target", columns=["nope"])
+    except KeyError as exc:
+        assert "nope" in str(exc)
+    else:
+        raise AssertionError("없는 지표를 지정했는데 오류가 나지 않았습니다.")
+
+
+def test_align_paths_recovers_a_known_lag():
+    """A path compared against a shifted copy of itself recovers the shift."""
+    shape = 1. + np.sin(np.linspace(0., 3., 100)) * .1
+    lag = 7
+    # both paths start on their own day 1, but the match starts `lag` days further into the
+    # same shape -- so the match is the one running ahead
+    target = pd.Series(shape[:60], index=np.arange(1, 61))
+    match = pd.Series(shape[lag:lag + 60], index=np.arange(1, 61))
+
+    result = align_paths(target, match, max_lag=20)
+    assert result["lag"] == -lag                        # the target is running `lag` days behind
+    assert result["rmse"] < 1e-9
+    assert set(result["aligned"].columns) == {"target", "match"}
+    assert result["n_overlap"] == 60 - lag
+
+    # comparing them day by day, with no lag allowed, is strictly worse
+    raw = align_paths(target, match, max_lag=0)
+    assert raw["lag"] == 0 and raw["rmse"] > result["rmse"]
+
+
+def test_normalized_path_and_comparison():
+    """Both paths start at 1 on their own entry day, whatever the price level there."""
+    dates = pd.bdate_range("2020-01-01", periods=200).date
+    close = pd.Series(np.linspace(100., 300., 200), index=dates)
+    path = normalized_path(close, dates[50], 30)
+    assert len(path) == 30 and path.iloc[0] == 1. and list(path.index[:2]) == [1, 2]
+    comparison = compare_episode_paths(close, dates[150], dates[50], horizon=30, max_lag=10)
+    assert list(comparison["paths"].columns) == ["target", "match"]
+    assert comparison["paths"].iloc[0].tolist() == [1., 1.]
+    assert comparison["target_start"] == dates[150]
+    # a path cut short by the end of the data still compares, on the overlap it leaves
+    assert len(normalized_path(close, dates[190], 30)) == 10
+
+
+def test_length_scenarios():
+    """Every scenario turns a length into a remaining number of days and a date."""
+    regime, ret, dates = _episode_frame()
+    episodes = extract_episodes(regime, ret)
+    similar = rank_similar_episodes(
+        episode_metrics(episodes, pd.DataFrame({"regime": regime}, index=dates),
+                        pd.DataFrame({"close": 100. * (1. + ret).cumprod(), "ret": ret},
+                                     index=dates), horizon=4))
+    scenarios = length_scenarios(episodes, pd.Index(dates), similar=similar, top=2)
+    # restricted to what had ended before the second episode, only the first one is left
+    earlier = length_scenarios(episodes, pd.Index(dates), target=episodes.index[1],
+                               before=episodes.index[1])
+    assert earlier.loc["p50", "length_days"] == 5.
+    assert "p50" in scenarios.index and "similar-1" in scenarios.index
+    assert (scenarios["elapsed_days"] == 3).all()               # the running episode
+    assert np.allclose(scenarios["remaining_days"], scenarios["length_days"] - 3)
+    # the median of the two closed episodes, of 5 and 3 days
+    assert scenarios.loc["p50", "length_days"] == 4.
+    # the projection runs past the end of the sample, so the date is extrapolated
+    assert scenarios.loc["p50", "projected_end"] > dates[-1]
+
+
+def test_state_losses_explain_the_labels():
+    """The recorded losses are the model's own, and disagree with the label only under the penalty."""
+    X, ret = _toy_features()
+    result = run_rolling_jm(X, ret, model="sjm", jump_penalty=10., window=300, min_window=250,
+                            n_init=2, verbose=False)
+    losses = result.regimes[["loss_0", "loss_1"]]
+    assert losses.notna().all().all() and (losses >= 0.).all().all()
+    nearest = losses.to_numpy().argmin(axis=1)
+    # most days sit in the state whose centroid is closest; the rest are what the jump
+    # penalty is holding, which is exactly what `penalty_days` counts
+    agreement = float((nearest == result.regimes.regime.to_numpy()).mean())
+    assert agreement > .5, agreement
+
+    episodes = extract_episodes(result.regimes.regime, ret.reindex(result.regimes.index))
+    data = pd.DataFrame({"close": (1. + ret).cumprod(), "ret": ret}).reindex(result.regimes.index)
+    metrics = episode_metrics(episodes, result.regimes, data, result.params)
+    penalty_days = int(((result.regimes.regime == 1) &
+                        (result.regimes.loss_1 > result.regimes.loss_0)).sum())
+    assert int(metrics["penalty_days"].sum()) == penalty_days
+    assert int(metrics["distance_days"].sum() + metrics["penalty_days"].sum()) == int(metrics["length"].sum())
 
 
 def main() -> int:

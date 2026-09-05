@@ -315,3 +315,162 @@ def plot_feat_weights(feat_weights: pd.DataFrame,
     ax.grid(alpha=.25)
     ax.legend(loc="upper left", ncol=2, fontsize="small")
     return _save(fig, filepath)
+
+
+def plot_weight_groups(shares: pd.DataFrame,
+                       filepath: str,
+                       title: str = "Share of the feature weight by variable type",
+                       figsize=(14, 5.)) -> str:
+    """
+    Plot how the feature weight splits across variable groups at every re-estimation.
+
+    The bands are stacked to 100%, so the figure answers "what kind of variable is separating
+    the regimes right now" and makes the answer comparable from one re-estimation to the
+    next, which the per-feature figure of `plot_feat_weights` cannot do once the feature set
+    runs to a few dozen columns.
+
+    Parameters
+    ----------
+    shares : pd.DataFrame
+        The output of `weights.group_feature_weights`: one row per refit date, one column
+        per group plus the `total` column, which is left out of the figure.
+
+    filepath : str
+        Where to save the figure.
+
+    title : str, optional
+        The figure title.
+
+    figsize : tuple, optional
+        The figure size, in inches.
+
+    Returns
+    -------
+    str
+        The path of the saved figure.
+    """
+    groups = [col for col in shares.columns if col != "total"]
+    _warn_missing_font(groups)
+    dates = pd.to_datetime(pd.Index(shares.index))
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.stackplot(dates, *[shares[col].fillna(0.) for col in groups], labels=groups, alpha=.85)
+    # the re-estimations are what the shares are defined at; the bands between them only
+    # interpolate, so the dates themselves are marked
+    for date in dates:
+        ax.axvline(date, color="white", lw=.6, alpha=.6)
+    ax.set(title=title, ylabel="Share of the total weight", ylim=(0., 1.))
+    _percent_axis(ax)
+    ax.margins(x=0)
+    ax.legend(loc="upper left", ncol=min(len(groups), 5), fontsize="small", framealpha=.85)
+    return _save(fig, filepath)
+
+
+def plot_episode_lengths(episodes: pd.DataFrame,
+                         filepath: str,
+                         title: str = "Length of every bear episode, by what held it there",
+                         figsize=(14, 5.)) -> str:
+    """
+    Plot the length of every episode, split into its distance and penalty days.
+
+    A day sits in the bear state either because its features are closer to the bear centroid
+    -- the distance days -- or because they are not and only the jump penalty keeps the model
+    from stepping out and back -- the penalty days. Stacking the two shows which episodes the
+    features carried on their own and which ones the penalty was extending.
+
+    Parameters
+    ----------
+    episodes : pd.DataFrame
+        The output of `regime_episodes.episode_metrics`, with `distance_days` and
+        `penalty_days`. Without those columns -- a run whose regimes carry no `loss_*` --
+        the plain length is drawn instead.
+
+    filepath : str
+        Where to save the figure.
+
+    title : str, optional
+        The figure title.
+
+    figsize : tuple, optional
+        The figure size, in inches.
+
+    Returns
+    -------
+    str
+        The path of the saved figure.
+    """
+    labels = [str(start) for start in episodes.index]
+    positions = np.arange(len(episodes))
+    fig, ax = plt.subplots(figsize=figsize)
+    split = {"distance_days", "penalty_days"} <= set(episodes.columns)
+    if split and episodes["distance_days"].notna().any():
+        distance = episodes["distance_days"].fillna(0.)
+        penalty = episodes["penalty_days"].fillna(0.)
+        ax.bar(positions, distance, color="#63c5c5", label="distance")
+        ax.bar(positions, penalty, bottom=distance, color="#3d5a80", label="penalty")
+        ax.legend(loc="upper left", fontsize="small")
+    else:
+        ax.bar(positions, episodes["length"], color="#63c5c5")
+    if "false_signal" in episodes.columns:
+        for pos, flagged in zip(positions, episodes["false_signal"]):
+            if flagged:
+                ax.annotate("false", (pos, episodes["length"].iloc[pos]), ha="center",
+                            va="bottom", fontsize="x-small", color="#c92a2a")
+    ax.set(title=title, ylabel="Trading days")
+    ax.set_xticks(positions)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize="small")
+    ax.grid(axis="y", alpha=.25)
+    return _save(fig, filepath)
+
+
+def plot_similar_episode_paths(comparison: dict,
+                               filepath: str,
+                               title: str = "Current episode against its closest past match",
+                               figsize=(14, 5.)) -> str:
+    """
+    Plot the normalized path of the target episode next to its match, raw and lag-aligned.
+
+    The left panel puts the two paths on the same day axis; the right one shifts the match by
+    the lag `regime_episodes.align_paths` found, which is how far ahead of it the target is
+    running.
+
+    Parameters
+    ----------
+    comparison : dict
+        The output of `regime_episodes.compare_episode_paths`.
+
+    filepath : str
+        Where to save the figure.
+
+    title : str, optional
+        The figure title.
+
+    figsize : tuple, optional
+        The figure size, in inches.
+
+    Returns
+    -------
+    str
+        The path of the saved figure.
+    """
+    paths, aligned = comparison["paths"], comparison["aligned"]
+    target_label = f"target ({comparison['target_start']})"
+    match_label = f"match ({comparison['match_start']})"
+    lag = comparison["lag"]
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize, sharey=True)
+    axes[0].plot(paths.index, paths["target"], color="#3d5a80", lw=1.6, label=target_label)
+    axes[0].plot(paths.index, paths["match"], color="#adb5bd", lw=1.6, label=match_label)
+    axes[0].set(title="Raw", xlabel="Trading day from entry", ylabel="Price, entry = 1")
+
+    axes[1].plot(aligned.index, aligned["target"], color="#3d5a80", lw=1.6, label=target_label)
+    axes[1].plot(aligned.index, aligned["match"], color="#adb5bd", lw=1.6,
+                 label=f"{match_label}, shifted {lag:+d}d")
+    axes[1].set(title=f"Aligned (lag {lag:+d}d, rmse {comparison['rmse']:.3f}, "
+                      f"corr {comparison['corr']:.2f})",
+                xlabel="Trading day from entry")
+    for ax in axes:
+        ax.axhline(1., color="#868e96", lw=.8, ls=":")
+        ax.grid(alpha=.25)
+        ax.legend(loc="lower left", fontsize="small")
+    fig.suptitle(title)
+    return _save(fig, filepath)

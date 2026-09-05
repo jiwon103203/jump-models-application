@@ -23,6 +23,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+from scipy.spatial.distance import cdist
 
 try:
     from jumpmodels.jump import JumpModel
@@ -205,6 +206,43 @@ def init_model(model: str = "jm",
     raise ValueError(f"지원하지 않는 모델입니다: {model}. 가능한 값: {MODELS}")
 
 
+def state_losses(model_ins, X_processed) -> np.ndarray:
+    """
+    Compute the model's own loss of every day against every state centroid.
+
+    The jump model assigns the regimes by minimizing ``Σ_t loss(t, s_t) + λ · (jumps)``, with
+    ``loss(t, k) = ½‖x_t ⊙ w − μ_k‖²`` -- the squared distance between the day's features and
+    the centroid of state `k`, both in the weighted space the model actually clusters in
+    (`jumpmodels.jump.do_E_step`). Reading those two terms back out is what separates the two
+    reasons a day ends up in the bear state: either its features genuinely sit closer to the
+    bear centroid (the *distance* term), or they do not and the jump penalty is what keeps it
+    there rather than pay for a round trip out of the state and back (the *penalty* term).
+
+    `regime_episodes` uses the difference of the two columns to characterize each bear
+    episode and to split its length into those two factors.
+
+    Parameters
+    ----------
+    model_ins : JumpModel, SparseJumpModel or PinnedSparseJumpModel
+        A fitted model. The sparse variants keep their fitted jump model in `jm_ins`, which
+        carries the feature weights and the weighted centroids.
+
+    X_processed : pd.DataFrame or np.ndarray
+        The features of the days to score, clipped and standardized exactly as the ones the
+        model was fitted on, and *not* yet multiplied by the feature weights -- the model
+        applies those itself.
+
+    Returns
+    -------
+    np.ndarray of shape (n_days, n_components)
+        The loss of every day against every state, in the order of the states of the fitted
+        model (0 = bull).
+    """
+    jm = getattr(model_ins, "jm_ins", model_ins)      # the sparse models fit an inner JM
+    X_weighted = jm.check_X_predict_func(X_processed)  # applies `feat_weights`, if any
+    return .5 * cdist(X_weighted, np.asarray(jm.centers_, dtype=float), "sqeuclidean")
+
+
 def semiannual_anchors(index) -> list:
     """
     Locate the first trading day on or after January 1st and July 1st of every year covered
@@ -287,7 +325,9 @@ class RollingJMResult:
         1 = bear), the regime probabilities and the refit date whose parameters were used.
         With the continuous model (`cont=True`) the `proba_*` columns hold genuine
         probabilities, multiples of `grid_size` summing to one; with the discrete model
-        they are one-hot and merely restate the `regime` column.
+        they are one-hot and merely restate the `regime` column. The `loss_*` columns carry
+        the model's own loss of the day against each state centroid (`state_losses`), the
+        distance term of the objective the jump penalty is traded off against.
 
     params : pd.DataFrame
         One row per (refit date, state): the training window, the cluster centroid in the
@@ -501,11 +541,17 @@ def run_rolling_jm(X: pd.DataFrame,
         # online inference from this refit date until the next one
         seg_end = schedule[i + 1][1] if i + 1 < len(schedule) else n_obs
         X_context = X.iloc[pos - win:seg_end]      # lookback window + the segment itself
-        proba_online = model_ins.predict_proba_online(scaler.transform(clipper.transform(X_context)))
+        X_context_processed = scaler.transform(clipper.transform(X_context))
+        proba_online = model_ins.predict_proba_online(X_context_processed)
         proba_seg = proba_online.iloc[win:]        # drop the lookback rows
 
         seg = pd.DataFrame(np.asarray(proba_seg), index=proba_seg.index, columns=proba_cols)
         seg.insert(0, "regime", np.asarray(proba_seg).argmax(axis=1))
+        # the distance half of the model's objective, kept so that a regime episode can be
+        # split into what the features imply and what the jump penalty holds in place
+        losses = state_losses(model_ins, X_context_processed.iloc[win:])
+        for k in range(n_components):
+            seg[f"loss_{k}"] = losses[:, k]
         seg["refit_date"] = refit_date
         regime_parts.append(seg)
 
