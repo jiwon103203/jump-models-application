@@ -6,9 +6,10 @@ csv/엑셀 파일 하나(날짜·종가·무위험금리)를 넣으면 논문 [S
 2. 지수가중이동(EWM) downside deviation·Sortino ratio 피처 생성 (+ 원하면 **확장 피처 세트**나 **사용자 커스텀 변수** 추가)
 3. **6개월마다(1월·7월 첫 영업일) 3000거래일 학습창으로 점프 모델 재추정** + 재추정 사이 구간은 온라인 추론 (sparse JM을 쓸 때는 **꼭 남기고 싶은 피처 고정** 가능)
 4. 0/1 전략 백테스트(거래비용·거래지연 반영, **현금 비중 제한**과 **매수/매도 거래비용 분리** 지원) + **거래 지연 로버스트니스 표(논문 Table 5)**
-5. 선택적으로 **HMM 벤치마크(논문 §3.3)** 와 성과 비교
+5. **변수 유형별 가중 비중**(sjm)과 **bear 국면 분석 · 유사 국면 탐색 · 국면 종료 시나리오**
+6. 선택적으로 **HMM 벤치마크(논문 §3.3)** 와 성과 비교
 
-까지 수행하고 결과 csv와 그림을 저장합니다.
+까지 수행하고 결과 csv와 그림을 저장합니다. 과거를 다시 걷지 않고 **지금 국면만** 알고 싶다면 `--inference`로 현재 반기 하나만 추론할 수 있습니다(3-11).
 
 ---
 
@@ -94,6 +95,18 @@ res["performance"]         # 전략 성과표
 | `--start-date` / `--end-date` | 없음 | 분석 기간 필터 |
 | `--n-init` | 10 | 좌표하강 재시작 횟수. 줄이면 빨라지고 해의 안정성은 떨어집니다 |
 | `--delays` | `1,5,10` | 거래 지연 로버스트니스 표에 쓸 지연 일수 목록. `--no-robustness`로 생략 |
+| `--inference` | 꺼짐 | **추론 전용 모드**. 과거 롤링·백테스트를 건너뛰고 현재 반기 직전 `--window`거래일로 한 번 적합해 현재 반기만 추론 (3-11 참고) |
+| `--weight-group` | `type` | `sjm` 전용. 피처 가중을 묶어 볼 기준 (`type` / `type-horizon` / `series` / `horizon`) (3-9 참고) |
+| `--similar-target` | 마지막 국면 | 유사 국면 탐색의 기준 국면. 국면의 시작일이거나 국면 **안**의 날짜 (3-10 참고) |
+| `--similar-metric` | 지표 전체 | 유사도에 쓸 지표를 직접 지정. 여러 번 지정 가능 |
+| `--similar-top` | 3 | 시나리오 표에 남길 유사 국면 개수 |
+| `--similar-include-later` | 꺼짐 | 기준 국면 **이후**에 일어난 국면도 비교 대상에 포함. 기본은 기준 국면 이전에 끝난 국면만 봅니다 (3-10 참고) |
+| `--episode-horizon` | 22 | 국면 진입 후 전방 구간 길이(거래일). `ret_fwd`·`mdd_fwd`의 창 |
+| `--false-signal-return` | 0.0 | 구간수익이 이 값을 넘으면 오탐으로 **표시**(제외는 하지 않음) |
+| `--min-episode-len`, `--drop-false-signal` | 없음 / 꺼짐 | 유사도 후보와 길이 통계에서 제외할 국면. 둘 다 기본은 제외 없음 |
+| `--path-horizon`, `--max-lag`, `--align-by` | 60, 30, `rmse` | 경로 비교 구간 길이, 탐색할 최대 시차, 정렬 기준(`rmse`/`corr`) |
+| `--no-episodes` | 꺼짐 | 국면 분석 전체를 건너뜀 |
+| `--episode-state` | 마지막 상태 | 국면을 끊을 상태 번호. `--n-components`를 3 이상으로 둘 때 씁니다 |
 | `--no-plot`, `--save-features`, `--quiet` | | 출력 제어 |
 | `--plot-font` | 자동 | 그림 폰트. 한글 라벨이 깨질 때 지정 (예: `NanumGothic`) |
 
@@ -347,11 +360,150 @@ python run_pipeline.py --input 내데이터.xlsx --no-cont
 - **`--grid-size`의 역수는 정수여야 합니다.** `0.1`·`0.05`·`0.02`·`0.01`처럼 1을 나누는 값을 쓰세요. 아니면 가장 가까운 격자로 내림하면서 경고를 출력합니다.
 - **`--model sjm`에도 그대로 적용됩니다.** sparse JM은 내부의 점프 모델에 설정을 그대로 넘기므로, 피처 가중·선택 결과와 무관하게 확률 출력이 됩니다.
 
-## 4. 출력물 (`--outdir`)
+### 3-9. 변수 유형별 가중치 (`--weight-group`)
+
+`--model sjm`은 재추정마다 피처별 가중을 다시 정하고, 그 값이 `feat_weights.csv`·`feat_weights.png`에 남습니다. 그런데 `--feature-set extra`처럼 35개짜리 피처 세트를 쓰면 라인 35개가 겹친 그림이라 읽히지 않습니다. 궁금한 것도 보통 "`mad_20`이 어떻게 됐나"가 아니라 **"지금 이 모델은 어떤 종류의 변수로 국면을 가르고 있나"** 이고요.
+
+`weight_groups.csv`·`weight_groups.png`가 그 질문에 답합니다. 피처를 유형으로 묶어 **재추정 시점별 가중 비중(합 100%)** 을 냅니다.
+
+```bash
+# 기본 — 변수 유형 4종 + 커스텀
+python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm
+
+# "5일 실현변동성 vs 20일 실현변동성"처럼 기간까지 나눠 보기
+python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm     --weight-group type-horizon
+```
+
+묶는 기준은 4가지입니다.
+
+| `--weight-group` | 그룹 | 예 |
+|---|---|---|
+| `type` (기본) | `return` / `realized-vol` / `log-vol` / `downside` / `custom` | `sortino_20` → `return` |
+| `type-horizon` | 위 유형 × 기간 | `std_5` → `realized-vol_5` |
+| `series` | 피처 시리즈(`features.feature_series_name`) | `std_5` → `std` |
+| `horizon` | 기간만 | `std_5` → `5`, `ret-cumlog` → `none` |
+
+`type`의 5개 그룹은 다음과 같이 나뉩니다(`weights.FEATURE_TYPE_SERIES`).
+
+| 유형 | 포함 시리즈 | 뜻 |
+|---|---|---|
+| `return` | `ret`, `sortino`, `ret-simple`, `ret-log`, `ret-cumlog` | 수익률 수준과 그 위에 세운 위험조정 수익률 |
+| `realized-vol` | `std`, `var`, `mad`, `rms`, `ret-abs`, `ret-sq` | 롤링 창에서 잰 양방향 변동성과 그 일간 프록시 |
+| `log-vol` | `vol-log`, `vol-chg`, `vol-ratio` | 로그 스케일 EWMA 변동성, 그 변화와 기간 구조 |
+| `downside` | `DD`, `DD-log` | 하방 편차 |
+| `custom` | 그 외 전부 | `--extra-feature`로 넣은 변수 |
+
+알아둘 점은 다음과 같습니다.
+
+- **`--model sjm` 전용입니다.** 일반 JM은 피처 가중이라는 개념 자체가 없어(`feat_weights`가 `None`) 이 산출물이 나오지 않습니다.
+- **비중은 L1 기준입니다.** sparse JM의 가중 `w`는 `‖w‖₂ = 1`로 정규화되어 있어서 그대로 더하면 100%가 되지 않습니다. 그래서 `w_j / Σ_j w_j`로 비중을 잡고, `‖w‖₁` 자체는 `total` 열에 따로 남깁니다.
+- **`total`은 가중이 얼마나 퍼져 있는지를 봅니다.** 피처 하나에 다 몰리면 1에 가깝고, 여러 피처에 고르게 퍼질수록 커집니다(`√(선택된 피처 수)`가 상한).
+- **모든 가중이 0인 재추정은 비중이 NaN입니다.** 학습창이 한 레짐만 덮었다는 뜻이고, 그 경우는 재추정 단계에서 이미 경고가 나옵니다.
+
+### 3-10. 국면 분석과 유사 국면 탐색 (`--similar-*`, `--episode-*`)
+
+레짐 시계열을 **bear 국면(연속된 구간) 단위로 끊어** 하나씩 성격을 재고, **지금 국면과 가장 닮은 과거 국면**을 찾아, 그 국면이 걸었던 길로 현재 국면의 종료 시점을 가늠합니다. 기본으로 켜져 있고 `--no-episodes`로 끕니다.
+
+```bash
+# 기본 — 마지막(현재) 국면을 기준으로
+python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm
+
+# 특정 국면을 기준으로. 국면의 시작일이 아니라 국면 '안'의 날짜를 줘도 됩니다
+python run_pipeline.py --input 내데이터.xlsx --similar-target 2020-04-15
+
+# 오탐과 22일 미만 국면을 비교 대상에서 빼고, 지표도 직접 고르기
+python run_pipeline.py --input 내데이터.xlsx --drop-false-signal --min-episode-len 22     --similar-metric vol_20_mean --similar-metric dd_at_entry --similar-metric mdd_fwd
+```
+
+**(1) 국면 추출과 측정** — `regime_episodes.csv`. 국면 하나가 한 행이고, 시작일이 인덱스입니다.
+
+| 열 | 뜻 |
+|---|---|
+| `end` / `length` | 종료일과 길이(거래일) |
+| `period_ret` / `mdd` | 그 구간의 벤치마크 누적수익과 MDD. 거래 지연을 넣지 않은 **시장 자체의 움직임**입니다(전략 성과는 `strategy.csv` 쪽) |
+| `false_signal` | `period_ret`가 `--false-signal-return`(기본 0)을 넘으면 True. 방어로 갔는데 시장이 올랐다는 뜻 |
+| `ongoing` | 데이터 마지막 날까지 이어지는 국면, 즉 현재 국면 |
+
+**(2) 국면별 특성 지표** — 같은 파일의 뒷부분이며, 유사도 계산이 이 값들 위에서 돕니다.
+
+| 열 | 뜻 |
+|---|---|
+| `loss_diff_mean` | 국면 평균 `loss(bear) − loss(bull)`. 음수가 클수록 피처가 bear 군집에 확실히 앉아 있었다는 뜻 |
+| `distance_days` / `penalty_days` / `penalty_share` | 국면 길이를 **거리 요인**(피처가 실제로 bear 중심에 더 가까웠던 날)과 **페널티 요인**(bull 중심이 더 가까웠는데 점프 페널티가 붙잡아 둔 날)으로 나눈 것 |
+| `vol_5_mean` / `vol_20_mean` | 국면 평균 5일·20일 실현변동성 (연율) |
+| `sortino_20_mean` | 국면 평균 EWM Sortino (반감기 20) |
+| `vol_ratio_state` | `vol_20_mean` ÷ 그 시점 재추정의 **bear 상태 학습창 변동성**. 그 모델의 기준으로 이 국면이 얌전했는지 사나웠는지 |
+| `state_flip` | 그 재추정에서 bull 상태가 **저변동성** 쪽이면 1. 보통은 0이므로, 1은 상태 배치가 평소와 달랐던 재추정을 뜻합니다 |
+| `dd_at_entry` | 국면 진입 시점에 **이미 실현되어 있던 낙폭**. 얼마나 선제적인 신호였는지 |
+| `ret_fwd` / `mdd_fwd` / `fwd_days` | 진입 후 `--episode-horizon`(기본 22)거래일의 누적수익·MDD와, 데이터에 실제로 있었던 날 수 |
+
+**(3) 유사 국면 순위** — `similar_episodes.csv`. 비교 대상은 **기준 국면이 시작하기 전에 이미 끝난 국면**뿐입니다. 아직 일어나지도 않은 국면은 "이 국면이 얼마나 갈까"의 근거가 될 수 없기 때문이고, 기준 국면이 마지막(현재) 국면이면 어차피 모든 후보가 과거라 차이가 없습니다. 순수하게 "어떤 국면들이 서로 닮았나"만 보고 싶으면 `--similar-include-later`로 이 제한을 풉니다. 그 위에서, 지표를 국면 간에 표준화(z-score)한 뒤 **표준화된 차이의 RMS**를 거리로 씁니다. 합이 아니라 평균이라, 한 국면에만 결측인 지표가 있어도 그 국면만 그 지표를 빼고 계산합니다(`n_metrics`가 실제로 쓴 지표 수). 국면 간에 값이 전혀 변하지 않는 지표는 정보가 없으므로 자동으로 빠집니다.
+
+**(4) 경로 비교** — `similar_episode_paths.csv`·`.png`. 기준 국면과 1순위 국면의 종가를 각자 **진입일 = 1.0**으로 정규화해 나란히 놓고, 둘을 가장 잘 겹치는 **시차**를 `[−max-lag, +max-lag]`에서 찾습니다. 시차가 `+18`이면 **기준 국면이 18일 앞서 간다**는 뜻입니다(같은 지점에 18일 먼저 도달). 변동성이 더 큰 국면이 같은 낙폭에 더 빨리 닿기 때문에 생기는 차이입니다. 기준은 `--align-by rmse`(수준 차이 최소화, 기본)와 `corr`(상관 최대화) 중에 고르며, `rmse` 쪽이 더 엄격합니다.
+
+**(5) 종료 시점 시나리오** — `episode_length_scenarios.csv`. (3)과 같은 후보 집합에서 잰 과거 국면 길이의 분위수(`p25`/`p50`/`p75`)와 유사 국면 상위 `--similar-top`개의 길이를, 각각 현재 국면의 총 길이로 놓고 잔여일과 예상 종료일을 냅니다.
+
+알아둘 점은 다음과 같습니다.
+
+- **오탐·최소 길이 필터는 기본적으로 켜지지 않습니다.** 수익이 났던 국면이나 3일짜리 국면을 비교 대상에 넣을지는 데이터가 아니라 시장에 대한 판단이라, 표에는 `false_signal`과 `length`를 그대로 남기고 제외는 `--drop-false-signal`·`--min-episode-len`으로 **명시적으로** 요청할 때만 합니다. `--episode-horizon`과 같은 값(기본 22)을 `--min-episode-len`에 주면 전방 구간이 국면 안에서 온전히 관측된 국면만 남습니다.
+- **특성 지표는 사후 서술입니다.** `ret_fwd`·`mdd_fwd`는 진입일 이후의 데이터를 봅니다. 모델 자체에는 룩어헤드가 없지만(6절), 이 표는 **지나간 국면을 설명하는 자료**이지 진입 시점에 쓸 수 있는 신호가 아닙니다.
+- **`loss_*` 없이도 돕니다.** 이 기능이 생기기 전에 만든 `regimes.csv`에는 `loss_0`·`loss_1`이 없습니다. 그러면 손실 기반 3개 열만 NaN이 되고 나머지 지표로 유사도를 계산합니다.
+- **예상 종료일의 근사.** 데이터 마지막 날을 넘어가는 예측은 남은 일수를 영업일로 셉니다. 휴장일을 모르니 긴 예측일수록 조금 이르게 찍힙니다.
+- **잔여일이 음수일 수 있습니다.** 기준 국면이 이미 그 시나리오보다 오래 갔다는 뜻이고, 감추기보다 그대로 보여줍니다.
+- **국면이 하나뿐이거나 경로가 겹치지 않으면** 해당 산출물만 경고와 함께 건너뛰고 나머지는 그대로 저장합니다. 현재 국면이 데이터 끝에 막 시작된 경우(경로가 10일도 안 됨)가 대표적입니다.
+
+### 3-11. 추론 전용 모드 (`--inference`)
+
+기본 실행은 **백테스트**입니다. 1990년부터 6개월마다 재추정하며 모든 날의 레짐을 추론하죠. 모델을 평가할 때는 그게 맞지만, **"지금 국면이 뭔가"** 만 알고 싶을 때는 과거를 전부 다시 걸을 이유가 없습니다.
+
+`--inference`는 그 걸음의 **마지막 한 칸만** 수행합니다. 현재 반기 직전 `--window`(기본 3000)거래일로 **한 번 적합**하고, 그 반기의 첫 거래일부터 데이터 마지막 날까지를 온라인 추론합니다.
+
+```bash
+# 현재 국면만
+python run_pipeline.py --input 내데이터.xlsx --inference
+
+# 백테스트와 같은 설정으로
+python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm --inference
+```
+
+```
+추론 모드 — 현재 반기만 (재추정 2026-07-01)
+학습창: 2014-07-02 ~ 2026-06-30 (3000거래일)
+추론 구간: 2026-07-01 ~ 2026-09-04 (46거래일, bear 비중 47.8%)
+------------------------------------------------------------------------
+현재 국면(2026-09-04): BEAR (확률 100%) — 22거래일째 (2026-08-05부터)
+권장 위험자산 비중: 0% (거래 지연 1일 반영, 현금 0%~100%)
+변수 type별 가중 비중: realized-vol 59%, log-vol 22%, downside 19%
+```
+
+**현재 반기**는 데이터가 덮는 가장 최근 반기 앵커 — 1월 1일·7월 1일 **이후 첫 거래일** — 부터입니다(3절의 재추정 스케줄과 같은 규칙). 오늘이 9월 5일이면 7월 1일에 적합된 모델로 7월 이후를 추론합니다.
+
+**백테스트와 완전히 같은 신호가 나옵니다.** 두 모드가 겹치는 날짜의 `regime`·`proba_*`·`loss_*`는 부동소수점 수준까지 동일합니다. 적합은 반기 이전 창만 보고, 반기 안 어떤 날의 추론도 그 창 + 그 날까지의 데이터만 보기 때문입니다(6절 룩어헤드 규칙 그대로). 차이는 **얼마나 계산하느냐**뿐입니다 — 재추정 30회 대신 1회라, 예제 데이터에서 20분대 → 6초였습니다.
+
+산출물은 전부 `inference_` 접두사가 붙어서, 백테스트 결과와 **같은 폴더를 써도 덮어쓰지 않습니다**.
 
 | 파일 | 내용 |
 |---|---|
-| `regimes.csv` | 날짜별 온라인 추론 레짐(0=bull, 1=bear), 레짐 확률(`proba_0`·`proba_1`), 사용된 재추정 시점, 종가·수익률·무위험금리·초과수익률, 전략 비중과 전략 수익률. 기본(연속형)에서는 `proba_*`가 `--grid-size` 간격의 확률값이고, `--no-cont`를 주면 0/1 원핫입니다 (3-8 참고) |
+| `inference_regimes.csv` | 현재 반기의 날짜별 레짐·확률·상태 손실 + 종가·수익률·무위험금리·초과수익률과 **권장 위험자산 비중** |
+| `inference_summary.csv` | 한 눈에 보는 요약: 기준일, 재추정일, 학습창 구간·길이, 추론 구간, 현재 레짐과 확률, 현재 국면 지속일수와 시작일, 반기 내 bear 비중, 권장 비중, 종가 |
+| `inference_refit_params.csv` | 그 한 번의 재추정에 대한 레짐별 파라미터 (일반 `refit_params.csv`와 같은 형식) |
+| `inference_feat_weights.csv` · `inference_weight_groups.csv` | `--model sjm` 사용 시 그 재추정의 피처 가중과 유형별 비중 (3-9) |
+| `inference_regimes.png` | 반기 종가 + bear 구간 음영, 아래에 P(bear) 패널. 기준일은 점으로 표시 |
+
+알아둘 점은 다음과 같습니다.
+
+- **백테스트 전용 옵션은 쓰이지 않습니다.** 거래비용(`--cost-bps` 계열), `--delays`/`--no-robustness`, `--hmm`, 국면 분석(`--episode-*`·`--similar-*`), `--refit-start`는 이 모드에 대응물이 없습니다. `--hmm`을 주면 무시한다고 경고합니다. `--delay`와 `--min-cash`/`--max-cash`는 **권장 비중을 계산할 때만** 쓰입니다.
+- **권장 비중은 성과가 아니라 신호를 다시 쓴 것입니다.** 레짐을 현금 한도로 매핑하고 거래 지연을 반영한 값이라, 0/1 전략이 지금 들고 있을 포지션과 같습니다. 백테스트를 돌리지 않았으므로 이 모드에는 성과표가 없습니다.
+- **데이터가 짧으면 실패합니다.** 최근 반기 앵커 앞에 `--min-window`(기본 500)거래일이 없으면 재추정 시점을 만들 수 없다는 오류가 납니다. 백테스트와 같은 조건입니다.
+- **반기가 막 시작했으면 추론 구간이 며칠뿐입니다.** 예컨대 7월 3일에 돌리면 1~2거래일이고, 그래도 동작합니다. 다만 `--jump-penalty`가 상태 전환을 억제하므로 반기 초반의 신호는 학습창 끝의 상태에 끌리는 경향이 있습니다.
+
+## 4. 출력물 (`--outdir`)
+
+아래는 기본(백테스트) 실행의 산출물입니다. `--inference`는 `inference_` 접두사가 붙은 별도 파일을 냅니다(3-11).
+
+| 파일 | 내용 |
+|---|---|
+| `regimes.csv` | 날짜별 온라인 추론 레짐(0=bull, 1=bear), 레짐 확률(`proba_0`·`proba_1`), 상태별 손실(`loss_0`·`loss_1`), 사용된 재추정 시점, 종가·수익률·무위험금리·초과수익률, 전략 비중과 전략 수익률. 기본(연속형)에서는 `proba_*`가 `--grid-size` 간격의 확률값이고, `--no-cont`를 주면 0/1 원핫입니다 (3-8 참고) |
 | `refit_params.csv` | 재추정 시점 × 레짐별 학습창 구간, 학습창 내 비중·연율 수익률·연율 변동성, 자기전이확률, **원래 피처 단위로 되돌린 군집 중심** |
 | `strategy.csv` | 일별 비중·매수량(`bought`)·매도량(`sold`)·총 거래량(`traded`)·거래비용(`cost`)·무위험금리·매수보유 수익률·전략 수익률 |
 | `performance.csv` | 매수보유 vs JM 0/1 전략 성과(CAGR, 변동성, Sharpe, MDD, Calmar, ES 5%, Turnover, Leverage, 연율 거래비용 `Cost`) |
@@ -362,6 +514,14 @@ python run_pipeline.py --input 내데이터.xlsx --no-cont
 | `delay_robustness.csv` | 거래 지연 1/5/10일 성과 비교 (논문 Table 5) |
 | `feat_weights.csv` | `--model sjm` 사용 시 재추정별 피처 가중(0이면 그 시점에 탈락) |
 | `feat_weights.png` | 재추정에 따른 피처 가중의 시간 변화. 고정한 피처는 실선, 나머지는 점선 |
+| `weight_groups.csv` | `--model sjm` 사용 시 재추정별 **변수 유형별 가중 비중**(합 100%)과 `‖w‖₁`(`total` 열) (3-9) |
+| `weight_groups.png` | 같은 내용의 100% 스택 그림 |
+| `regime_episodes.csv` | bear 국면별 길이·구간수익·MDD·오탐 표시와 특성 지표(거리/페널티 분해 포함) (3-10) |
+| `episode_lengths.png` | 국면 길이를 거리 요인 / 페널티 요인으로 나눈 스택 바 |
+| `similar_episodes.csv` | 기준 국면과의 표준화 거리 순위 |
+| `episode_length_scenarios.csv` | 과거 길이 분위수·유사 국면 길이별 잔여일과 예상 종료일 |
+| `similar_episode_paths.csv` | 기준 국면과 1순위 국면의 정규화 경로(진입일 = 1.0) |
+| `similar_episode_paths.png` | 같은 경로의 원본 / 시차 정렬 2패널 비교 |
 | `hmm_regimes.csv` | `--hmm` 사용 시 HMM의 원(raw) 상태·평활된 레짐·사용된 재추정 시점 |
 | `hmm_refit_params.csv` | HMM 재추정별 상태 조건부 연율 수익률·변동성·자기전이확률·로그우도 |
 | `hmm_strategy.csv` | HMM 신호로 돌린 0/1 전략의 일별 결과 |
@@ -385,6 +545,10 @@ python run_pipeline.py --input 내데이터.xlsx --no-cont
 | (논문 밖) 연속형 JM (Nystrup et al. 2020) — 확률로 나오는 레짐 | `rolling.init_model(cont=True)` → `JumpModel(cont=True)` |
 | (논문 밖) 특정 피처를 선택에서 제외하고 항상 유지 | `features.resolve_pinned_features` → `sparse_pin.PinnedSparseJumpModel` |
 | (논문 밖) 피처 시리즈를 모델에 넣기 전에 제거 | `features.resolve_removed_features` → `features.build_features(remove_series=...)` |
+| (논문 밖) 변수 유형별 가중 비중 | `weights.group_feature_weights` → `plotting.plot_weight_groups` |
+| (논문 밖) 국면 길이의 거리 요인 / 페널티 요인 분해 | `rolling.state_losses` → `regime_episodes.episode_metrics` |
+| (논문 밖) 현재 반기만 추론하는 실행 모드 | `rolling.run_rolling_jm(last_refit_only=True)` → `run_pipeline.run_inference` |
+| (논문 밖) 유사 국면 탐색과 국면 종료 시점 | `regime_episodes.rank_similar_episodes`·`compare_episode_paths`·`length_scenarios` |
 
 ## 6. 구현상의 선택과 주의사항
 
@@ -402,6 +566,8 @@ python run_pipeline.py --input 내데이터.xlsx --no-cont
 - **한글 라벨**: 커스텀 변수 이름이 한글이면 그림에 한글이 들어갑니다. 설치된 한글 지원 폰트를 자동으로 찾고, 없으면 경고합니다(`--plot-font`로 직접 지정 가능).
 - **성과 지표 정의**: Return은 무위험수익을 포함한 CAGR, Sharpe는 연율 평균 초과수익÷연율 변동성, Calmar는 연율 평균 초과수익÷|MDD|, Turnover는 연 `Σ|Δw|/2`, ES는 일간 수익률 하위 5% 평균입니다. MDD는 총수익 복리 자산곡선 기준입니다.
 - **거래 시작 시점**: 신호가 아직 없는 첫 `delay+1`일은 위험자산 100%로 둡니다.
+- **국면 특성 지표는 사후 서술입니다.** `regime_episodes.csv`의 전방 구간 열(`ret_fwd`·`mdd_fwd`)은 진입일 **이후**의 데이터를 씁니다. 모델 신호에는 룩어헤드가 없지만 이 표는 지나간 국면을 설명하는 자료이지 실시간 신호가 아닙니다(3-10).
+- **상태별 손실(`loss_*`)은 모델 자신의 손실입니다.** 가중된 피처 공간에서 `½‖x·w − μ_k‖²`이며(`jumpmodels.jump.do_E_step`와 같은 식), 점프 페널티와 맞바꿔지는 항이 바로 이 값입니다. 그래서 "가장 가까운 중심 ≠ 배정된 레짐"인 날이 페널티가 붙잡고 있는 날이 됩니다.
 - 그림은 LaTeX 의존성이 있는 `jumpmodels.plot` 대신 `plotting.py`에서 직접 그립니다.
 
 ## 7. 실행 예시 결과
