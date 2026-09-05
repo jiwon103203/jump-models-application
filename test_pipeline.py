@@ -9,6 +9,7 @@ Run directly (`python test_pipeline.py`) or through `pytest test_pipeline.py`.
 
 import os
 import sys
+import tempfile
 import warnings
 
 import numpy as np
@@ -28,6 +29,7 @@ from regime_episodes import (align_paths, compare_episode_paths, episode_metrics
                              rank_similar_episodes, resolve_target_episode, select_episodes)
 from rolling import (DEFAULT_GRID_SIZE, init_model, refit_schedule, resolve_grid_size,
                      resolve_max_feats, run_rolling_jm, semiannual_anchors, state_losses)
+from run_pipeline import run_inference
 from sparse_pin import PinnedSparseJumpModel, solve_lasso_pinned
 from weights import (CUSTOM_TYPE, GROUPINGS, NO_HORIZON, feature_group_map, feature_group_name,
                      feature_horizon, feature_type_name, group_feature_weights,
@@ -888,6 +890,83 @@ def test_state_losses_explain_the_labels():
                         (result.regimes.loss_1 > result.regimes.loss_0)).sum())
     assert int(metrics["penalty_days"].sum()) == penalty_days
     assert int(metrics["distance_days"].sum() + metrics["penalty_days"].sum()) == int(metrics["length"].sum())
+
+
+############################################
+## 추론 전용 모드
+############################################
+
+def test_last_refit_only_matches_the_tail_of_the_full_run():
+    """One refit gives exactly the last segment of the full walk, day for day."""
+    X, ret = _toy_features()
+    shared = dict(model="jm", jump_penalty=10., window=300, min_window=250, n_init=2,
+                  verbose=False)
+    full = run_rolling_jm(X, ret, **shared)
+    last = run_rolling_jm(X, ret, last_refit_only=True, **shared)
+
+    assert len(last.schedule) == 1 and last.schedule[0] == full.schedule[-1]
+    refit_date = last.schedule[0][0]
+    # the inferred half runs from the refit date to the end of the data
+    assert last.regimes.index[0] == refit_date
+    assert last.regimes.index[-1] == X.index[-1]
+    assert (last.regimes["refit_date"] == refit_date).all()
+
+    # and it is the same inference the full run made over those days: the fit sees only the
+    # window before the half, and a day of the half sees only that window plus the days up to it
+    common = full.regimes.index.intersection(last.regimes.index)
+    assert len(common) == len(last.regimes)
+    for col in ("regime", "proba_0", "proba_1", "loss_0", "loss_1"):
+        assert np.allclose(full.regimes.loc[common, col], last.regimes.loc[common, col]), col
+    # only the last refit's parameters are reported
+    assert list(last.params["refit_date"].unique()) == [refit_date]
+
+
+def _write_sample_input(folder, n=1400, seed=0):
+    """A small price file in the layout the pipeline reads, written into `folder`."""
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2018-01-01", periods=n)
+    state = np.tile(np.repeat([0, 1], 120), n // 240 + 1)[:n]
+    ret = rng.normal(np.where(state == 0, .0008, -.001), np.where(state == 0, .007, .02))
+    path = os.path.join(folder, "sample.csv")
+    pd.DataFrame({"날짜": dates.date,
+                  "종가": (100. * np.cumprod(1. + ret)).round(4),
+                  "무위험금리": 3.}).to_csv(path, index=False)
+    return path
+
+
+def test_run_inference_covers_the_current_half_only():
+    """The inference mode fits once before the current half and reports where it stands now."""
+    with tempfile.TemporaryDirectory() as folder:
+        out = run_inference(_write_sample_input(folder), outdir=folder, feature_set="paper",
+                            jump_penalty=10., window=300, min_window=250, warmup=60,
+                            n_init=2, plot=False, verbose=False)
+
+        result, regimes, summary = out["result"], out["regimes"], out["summary"]
+        assert len(result.schedule) == 1
+        refit_date = result.schedule[0][0]
+        # the training window ends the day before the half starts: no day of the half is fitted on
+        assert summary["train_end"] < refit_date <= summary["inference_start"]
+        assert summary["n_train"] == 300
+        assert summary["inference_start"] == regimes.index[0] == refit_date
+        assert summary["asof"] == regimes.index[-1] == out["X"].index[-1]
+        assert summary["n_inference"] == len(regimes)
+
+        # the headline call is the last day's, and the run length reaches back to its start
+        assert summary["regime"] == regimes["regime"].iloc[-1]
+        assert summary["regime_name"] in ("bull", "bear")
+        assert 1 <= summary["run_length"] <= len(regimes)
+        assert (regimes["regime"].iloc[-summary["run_length"]:] == summary["regime"]).all()
+        assert summary["run_start"] == regimes.index[len(regimes) - summary["run_length"]]
+        # the recommended weight is the signal mapped through the cash limits, nothing more
+        assert summary["weight"] in (0., 1.)
+
+        # every file is prefixed, so an inference run cannot overwrite a backtest run
+        names = [os.path.basename(path) for path in out["written"]]
+        assert all(name.startswith("inference_") for name in names), names
+        assert "inference_regimes.csv" in names and "inference_summary.csv" in names
+        # the plain model has no feature weights, so no weight tables are written
+        assert out["weight_groups"] is None
+        assert not [name for name in names if "weight" in name]
 
 
 def main() -> int:

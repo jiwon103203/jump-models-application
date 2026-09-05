@@ -474,3 +474,69 @@ def plot_similar_episode_paths(comparison: dict,
         ax.legend(loc="lower left", fontsize="small")
     fig.suptitle(title)
     return _save(fig, filepath)
+
+
+def plot_inference(regimes: pd.DataFrame,
+                   filepath: str,
+                   bear_state: int = 1,
+                   title: str = "Regimes of the current half-year",
+                   figsize=(14, 7)) -> str:
+    """
+    Plot the price of the inferred half-year with its bear stretches shaded, over the
+    probability the model puts on the bear state.
+
+    This is the picture of an inference run: a single half-year, not a track record. There
+    is no strategy curve on it, because none was backtested -- the lower panel shows how
+    confident the model is in the call, which is what one wants when reading a live signal
+    rather than a historical one.
+
+    Parameters
+    ----------
+    regimes : pd.DataFrame
+        The `regimes` frame of `run_pipeline.run_inference`: the regime, the `proba_*`
+        columns, the close price and the recommended weight, indexed by date.
+
+    filepath : str
+        Where to save the figure.
+
+    bear_state : int, optional (default=1)
+        The state treated as the defensive one, i.e. the one shaded and plotted below.
+
+    title : str, optional
+        The figure title.
+
+    figsize : tuple, optional
+        The figure size, in inches.
+
+    Returns
+    -------
+    str
+        The path of the saved figure.
+    """
+    dates = pd.to_datetime(pd.Index(regimes.index))
+    in_bear = (regimes["regime"] == bear_state).to_numpy()
+    proba = regimes.get(f"proba_{bear_state}")
+
+    fig, axes = plt.subplots(2, 1, figsize=figsize, sharex=True,
+                             gridspec_kw={"height_ratios": [3, 1]})
+    axes[0].plot(dates, regimes["close"], color="#1c7ed6", lw=1.5, label="Close")
+    axes[0].fill_between(dates, 0, 1, where=in_bear, transform=axes[0].get_xaxis_transform(),
+                         color=BEAR_COLOR, alpha=.18, step="pre", label="Bear")
+    # the last day is the call one would act on, so it is marked rather than left to the eye
+    axes[0].scatter(dates[-1:], regimes["close"].iloc[-1:], color="#c92a2a", zorder=5, s=36,
+                    label=f"As of {regimes.index[-1]}")
+    axes[0].set(title=title, ylabel="Close")
+    axes[0].legend(loc="upper left")
+
+    if proba is not None:
+        # drawn as a step, like the shading above: with the discrete model the probability is
+        # one-hot, and a smooth line would suggest a gradual move the model never made
+        axes[1].fill_between(dates, 0., proba, color=BEAR_COLOR, alpha=.35, step="pre")
+        axes[1].plot(dates, proba, color=BEAR_COLOR, lw=1.2, drawstyle="steps-pre")
+    axes[1].axhline(.5, color="#868e96", lw=.8, ls=":")
+    axes[1].set(ylabel="P(bear)", ylim=(0., 1.05))
+    _percent_axis(axes[1])
+    for ax in axes:
+        ax.grid(alpha=.25)
+        ax.margins(x=0)
+    return _save(fig, filepath)

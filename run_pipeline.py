@@ -3,11 +3,16 @@
 End-to-end pipeline: a csv/Excel file of date, close price and risk-free rate in, and
 regime signals plus a 0/1 strategy backtest out, following Shu, Yu and Mulvey (2024).
 
+Two run modes share the same options: the default backtest, which walks the whole history,
+and `--inference`, which fits once on the window preceding the current half-year and infers
+that half-year alone -- the answer to "what regime are we in now" without the backtest.
+
 Example
 -------
     python run_pipeline.py --input my_index.xlsx --outdir out
     python run_pipeline.py --input my_index.xlsx --hmm --extra-feature VIX:ewm:20
     python run_pipeline.py --input my_index.xlsx --feature-set extra --remove-series var
+    python run_pipeline.py --input my_index.xlsx --inference
 
 Run `python run_pipeline.py --help` for the full list of options.
 """
@@ -22,7 +27,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from backtest import (DEFAULT_COST_BPS, DEFAULT_MAX_CASH, DEFAULT_MIN_CASH,
+from backtest import (DEFAULT_COST_BPS, DEFAULT_MAX_CASH, DEFAULT_MIN_CASH, build_weights,
                       delay_robustness_table, format_performance_table, performance_table,
                       regime_summary, resolve_cash_limits, resolve_cost_bps, run_0_1_strategy)
 from data_io import (RF_UNITS, TRADING_DAYS, join_extra_table, load_extra_table,
@@ -137,6 +142,12 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--delays", default="1,5,10",
                        help="거래 지연 로버스트니스 표(논문 Table 5)에 사용할 지연 일수 목록")
     group.add_argument("--no-robustness", action="store_true", help="지연 로버스트니스 표를 건너뜀")
+
+    group = parser.add_argument_group("실행 모드")
+    group.add_argument("--inference", action="store_true",
+                       help="추론 전용 모드. 과거 롤링·백테스트를 건너뛰고, 현재 반기 직전 "
+                            "--window 거래일로 한 번만 적합해 현재 반기의 레짐만 추론합니다. "
+                            "거래비용·로버스트니스·HMM·국면 분석 옵션은 이 모드에서 쓰이지 않습니다")
 
     group = parser.add_argument_group("변수 유형별 가중치 (--model sjm 전용)")
     group.add_argument("--weight-group", default="type", choices=GROUPINGS,
@@ -271,6 +282,85 @@ def load_data_with_extras(input_path: str,
     return data, extra_df
 
 
+def prepare_inputs(input_path: str,
+                   sheet=None,
+                   date_col=None,
+                   close_col=None,
+                   rf_col=None,
+                   rf_unit: str = "annual_percent",
+                   trading_days: int = TRADING_DAYS,
+                   start_date=None,
+                   end_date=None,
+                   feature_set: str = "paper",
+                   log_dd: bool = False,
+                   remove_series=None,
+                   warmup: int = 252,
+                   extra_features=None,
+                   extra_file: str = None,
+                   extra_sheet=None,
+                   extra_date_col: str = None,
+                   model: str = "jm",
+                   pin_features=None,
+                   cont: bool = True,
+                   grid_size: float = DEFAULT_GRID_SIZE,
+                   verbose: bool = True):
+    """
+    Load the price file and build the feature matrix -- the prelude both run modes share.
+
+    `run_pipeline` and `run_inference` differ only in what they do with the features, so
+    everything up to and including them is done here once: the file is read into daily
+    returns and excess returns, the custom variables are joined and transformed, the feature
+    set is built on the excess returns, and the pin specifications are expanded into the
+    columns they stand for.
+
+    Parameters
+    ----------
+    input_path : str
+        Path of the csv/Excel file holding the date, close price and risk-free rate columns.
+
+    Other parameters mirror the command line options; see `build_parser`.
+
+    Returns
+    -------
+    tuple
+        `data` (the market data), `X` (the feature matrix) and `pinned` (the resolved pinned
+        feature columns, empty unless the sparse model is in use).
+    """
+    data, extra_df = load_data_with_extras(
+        input_path, extra_features=extra_features, extra_file=extra_file,
+        extra_sheet=extra_sheet, extra_date_col=extra_date_col,
+        sheet=sheet, date_col=date_col, close_col=close_col, rf_col=rf_col,
+        rf_unit=rf_unit, trading_days=trading_days, start_date=start_date, end_date=end_date)
+    if verbose:
+        print(f"데이터: {len(data)}거래일, {data.index[0]} ~ {data.index[-1]}")
+        print(f"연율 무위험금리 평균: {data.rf.mean() * trading_days:.2%}, "
+              f"자산 연율 수익률 평균: {data.ret.mean() * trading_days:.2%}")
+        if extra_df is not None:
+            print(f"커스텀 변수: {list(extra_df.columns)}")
+
+    X = build_features(data.excess_ret, ver=feature_set, warmup=warmup, log_dd=log_dd,
+                       extra_features=extra_df, remove_series=remove_series)
+    if verbose:
+        if remove_series:
+            built = (feature_set_columns(feature_set, log_dd=log_dd)
+                     + (list(extra_df.columns) if extra_df is not None else []))
+            dropped = [col for col in built if col not in set(X.columns)]
+            print(f"제거한 피처: {dropped} ({len(dropped)}/{len(built)}개, 지정: {list(remove_series)})")
+        print(f"피처({feature_set}): {list(X.columns)} / {len(X)}행, {X.index[0]} ~ {X.index[-1]}")
+
+    # feature-set names such as "paper" become the columns they stand for
+    pinned = resolve_pinned_features(X.columns, pin_features, ver=feature_set, log_dd=log_dd,
+                                     remove_series=remove_series)
+    if verbose and pinned and model == "sjm":       # `run_rolling_jm` warns and ignores them otherwise
+        print(f"고정 피처: {pinned} ({len(pinned)}/{X.shape[1]}개, 재추정마다 항상 유지)")
+
+    if verbose:
+        variant = (f"연속형(CJM, grid_size={grid_size:g}) → proba_* 열이 확률값"
+                   if cont else "이산형(논문 원본) → proba_* 열이 0/1 원핫")
+        print(f"모델: {model.upper()} {variant}")
+    return data, X, pinned
+
+
 def analyze_episodes(result,
                      data,
                      state: int = None,
@@ -356,6 +446,184 @@ def analyze_episodes(result,
     except ValueError as exc:                 # too little overlap to align the two paths
         warnings.warn(f"유사 국면 경로 비교를 건너뜁니다: {exc}")
     return out
+
+
+def run_inference(input_path: str,
+                  outdir: str = "out",
+                  sheet=None,
+                  date_col=None,
+                  close_col=None,
+                  rf_col=None,
+                  rf_unit: str = "annual_percent",
+                  trading_days: int = TRADING_DAYS,
+                  start_date=None,
+                  end_date=None,
+                  feature_set: str = "paper",
+                  log_dd: bool = False,
+                  remove_series=None,
+                  warmup: int = 252,
+                  extra_features=None,
+                  extra_file: str = None,
+                  extra_sheet=None,
+                  extra_date_col: str = None,
+                  model: str = "jm",
+                  max_feats: float = None,
+                  pin_features=None,
+                  jump_penalty: float = 50.,
+                  window: int = 3000,
+                  min_window: int = 500,
+                  n_components: int = 2,
+                  clip_mul: float = 3.,
+                  n_init: int = 10,
+                  random_state: int = 0,
+                  cont: bool = True,
+                  grid_size: float = DEFAULT_GRID_SIZE,
+                  delay: int = 1,
+                  min_cash: float = DEFAULT_MIN_CASH,
+                  max_cash: float = DEFAULT_MAX_CASH,
+                  weight_group: str = "type",
+                  plot: bool = True,
+                  plot_font: str = None,
+                  save_features: bool = False,
+                  verbose: bool = True) -> dict:
+    """
+    Infer the regimes of the current half-year only, and report where the market stands now.
+
+    The backtest walks the whole history: it re-estimates every six months and infers every
+    day from 1990 onwards, which is what one needs to judge the model but not what one needs
+    to act on it. This mode does the last step of that walk and nothing else -- the model is
+    fitted once, on the `window` trading days that precede the current half-year, and the
+    regimes of that half-year are inferred online from its first trading day to the end of
+    the data. The result is the answer to "지금 국면이 무엇인가", at a fraction of the cost,
+    and with no strategy attached: there is no backtest here to be misread as a track record.
+
+    The current half-year is the one that began at the most recent semiannual anchor the data
+    covers -- the first trading day on or after January 1st or July 1st (`rolling.semiannual_anchors`).
+    Its regimes are inferred exactly as the backtest infers them, so a day common to both runs
+    gets the same signal: the fit sees only the pre-half window, and the inference of a day
+    sees only that window plus the days of the half up to it.
+
+    The recommended weight is the plain mapping of the regime through `min_cash`/`max_cash`,
+    with the trading delay applied, i.e. the position the 0/1 strategy would be holding. It
+    is a restatement of the signal, not a backtested result.
+
+    Parameters
+    ----------
+    input_path : str
+        Path of the csv/Excel file holding the date, close price and risk-free rate columns.
+
+    outdir : str, optional (default="out")
+        Folder the results are written to. Every file is prefixed `inference_`, so an
+        inference run and a backtest run can share a folder without overwriting each other.
+
+    Other parameters mirror the command line options; see `build_parser`. The ones that only
+    make sense for a backtest -- the transaction costs, the robustness delays, the HMM
+    benchmark, the episode analysis -- have no counterpart here.
+
+    Returns
+    -------
+    dict
+        `data`, `X`, `result` (the single-refit `RollingJMResult`), `regimes` (the inferred
+        half with its prices and recommended weight), `summary` (the headline table),
+        `weight_groups` and `written`.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    data, X, pinned = prepare_inputs(
+        input_path, sheet=sheet, date_col=date_col, close_col=close_col, rf_col=rf_col,
+        rf_unit=rf_unit, trading_days=trading_days, start_date=start_date, end_date=end_date,
+        feature_set=feature_set, log_dd=log_dd, remove_series=remove_series, warmup=warmup,
+        extra_features=extra_features, extra_file=extra_file, extra_sheet=extra_sheet,
+        extra_date_col=extra_date_col, model=model, pin_features=pin_features,
+        cont=cont, grid_size=grid_size, verbose=verbose)
+
+    # one fit, on the window preceding the current half-year, then that half-year online
+    result = run_rolling_jm(X, data.excess_ret, jump_penalty=jump_penalty, window=window,
+                            min_window=min_window, last_refit_only=True,
+                            n_components=n_components, clip_mul=clip_mul, n_init=n_init,
+                            random_state=random_state, model=model, max_feats=max_feats,
+                            pin_feats=pinned, cont=cont, grid_size=grid_size, verbose=verbose)
+
+    regimes = result.regimes.join(data[["close", "ret", "rf", "excess_ret"]])
+    regimes["weight"] = build_weights(result.regimes.regime, delay=delay, bull_state=0,
+                                      min_cash=min_cash, max_cash=max_cash)
+
+    bear_state = n_components - 1
+    asof = regimes.index[-1]
+    refit_date, _, train_len = result.schedule[-1]
+    train_start = X.index[X.index.get_loc(refit_date) - train_len]
+    current = int(regimes.loc[asof, "regime"])
+    # how long the market has been in the state it is in now, within the inferred half
+    run_length = int((regimes["regime"] != current)[::-1].cumsum().eq(0).sum())
+    summary = pd.Series({
+        "asof": asof,
+        "refit_date": refit_date,
+        "train_start": train_start,
+        "train_end": X.index[X.index.get_loc(refit_date) - 1],
+        "n_train": train_len,
+        "inference_start": regimes.index[0],
+        "n_inference": len(regimes),
+        "regime": current,
+        "regime_name": "bull" if current == 0 else ("bear" if current == bear_state
+                                                    else f"mid{current}"),
+        "proba": float(regimes.loc[asof, f"proba_{current}"]),
+        "run_length": run_length,
+        "run_start": regimes.index[len(regimes) - run_length],
+        "bear_share": float((regimes["regime"] == bear_state).mean()),
+        "weight": float(regimes.loc[asof, "weight"]),
+        "close": float(regimes.loc[asof, "close"]),
+    }, name="inference")
+
+    weight_shares = None
+    if result.feat_weights is not None:
+        weight_shares = group_feature_weights(result.feat_weights, grouping=weight_group)
+
+    written = []
+    outputs = [("inference_regimes.csv", regimes),
+               ("inference_refit_params.csv", result.params.set_index("refit_date")),
+               ("inference_summary.csv", summary.to_frame())]
+    if result.feat_weights is not None:
+        outputs.append(("inference_feat_weights.csv", result.feat_weights))
+    if weight_shares is not None:
+        outputs.append(("inference_weight_groups.csv", weight_shares))
+    if save_features:
+        outputs.append(("inference_features.csv", X.loc[train_start:]))
+    for name, obj in outputs:
+        path = os.path.join(outdir, name)
+        obj.to_csv(path)
+        written.append(path)
+
+    if plot:
+        from plotting import plot_inference, setup_font
+        if plot_font:
+            setup_font(plot_font)
+        written.append(plot_inference(
+            regimes, os.path.join(outdir, "inference_regimes.png"), bear_state=bear_state,
+            title=f"{result.model.upper()} regimes of the current half-year "
+                  f"(fitted on {train_len} days to {summary['train_end']})"))
+
+    if verbose:
+        print("\n" + "=" * 72)
+        print(f"추론 모드 — 현재 반기만 (재추정 {refit_date})")
+        print(f"학습창: {train_start} ~ {summary['train_end']} ({train_len}거래일)")
+        print(f"추론 구간: {summary['inference_start']} ~ {asof} "
+              f"({summary['n_inference']}거래일, bear 비중 {summary['bear_share']:.1%})")
+        print("-" * 72)
+        print(f"현재 국면({asof}): {summary['regime_name'].upper()} "
+              f"(확률 {summary['proba']:.0%}) — {run_length}거래일째 "
+              f"({summary['run_start']}부터)")
+        print(f"권장 위험자산 비중: {summary['weight']:.0%} "
+              f"(거래 지연 {delay}일 반영, 현금 {min_cash:.0%}~{max_cash:.0%})")
+        if weight_shares is not None:
+            shares = weight_shares.drop(columns="total").iloc[-1].sort_values(ascending=False)
+            top = ", ".join(f"{group} {share:.0%}" for group, share in shares.items() if share > 0.)
+            print(f"변수 {weight_group}별 가중 비중: {top}")
+        print("=" * 72)
+        print("저장된 파일:")
+        for path in written:
+            print(f"  {path}")
+
+    return {"data": data, "X": X, "result": result, "regimes": regimes, "summary": summary,
+            "weight_groups": weight_shares, "written": written}
 
 
 def run_pipeline(input_path: str,
@@ -470,40 +738,14 @@ def run_pipeline(input_path: str,
     cost_kwargs = {"cost_bps": cost_bps, "buy_cost_bps": buy_cost_bps,
                    "sell_cost_bps": sell_cost_bps, "min_cash": min_cash, "max_cash": max_cash}
 
-    # 1) raw file(s) -> daily returns, excess returns and custom variables
-    data, extra_df = load_data_with_extras(
-        input_path, extra_features=extra_features, extra_file=extra_file,
-        extra_sheet=extra_sheet, extra_date_col=extra_date_col,
-        sheet=sheet, date_col=date_col, close_col=close_col, rf_col=rf_col,
-        rf_unit=rf_unit, trading_days=trading_days, start_date=start_date, end_date=end_date)
-    if verbose:
-        print(f"데이터: {len(data)}거래일, {data.index[0]} ~ {data.index[-1]}")
-        print(f"연율 무위험금리 평균: {data.rf.mean() * trading_days:.2%}, "
-              f"자산 연율 수익률 평균: {data.ret.mean() * trading_days:.2%}")
-        if extra_df is not None:
-            print(f"커스텀 변수: {list(extra_df.columns)}")
-
-    # 2) features from the excess return series (+ custom variables)
-    X = build_features(data.excess_ret, ver=feature_set, warmup=warmup, log_dd=log_dd,
-                       extra_features=extra_df, remove_series=remove_series)
-    if verbose:
-        if remove_series:
-            built = (feature_set_columns(feature_set, log_dd=log_dd)
-                     + (list(extra_df.columns) if extra_df is not None else []))
-            dropped = [col for col in built if col not in set(X.columns)]
-            print(f"제거한 피처: {dropped} ({len(dropped)}/{len(built)}개, 지정: {list(remove_series)})")
-        print(f"피처({feature_set}): {list(X.columns)} / {len(X)}행, {X.index[0]} ~ {X.index[-1]}")
-
-    # feature-set names such as "paper" become the columns they stand for
-    pinned = resolve_pinned_features(X.columns, pin_features, ver=feature_set, log_dd=log_dd,
-                                     remove_series=remove_series)
-    if verbose and pinned and model == "sjm":       # `run_rolling_jm` warns and ignores them otherwise
-        print(f"고정 피처: {pinned} ({len(pinned)}/{X.shape[1]}개, 재추정마다 항상 유지)")
-
-    if verbose:
-        variant = (f"연속형(CJM, grid_size={grid_size:g}) → regimes.csv의 proba_* 열이 확률값"
-                   if cont else "이산형(논문 원본) → regimes.csv의 proba_* 열이 0/1 원핫")
-        print(f"모델: {model.upper()} {variant}")
+    # 1-2) raw file(s) -> returns and custom variables -> the feature matrix
+    data, X, pinned = prepare_inputs(
+        input_path, sheet=sheet, date_col=date_col, close_col=close_col, rf_col=rf_col,
+        rf_unit=rf_unit, trading_days=trading_days, start_date=start_date, end_date=end_date,
+        feature_set=feature_set, log_dd=log_dd, remove_series=remove_series, warmup=warmup,
+        extra_features=extra_features, extra_file=extra_file, extra_sheet=extra_sheet,
+        extra_date_col=extra_date_col, model=model, pin_features=pin_features,
+        cont=cont, grid_size=grid_size, verbose=verbose)
 
     # 3) semiannual refits on a rolling window + online inference in between
     result = run_rolling_jm(X, data.excess_ret, jump_penalty=jump_penalty, window=window,
@@ -722,10 +964,32 @@ def run_pipeline(input_path: str,
 
 
 def main(argv=None) -> int:
-    """Parse the command line arguments and run the pipeline."""
+    """Parse the command line arguments and run the pipeline, or a single inference."""
     args = build_parser().parse_args(argv)
     if not args.quiet:
         warnings.simplefilter("always", UserWarning)
+    if args.inference:
+        if args.hmm:
+            warnings.warn("--hmm 은 백테스트 벤치마크라 --inference 모드에서는 무시합니다.")
+        run_inference(input_path=args.input, outdir=args.outdir, sheet=args.sheet,
+                      date_col=args.date_col, close_col=args.close_col, rf_col=args.rf_col,
+                      rf_unit=args.rf_unit, trading_days=args.trading_days,
+                      start_date=args.start_date, end_date=args.end_date,
+                      feature_set=args.feature_set, log_dd=args.log_dd,
+                      remove_series=args.remove_series, warmup=args.warmup,
+                      extra_features=args.extra_feature, extra_file=args.extra_file,
+                      extra_sheet=args.extra_sheet, extra_date_col=args.extra_date_col,
+                      model=args.model, max_feats=args.max_feats,
+                      pin_features=args.pin_feature, jump_penalty=args.jump_penalty,
+                      window=args.window, min_window=args.min_window,
+                      n_components=args.n_components, clip_mul=args.clip_mul,
+                      n_init=args.n_init, random_state=args.random_state,
+                      cont=not args.no_cont, grid_size=args.grid_size,
+                      delay=args.delay, min_cash=args.min_cash, max_cash=args.max_cash,
+                      weight_group=args.weight_group,
+                      plot=not args.no_plot, plot_font=args.plot_font,
+                      save_features=args.save_features, verbose=not args.quiet)
+        return 0
     run_pipeline(input_path=args.input, outdir=args.outdir, sheet=args.sheet,
                  date_col=args.date_col, close_col=args.close_col, rf_col=args.rf_col,
                  rf_unit=args.rf_unit, trading_days=args.trading_days,

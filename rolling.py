@@ -383,6 +383,7 @@ def run_rolling_jm(X: pd.DataFrame,
                    jump_penalty: float = 50.,
                    window: int = 3000,
                    min_window: int = 500,
+                   last_refit_only: bool = False,
                    n_components: int = 2,
                    clip_mul: float = 3.,
                    n_init: int = 10,
@@ -420,6 +421,13 @@ def run_rolling_jm(X: pd.DataFrame,
 
     min_window : int, optional (default=500)
         The shortest training window accepted; see `refit_schedule`.
+
+    last_refit_only : bool, optional (default=False)
+        Keep only the most recent re-estimation of the schedule, so that the model is fitted
+        once -- on the `window` trading days preceding the current half-year -- and the
+        online inference covers that half-year alone, from its first trading day to the end
+        of the data. This is the inference mode: it answers "what regime are we in now"
+        without walking the whole history, and produces no signal for the earlier years.
 
     n_components : int, optional (default=2)
         The number of regimes.
@@ -511,6 +519,9 @@ def run_rolling_jm(X: pd.DataFrame,
             f"재추정 시점을 만들 수 없습니다. 피처 {len(X)}행 (기간: {X.index[0]} ~ {X.index[-1]})으로는 "
             f"최소 학습창 {min_window}거래일을 확보한 1월/7월 첫 영업일이 없습니다. "
             f"--min-window(및 --window)나 --warmup 을 줄이거나 더 긴 데이터를 사용해 주세요.")
+
+    if last_refit_only:
+        schedule = schedule[-1:]
 
     short = [(d, w) for d, _, w in schedule if w < window]
     if short:
