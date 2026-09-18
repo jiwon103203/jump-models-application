@@ -290,8 +290,10 @@ def episode_metrics(episodes: pd.DataFrame,
         `refit_date`.
 
     data : pd.DataFrame
-        The market data, with `close` and `ret` and optionally `excess_ret`, which the
-        Sortino ratio prefers when it is there, as the model's own features do.
+        The market data, with `close` and `ret` and optionally `signal_ret`/`excess_ret`,
+        which the Sortino ratio prefers when either is there, so that it is taken over the
+        same series the model's own features were built on -- the benchmark-subtracted
+        return of a sector-level run included.
 
     params : pd.DataFrame, optional
         `rolling.RollingJMResult.params`, needed for `vol_ratio_state` and `state_flip`.
@@ -313,8 +315,11 @@ def episode_metrics(episodes: pd.DataFrame,
     index = regimes.index
     ret = pd.Series(data["ret"], dtype=float).reindex(index)
     close = pd.Series(data["close"], dtype=float).reindex(index)
-    base_ret = (pd.Series(data["excess_ret"], dtype=float).reindex(index)
-                if "excess_ret" in data else ret)
+    # the series the model's own features were built on: the benchmark-subtracted return
+    # when the run took the market signal out, the excess return otherwise
+    base_col = next((col for col in ("signal_ret", "excess_ret") if col in data), None)
+    base_ret = (pd.Series(data[base_col], dtype=float).reindex(index)
+                if base_col is not None else ret)
 
     ann = float(np.sqrt(trading_days))
     vol_5 = ret.rolling(5).std() * ann

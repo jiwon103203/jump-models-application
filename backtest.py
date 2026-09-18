@@ -13,6 +13,11 @@ between `1 - max_cash` and `1 - min_cash` instead of between 0 and 1; the defaul
 reproduce the pure 0/1 strategy of the article. Transaction costs may be split into a buy
 and a sell leg (`buy_cost_bps`, `sell_cost_bps`), as sell-side costs -- taxes and levies on
 top of the spread -- are typically the larger of the two.
+
+The same machinery also backtests a *relative* position, the one a sector-level run implies:
+long the sector and short its benchmark while the favorable regime holds, flat against the
+benchmark otherwise. Nothing about the strategy changes -- only the pair of series it is fed,
+which `resolve_backtest_basis` picks.
 """
 
 import numpy as np
@@ -22,6 +27,7 @@ TRADING_DAYS = 252
 DEFAULT_COST_BPS = 10.       # one-way transaction cost, in basis points
 DEFAULT_MIN_CASH = 0.        # cash floor, held even in the favorable regime
 DEFAULT_MAX_CASH = 1.        # cash cap, the share moved out of the risky asset in a bear
+BACKTEST_RETURNS = ("asset", "relative")     # what the strategy trades, see `resolve_backtest_basis`
 
 
 def resolve_cash_limits(min_cash: float = DEFAULT_MIN_CASH,
@@ -138,6 +144,49 @@ def build_weights(regime_ser: pd.Series,
     weights = pd.Series(np.where(regime_ser == bull_state, bull_weight, bear_weight),
                         index=regime_ser.index, dtype=float).shift(delay + 1)
     return weights.fillna(bull_weight).rename("weight")
+
+
+def resolve_backtest_basis(data: pd.DataFrame, basis: str = "asset") -> tuple:
+    """
+    Pick the return and risk-free series the strategy is to be measured on.
+
+    A regime model fitted on a benchmark-subtracted return says when the asset beats its
+    benchmark, not when it rises, so there are two honest ways to score the same signal:
+
+    - ``"asset"``: hold the asset itself while the favorable regime lasts and the risk-free
+      asset otherwise, exactly the strategy of the article. The regimes come from the
+      relative return, but the money is in the sector, so the table reports what a sector
+      fund holding cash in the unfavorable regime would have earned.
+    - ``"relative"``: hold the asset *against* its benchmark -- long the sector, short the
+      index -- while the favorable regime lasts, and sit flat against the benchmark
+      otherwise. The return series is then `rel_ret` and the alternative to holding it earns
+      nothing beyond the benchmark, so the risk-free leg is zero: every number in the
+      performance table is an excess-over-benchmark number, and its Sharpe ratio is an
+      information ratio. Its `bh` column is the sector's own relative performance.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        The market data, holding `ret` and `rf`, and `rel_ret` when a benchmark was given.
+
+    basis : str, optional (default="asset")
+        One of `BACKTEST_RETURNS`.
+
+    Returns
+    -------
+    (pd.Series, pd.Series, str)
+        The return series, the risk-free series, and a short Korean label naming the basis.
+    """
+    if basis not in BACKTEST_RETURNS:
+        raise ValueError(f"backtest_ret 는 {BACKTEST_RETURNS} 중 하나여야 합니다. 입력값: {basis}")
+    if basis == "asset":
+        return data["ret"], data["rf"], "자산"
+    if "rel_ret" not in data:
+        raise ValueError(
+            "backtest_ret='relative' 은 벤치마크가 있어야 합니다. "
+            "--relative-benchmark (별도 파일) 또는 --relative-benchmark-col (같은 파일)을 지정해 주세요.")
+    rel = pd.Series(data["rel_ret"], dtype=float)
+    return rel, pd.Series(0., index=rel.index, name="rf"), "상대"
 
 
 def run_0_1_strategy(regime_ser: pd.Series,

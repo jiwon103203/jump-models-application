@@ -17,8 +17,11 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from backtest import (build_weights, delay_robustness_table, resolve_cash_limits,
-                      resolve_cost_bps, run_0_1_strategy)
+from backtest import (build_weights, delay_robustness_table, performance_table,
+                      resolve_backtest_basis, resolve_cash_limits, resolve_cost_bps,
+                      run_0_1_strategy)
+from data_io import (attach_benchmark, load_benchmark_series, load_market_data,
+                     relative_return, resolve_signal_return)
 from features import (EXAMPLE_HLS, EXTRA_DD_HLS, EXTRA_WINDOWS, FEATURE_SETS, apply_transform,
                       build_extra_features, build_features, compute_ewm_DD, feature_engineer,
                       feature_series, feature_series_name, feature_set_columns, parse_extra_spec,
@@ -29,7 +32,7 @@ from regime_episodes import (align_paths, compare_episode_paths, episode_metrics
                              rank_similar_episodes, resolve_target_episode, select_episodes)
 from rolling import (DEFAULT_GRID_SIZE, init_model, refit_schedule, resolve_grid_size,
                      resolve_max_feats, run_rolling_jm, semiannual_anchors, state_losses)
-from run_pipeline import run_inference
+from run_pipeline import load_data_with_extras, market_columns, prepare_inputs, run_inference
 from sparse_pin import PinnedSparseJumpModel, solve_lasso_pinned
 from weights import (CUSTOM_TYPE, GROUPINGS, NO_HORIZON, feature_group_map, feature_group_name,
                      feature_horizon, feature_type_name, group_feature_weights,
@@ -600,6 +603,237 @@ def test_jump_model_run_has_no_feature_weights():
 
 
 ############################################
+## 벤치마크 차감 (섹터 지수)
+############################################
+
+BENCH_DATES = pd.bdate_range("2021-01-04", periods=8).date
+
+
+def _sector_and_benchmark(own):
+    """
+    A benchmark and a sector index that is the benchmark times a known own-return path.
+
+    `own` is what the sector does *beyond* the market, so `(1 + bench_ret) * (1 + own) - 1`
+    is the sector return and "ratio" subtraction has to give `own` back exactly.
+    """
+    bench_ret = np.array([0., .03, -.05, .02, .04, -.06, .01, .02])
+    bench_close = pd.Series(100. * np.cumprod(1. + bench_ret), index=BENCH_DATES)
+    sector_ret = (1. + bench_ret) * (1. + np.asarray(own)) - 1.
+    sector_close = pd.Series(50. * np.cumprod(1. + sector_ret), index=BENCH_DATES)
+    return sector_close, bench_close
+
+
+def test_relative_return_methods():
+    """The three subtractions are the three formulas they claim to be, and nothing else."""
+    ret = pd.Series([.02, -.03, .005], index=BENCH_DATES[:3])
+    bench = pd.Series([.01, -.04, .005], index=BENCH_DATES[:3])
+
+    assert np.allclose(relative_return(ret, bench, "diff"), ret - bench)
+    assert np.allclose(relative_return(ret, bench, "log"), np.log1p(ret) - np.log1p(bench))
+    assert np.allclose(relative_return(ret, bench, "ratio"), (1. + ret) / (1. + bench) - 1.)
+    # a day the asset matched the benchmark is a zero under every one of them
+    assert all(abs(float(relative_return(ret, bench, method).iloc[2])) < 1e-15
+               for method in ("diff", "log", "ratio"))
+    try:
+        relative_return(ret, bench, "subtract")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("알 수 없는 rel_method 를 거부해야 합니다")
+
+
+def test_attach_benchmark_leaves_only_the_sector_signal():
+    """Subtracting the benchmark recovers exactly what the sector did on its own."""
+    own = np.array([0., .01, .01, -.02, 0., -.02, 0., .015])
+    sector_close, bench_close = _sector_and_benchmark(own)
+    data = pd.DataFrame({"close": sector_close, "ret": sector_close.pct_change()})
+
+    out = attach_benchmark(data, bench_close, rel_method="ratio")
+    assert list(out.columns) == ["close", "ret", "bench_close", "bench_ret", "rel_ret"]
+    assert np.isnan(out.rel_ret.iloc[0])                        # no return on the first row
+    # the market's own moves -- including its -6% day -- leave no trace in the relative return
+    assert np.allclose(out.rel_ret.iloc[1:], own[1:])
+    # "diff" is the same statement to first order, and the exact subtraction it promises
+    diff = attach_benchmark(data, bench_close, rel_method="diff")
+    assert np.allclose(diff.rel_ret.iloc[1:], (diff.ret - diff.bench_ret).iloc[1:])
+    assert np.abs(diff.rel_ret.iloc[1:] - own[1:]).max() < 5e-3
+
+
+def test_attach_benchmark_aligns_without_looking_ahead():
+    """A benchmark on its own calendar is carried forward, never backwards."""
+    own = np.zeros(8)
+    sector_close, bench_close = _sector_and_benchmark(own)
+    data = pd.DataFrame({"close": sector_close, "ret": sector_close.pct_change()})
+    # the benchmark did not trade on the fourth day, and starts a day late
+    gapped = bench_close.drop(index=[BENCH_DATES[0], BENCH_DATES[3]])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out = attach_benchmark(data, gapped, rel_method="diff")
+    assert np.isnan(out.bench_close.iloc[0])                    # nothing is filled backwards
+    assert out.bench_close.iloc[3] == bench_close.iloc[2]       # the holiday holds its last close
+    assert abs(float(out.bench_ret.iloc[3])) < 1e-15            # so its return that day is zero
+    # and the whole thing is causal: the tail cannot change a value computed earlier
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        prefix = attach_benchmark(data.iloc[:5], gapped.loc[:BENCH_DATES[4]], rel_method="diff")
+    assert np.allclose(out.rel_ret.iloc[1:5], prefix.rel_ret.iloc[1:], equal_nan=True)
+
+
+def test_attach_benchmark_rejects_a_benchmark_that_is_the_asset():
+    """The same column twice means a relative return of zero; say so rather than fit it."""
+    own = np.zeros(8)
+    sector_close, _ = _sector_and_benchmark(own)
+    data = pd.DataFrame({"close": sector_close, "ret": sector_close.pct_change()})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = attach_benchmark(data, sector_close, rel_method="diff")
+    assert np.allclose(out.rel_ret.iloc[1:], 0.)
+    assert any("상대수익률" in str(w.message) for w in caught), [str(w.message) for w in caught]
+
+
+def test_load_market_data_reads_a_benchmark_column():
+    """A benchmark column of the main file becomes `bench_ret` and `rel_ret`."""
+    own = np.array([0., .01, -.02, .03, 0., -.01, .02, 0.])
+    sector_close, bench_close = _sector_and_benchmark(own)
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "sector.csv")
+        pd.DataFrame({"날짜": BENCH_DATES, "종가": sector_close.to_numpy(),
+                      "코스피": bench_close.to_numpy(), "무위험금리": 3.}).to_csv(path, index=False)
+
+        plain = load_market_data(path)
+        data = load_market_data(path, bench_col="코스피", rel_method="ratio")
+        assert "rel_ret" not in plain.columns             # nothing changes without a benchmark
+        assert list(data.columns) == ["close", "rf_raw", "rf", "ret", "excess_ret",
+                                      "bench_close", "bench_ret", "rel_ret"]
+        # the benchmark is attached before the first (return-less) row is dropped, so the
+        # relative return starts on the same day the asset return does
+        assert data.index[0] == plain.index[0] and not data.rel_ret.isna().any()
+        assert np.allclose(data.rel_ret, own[1:])
+        assert np.allclose(data.close, plain.close) and np.allclose(data.ret, plain.ret)
+
+        # the asset cannot be its own benchmark by accident
+        try:
+            load_market_data(path, close_col="종가", bench_col="종가")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("종가 열과 벤치마크 열이 같으면 거부해야 합니다")
+
+
+def test_benchmark_from_a_file_matches_a_benchmark_column():
+    """Both routes -- a column of the main file, a file of its own -- give the same series."""
+    own = np.array([0., .01, -.02, .03, 0., -.01, .02, 0.])
+    sector_close, bench_close = _sector_and_benchmark(own)
+    with tempfile.TemporaryDirectory() as folder:
+        main = os.path.join(folder, "sector.csv")
+        side = os.path.join(folder, "kospi.csv")
+        pd.DataFrame({"날짜": BENCH_DATES, "종가": sector_close.to_numpy(),
+                      "코스피": bench_close.to_numpy(), "무위험금리": 3.}).to_csv(main, index=False)
+        pd.DataFrame({"date": BENCH_DATES,
+                      "close": bench_close.to_numpy()}).to_csv(side, index=False)
+
+        assert np.allclose(load_benchmark_series(side), bench_close)
+        in_file, _ = load_data_with_extras(main, bench_col="코스피", rel_method="diff")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")            # the first day has no benchmark return
+            from_file, _ = load_data_with_extras(main, bench_file=side, rel_method="diff")
+        # the separate file cannot see the day before the data starts, so its first return is
+        # missing; everywhere else the two are the same number
+        assert np.isnan(from_file.bench_ret.iloc[0])
+        assert np.allclose(in_file.rel_ret.iloc[1:], from_file.rel_ret.iloc[1:])
+
+        try:
+            load_data_with_extras(main, bench_col="코스피", bench_file=side)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("--bench-col 과 --bench-file 을 함께 주면 거부해야 합니다")
+
+
+def test_resolve_signal_return():
+    """"auto" takes the benchmark out whenever there is one; the other two are explicit."""
+    plain = pd.DataFrame({"excess_ret": [.01, .02]})
+    with_bench = pd.DataFrame({"excess_ret": [.01, .02], "rel_ret": [.003, -.001]})
+
+    assert resolve_signal_return(plain) == "excess_ret"
+    assert resolve_signal_return(with_bench) == "rel_ret"
+    assert resolve_signal_return(with_bench, "excess") == "excess_ret"
+    assert resolve_signal_return(with_bench, "relative") == "rel_ret"
+    for bad, data in (("relative", plain), ("resid", with_bench)):
+        try:
+            resolve_signal_return(data, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"signal_ret={bad!r} 은 거부해야 합니다")
+
+
+def test_resolve_backtest_basis():
+    """The two bases hand the strategy the two pairs of series they promise."""
+    own = np.array([0., .01, -.02, .03, 0., -.01, .02, 0.])
+    sector_close, bench_close = _sector_and_benchmark(own)
+    plain = pd.DataFrame({"close": sector_close, "ret": sector_close.pct_change(), "rf": .0001})
+    data = attach_benchmark(plain, bench_close, rel_method="diff")
+
+    ret, rf, name = resolve_backtest_basis(data, "asset")
+    assert np.allclose(ret, data.ret, equal_nan=True) and np.allclose(rf, data.rf)
+    assert name == "자산"
+    # the active position earns the relative return, and being out of it earns nothing extra
+    rel, rel_rf, rel_name = resolve_backtest_basis(data, "relative")
+    assert np.allclose(rel, data.rel_ret, equal_nan=True) and np.allclose(rel_rf, 0.)
+    assert rel_rf.index.equals(data.index) and rel_name == "상대"
+
+    # a benchmark-free run has no relative position to score, and says so rather than guess
+    try:
+        resolve_backtest_basis(plain, "relative")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("벤치마크 없이 backtest_ret='relative' 는 거부해야 합니다")
+    try:
+        resolve_backtest_basis(data, "active")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("알 수 없는 backtest_ret 은 거부해야 합니다")
+
+
+def test_the_relative_backtest_scores_the_active_position():
+    """On the relative basis every number is an over-the-benchmark number."""
+    own = np.array([0., .01, -.02, .03, 0., -.01, .02, 0.])
+    sector_close, bench_close = _sector_and_benchmark(own)
+    plain = pd.DataFrame({"close": sector_close, "ret": sector_close.pct_change(), "rf": .0001})
+    data = attach_benchmark(plain, bench_close, rel_method="ratio").iloc[1:]   # drop the NaN day
+    regimes = pd.Series([0, 0, 0, 1, 1, 0, 0], index=data.index, name="regime")
+
+    asset = run_0_1_strategy(regimes, *resolve_backtest_basis(data, "asset")[:2],
+                             delay=1, cost_bps=10.)
+    rel = run_0_1_strategy(regimes, *resolve_backtest_basis(data, "relative")[:2],
+                           delay=1, cost_bps=10.)
+
+    # same signal, same trades -- only what the position earns differs
+    assert np.allclose(asset.weight, rel.weight) and np.allclose(asset.traded, rel.traded)
+    assert np.allclose(asset.bh, data.ret) and np.allclose(rel.bh, data.rel_ret)
+    assert np.allclose(rel.rf, 0.)
+    assert np.allclose(rel.jm, rel.weight * data.rel_ret - rel.cost)
+    # and the sector's own return is no longer in it: a day the sector merely followed the
+    # market is a zero, however far the market itself moved
+    assert abs(float(rel.bh.iloc[3])) < 1e-12 and abs(float(data.ret.iloc[3])) > 1e-2
+
+    # out of the active position is flat against the benchmark, not in cash
+    all_bear = run_0_1_strategy(pd.Series(1, index=data.index),
+                                *resolve_backtest_basis(data, "relative")[:2],
+                                delay=1, cost_bps=10.)
+    assert np.allclose(all_bear.weight.iloc[2:], 0.) and np.allclose(all_bear.jm.iloc[3:], 0.)
+
+    # with no risk-free leg the Sharpe ratio of the table is an information ratio
+    table = performance_table(rel, label="JM 0/1 (상대)")
+    ir = float(rel.jm.mean() / rel.jm.std(ddof=1) * np.sqrt(252))
+    assert abs(table.loc["Sharpe", "JM 0/1 (상대)"] - ir) < 1e-9
+
+
+############################################
 ## 변수 유형별 가중치
 ############################################
 
@@ -919,6 +1153,89 @@ def test_last_refit_only_matches_the_tail_of_the_full_run():
         assert np.allclose(full.regimes.loc[common, col], last.regimes.loc[common, col]), col
     # only the last refit's parameters are reported
     assert list(last.params["refit_date"].unique()) == [refit_date]
+
+
+def _write_sample_sector_and_benchmark(folder, n=1400, seed=1):
+    """
+    A sector index and its benchmark, in the layout the pipeline reads.
+
+    The benchmark has a bull/bear cycle of its own and the sector adds a second, faster one
+    on top of it, so the two signals genuinely differ -- which is the point of subtracting
+    one from the other.
+    """
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2018-01-01", periods=n)
+    market_state = np.tile(np.repeat([0, 1], 120), n // 240 + 1)[:n]
+    market = rng.normal(np.where(market_state == 0, .0008, -.001),
+                        np.where(market_state == 0, .007, .02))
+    own_state = np.tile(np.repeat([0, 1], 70), n // 140 + 1)[:n]
+    own = rng.normal(np.where(own_state == 0, .0009, -.0012),
+                     np.where(own_state == 0, .005, .012))
+    sector = (1. + market) * (1. + own) - 1.
+
+    main = os.path.join(folder, "sector.csv")
+    side = os.path.join(folder, "benchmark.csv")
+    pd.DataFrame({"날짜": dates.date,
+                  "종가": (100. * np.cumprod(1. + sector)).round(4),
+                  "무위험금리": 3.}).to_csv(main, index=False)
+    pd.DataFrame({"날짜": dates.date,
+                  "종가": (2000. * np.cumprod(1. + market)).round(4)}).to_csv(side, index=False)
+    return main, side
+
+
+def test_the_model_is_fitted_on_the_benchmark_subtracted_return():
+    """With a benchmark, the features, the state ordering and the tables all follow `rel_ret`."""
+    with tempfile.TemporaryDirectory() as folder:
+        main, side = _write_sample_sector_and_benchmark(folder)
+        shared = dict(feature_set="paper", warmup=60, verbose=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")            # the first day has no benchmark return
+            data, X, _ = prepare_inputs(main, bench_file=side, **shared)
+            plain_data, plain_X, _ = prepare_inputs(main, **shared)
+
+        # the signal is the relative return, and the features are the ones it produces
+        assert np.allclose(data.signal_ret, data.rel_ret, equal_nan=True)
+        assert np.allclose(plain_data.signal_ret, plain_data.excess_ret)
+        expected = build_features(data.rel_ret, ver="paper", warmup=60)
+        assert list(X.columns) == list(expected.columns)
+        assert X.index.equals(expected.index) and np.allclose(X, expected)
+        # and they are not the ones the raw sector return produces
+        common = X.index.intersection(plain_X.index)
+        assert len(common) > 100 and not np.allclose(X.loc[common], plain_X.loc[common])
+
+        # forcing the excess return back reproduces the benchmark-free run exactly
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            forced_data, forced_X, _ = prepare_inputs(main, bench_file=side,
+                                                      signal_ret="excess", **shared)
+        assert np.allclose(forced_data.signal_ret, forced_data.excess_ret)
+        assert np.allclose(forced_X.loc[common], plain_X.loc[common])
+        # the benchmark columns still come along for the ride, and get written out
+        assert market_columns(forced_data) == ["close", "ret", "rf", "excess_ret",
+                                               "bench_close", "bench_ret", "rel_ret"]
+        assert market_columns(plain_data) == ["close", "ret", "rf", "excess_ret"]
+
+
+def test_run_inference_on_a_sector_against_its_benchmark():
+    """The whole inference run goes through with a benchmark, and reports the relative call."""
+    with tempfile.TemporaryDirectory() as folder:
+        main, side = _write_sample_sector_and_benchmark(folder)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = run_inference(main, outdir=folder, bench_file=side, feature_set="paper",
+                                jump_penalty=10., window=300, min_window=250, warmup=60,
+                                n_init=2, plot=False, verbose=False)
+
+        regimes = out["regimes"]
+        # the regimes are those of the relative return, and the table says what they were read on
+        assert np.allclose(out["data"].signal_ret, out["data"].rel_ret, equal_nan=True)
+        for col in ("bench_close", "bench_ret", "rel_ret"):
+            assert col in regimes.columns, col
+        # the strategy side is untouched: the weight still maps the regime of the asset itself
+        assert set(regimes.regime.unique()) <= {0, 1}
+        assert out["summary"]["regime_name"] in ("bull", "bear")
+        assert regimes["weight"].isin([0., 1.]).all()
+        assert np.allclose(regimes.close, out["data"].close.reindex(regimes.index))
 
 
 def _write_sample_input(folder, n=1400, seed=0):
