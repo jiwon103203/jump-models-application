@@ -13,6 +13,7 @@ Example
     python run_pipeline.py --input my_index.xlsx --hmm --extra-feature VIX:ewm:20
     python run_pipeline.py --input my_index.xlsx --feature-set extra --remove-series var
     python run_pipeline.py --input my_index.xlsx --inference
+    python run_pipeline.py --input sector.xlsx --relative-benchmark kospi.xlsx  # 코스피 차감 섹터 신호
 
 Run `python run_pipeline.py --help` for the full list of options.
 """
@@ -27,11 +28,13 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from backtest import (DEFAULT_COST_BPS, DEFAULT_MAX_CASH, DEFAULT_MIN_CASH, build_weights,
-                      delay_robustness_table, format_performance_table, performance_table,
-                      regime_summary, resolve_cash_limits, resolve_cost_bps, run_0_1_strategy)
-from data_io import (RF_UNITS, TRADING_DAYS, join_extra_table, load_extra_table,
-                     load_market_data, normalize_header)
+from backtest import (BACKTEST_RETURNS, DEFAULT_COST_BPS, DEFAULT_MAX_CASH, DEFAULT_MIN_CASH,
+                      build_weights, delay_robustness_table, format_performance_table,
+                      performance_table, regime_summary, resolve_backtest_basis,
+                      resolve_cash_limits, resolve_cost_bps, run_0_1_strategy)
+from data_io import (REL_METHODS, RF_UNITS, SIGNAL_RETURNS, TRADING_DAYS, attach_benchmark,
+                     join_extra_table, load_benchmark_series, load_extra_table,
+                     load_market_data, normalize_header, resolve_signal_return)
 from features import (FEATURE_SETS, build_extra_features, build_features,
                       feature_set_columns, parse_extra_spec, resolve_pinned_features)
 from regime_episodes import (ALIGN_CRITERIA, DEFAULT_HORIZON, DEFAULT_MAX_LAG,
@@ -85,6 +88,27 @@ def build_parser() -> argparse.ArgumentParser:
                             "저빈도 값은 직전 값으로 채웁니다. --extra-feature 없이 쓰면 모든 열을 그대로 사용")
     group.add_argument("--extra-sheet", default=None, help="커스텀 변수 파일의 엑셀 시트")
     group.add_argument("--extra-date-col", default=None, help="커스텀 변수 파일의 날짜 열 이름")
+
+    group = parser.add_argument_group("벤치마크 차감 (섹터 지수 분석)")
+    group.add_argument("--relative-benchmark", "--bench-file", dest="bench_file", default=None,
+                       metavar="FILE",
+                       help="벤치마크(코스피 등) 종가가 담긴 별도 csv/엑셀 파일. 날짜 열과 종가(close) 열을 "
+                            "자동 인식해 자산 수익률에서 이 지수의 수익률을 차감합니다")
+    group.add_argument("--relative-benchmark-col", "--bench-col", dest="bench_col", default=None,
+                       metavar="COL",
+                       help="벤치마크가 같은 입력 파일 안에 있을 때 그 종가 열 이름. 자동 인식하지 않으므로 "
+                            "직접 지정합니다. --relative-benchmark 와 택일")
+    group.add_argument("--bench-sheet", default=None, help="벤치마크 파일의 엑셀 시트")
+    group.add_argument("--bench-date-col", default=None, help="벤치마크 파일의 날짜 열 이름 (미지정 시 자동 인식)")
+    group.add_argument("--bench-close-col", default=None, help="벤치마크 파일의 종가 열 이름 (미지정 시 자동 인식)")
+    group.add_argument("--rel-method", default="diff", choices=REL_METHODS,
+                       help="차감 방식: diff(수익률 단순 차감) / log(로그수익률 차감) / ratio(상대지수 수익률)")
+    group.add_argument("--signal-ret", default="auto", choices=SIGNAL_RETURNS,
+                       help="피처를 만들 수익률: auto(벤치마크가 있으면 상대수익률, 없으면 초과수익률) / "
+                            "excess(초과수익률 고정) / relative(상대수익률 고정)")
+    group.add_argument("--backtest-ret", default="asset", choices=BACKTEST_RETURNS,
+                       help="백테스트가 매매하는 대상: asset(섹터 자체 — 국면이 좋으면 섹터, 나쁘면 현금) / "
+                            "relative(섹터 매수·벤치마크 매도 — 성과표가 벤치마크 대비 초과성과가 됩니다)")
 
     group = parser.add_argument_group("모델 & 재추정")
     group.add_argument("--model", default="jm", choices=MODELS,
@@ -206,6 +230,16 @@ def parse_episode_date(value):
         raise ValueError(f"--similar-target 의 날짜를 읽지 못했습니다: '{value}' ({exc})") from exc
 
 
+def market_columns(data: pd.DataFrame) -> list:
+    """
+    The columns of the market data to write next to the regimes: the price, the returns the
+    strategy is computed on, and -- when a benchmark was subtracted -- the benchmark level,
+    its return and the relative return the model actually saw.
+    """
+    return [col for col in ("close", "ret", "rf", "excess_ret",
+                            "bench_close", "bench_ret", "rel_ret") if col in data.columns]
+
+
 def parse_delays(delays) -> tuple:
     """Turn the `--delays` option into a tuple of non-negative integers."""
     if isinstance(delays, str):
@@ -226,6 +260,12 @@ def load_data_with_extras(input_path: str,
                           extra_file: str = None,
                           extra_sheet=None,
                           extra_date_col: str = None,
+                          bench_col: str = None,
+                          bench_file: str = None,
+                          bench_sheet=None,
+                          bench_date_col: str = None,
+                          bench_close_col: str = None,
+                          rel_method: str = "diff",
                           **load_kwargs) -> tuple:
     """
     Load the market data together with any custom variables, and build their features.
@@ -233,6 +273,10 @@ def load_data_with_extras(input_path: str,
     Custom variables may live in the main file, in a second file joined on the date, or in
     both. When a second file is given without any explicit specification, every one of its
     columns is used as a feature as is.
+
+    The benchmark whose return is to be subtracted follows the same two routes -- a column
+    of the main file (`bench_col`) or a file of its own (`bench_file`) -- and adds the
+    `bench_close`, `bench_ret` and `rel_ret` columns rather than a feature of its own.
 
     Parameters
     ----------
@@ -246,6 +290,15 @@ def load_data_with_extras(input_path: str,
     extra_file, extra_sheet, extra_date_col : optional
         The second file holding custom variables, its sheet and its date column.
 
+    bench_col : str, optional
+        The benchmark close column inside the main file.
+
+    bench_file, bench_sheet, bench_date_col, bench_close_col : optional
+        The separate benchmark file, its sheet, its date column and its close column.
+
+    rel_method : str, optional (default="diff")
+        How the benchmark return is taken out, see `data_io.relative_return`.
+
     **load_kwargs
         Passed through to `data_io.load_market_data`.
 
@@ -255,6 +308,9 @@ def load_data_with_extras(input_path: str,
         The market data including the raw custom variables, and the transformed custom
         features (None when no custom variable was requested).
     """
+    if bench_col is not None and bench_file is not None:
+        raise ValueError("--relative-benchmark 와 --relative-benchmark-col 은 함께 쓸 수 없습니다. "
+                         "벤치마크가 있는 쪽 하나만 지정해 주세요.")
     specs = list(extra_features or [])
     extra_table = None
     if extra_file is not None:
@@ -275,7 +331,12 @@ def load_data_with_extras(input_path: str,
 
     from_main = [col for col in dict.fromkeys(parse_extra_spec(spec)[0] for spec in specs)
                  if extra_table is None or col not in extra_table.columns]
-    data = load_market_data(input_path, extra_cols=from_main, **load_kwargs)
+    data = load_market_data(input_path, extra_cols=from_main, bench_col=bench_col,
+                            rel_method=rel_method, **load_kwargs)
+    if bench_file is not None:
+        bench_close = load_benchmark_series(bench_file, sheet=bench_sheet,
+                                            date_col=bench_date_col, close_col=bench_close_col)
+        data = attach_benchmark(data, bench_close, rel_method=rel_method)
     if extra_table is not None:
         data = join_extra_table(data, extra_table)
     extra_df = build_extra_features(data, specs) if specs else None
@@ -299,6 +360,13 @@ def prepare_inputs(input_path: str,
                    extra_file: str = None,
                    extra_sheet=None,
                    extra_date_col: str = None,
+                   bench_col: str = None,
+                   bench_file: str = None,
+                   bench_sheet=None,
+                   bench_date_col: str = None,
+                   bench_close_col: str = None,
+                   rel_method: str = "diff",
+                   signal_ret: str = "auto",
                    model: str = "jm",
                    pin_features=None,
                    cont: bool = True,
@@ -309,9 +377,18 @@ def prepare_inputs(input_path: str,
 
     `run_pipeline` and `run_inference` differ only in what they do with the features, so
     everything up to and including them is done here once: the file is read into daily
-    returns and excess returns, the custom variables are joined and transformed, the feature
-    set is built on the excess returns, and the pin specifications are expanded into the
-    columns they stand for.
+    returns and excess returns, the benchmark is joined and subtracted when there is one,
+    the custom variables are joined and transformed, the feature set is built on the return
+    series the model is to see, and the pin specifications are expanded into the columns
+    they stand for.
+
+    That series is the excess return of the article by default, and the benchmark-subtracted
+    (relative) return once a benchmark is given -- the sector-level use, where the point of
+    supplying a market index is to keep its regimes out of the sector's. Whichever it is, it
+    is left in `data` under `signal_ret`, so that everything built on top of the fit -- the
+    bull/bear ordering of the states, the episode metrics -- reads the same series the
+    features were built from. The strategy is unaffected: it trades the asset itself, on
+    `ret` and `rf`, whatever the signal was computed on.
 
     Parameters
     ----------
@@ -323,22 +400,36 @@ def prepare_inputs(input_path: str,
     Returns
     -------
     tuple
-        `data` (the market data), `X` (the feature matrix) and `pinned` (the resolved pinned
-        feature columns, empty unless the sparse model is in use).
+        `data` (the market data, with `signal_ret`), `X` (the feature matrix) and `pinned`
+        (the resolved pinned feature columns, empty unless the sparse model is in use).
     """
     data, extra_df = load_data_with_extras(
         input_path, extra_features=extra_features, extra_file=extra_file,
         extra_sheet=extra_sheet, extra_date_col=extra_date_col,
+        bench_col=bench_col, bench_file=bench_file, bench_sheet=bench_sheet,
+        bench_date_col=bench_date_col, bench_close_col=bench_close_col, rel_method=rel_method,
         sheet=sheet, date_col=date_col, close_col=close_col, rf_col=rf_col,
         rf_unit=rf_unit, trading_days=trading_days, start_date=start_date, end_date=end_date)
+    # the return series the features are built on, and with them the bull/bear ordering
+    signal_col = resolve_signal_return(data, signal_ret)
+    data["signal_ret"] = data[signal_col]
     if verbose:
         print(f"데이터: {len(data)}거래일, {data.index[0]} ~ {data.index[-1]}")
         print(f"연율 무위험금리 평균: {data.rf.mean() * trading_days:.2%}, "
               f"자산 연율 수익률 평균: {data.ret.mean() * trading_days:.2%}")
+        if "rel_ret" in data:
+            print(f"벤치마크 연율 수익률 평균: {data.bench_ret.mean() * trading_days:.2%}, "
+                  f"상대(차감 후) 연율 수익률 평균: {data.rel_ret.mean() * trading_days:.2%} "
+                  f"(차감 방식 {rel_method})")
+        label = ("상대수익률 rel_ret — 벤치마크 신호를 뺀 자산 고유 신호"
+                 if signal_col == "rel_ret" else "초과수익률 excess_ret — 무위험금리만 뺀 논문 기준")
+        print(f"신호 기준 수익률: {label}")
+        if signal_col == "rel_ret":
+            print("  · 레짐 0(bull) = 벤치마크 대비 초과 국면, 레짐 1(bear) = 열위 국면입니다.")
         if extra_df is not None:
             print(f"커스텀 변수: {list(extra_df.columns)}")
 
-    X = build_features(data.excess_ret, ver=feature_set, warmup=warmup, log_dd=log_dd,
+    X = build_features(data.signal_ret, ver=feature_set, warmup=warmup, log_dd=log_dd,
                        extra_features=extra_df, remove_series=remove_series)
     if verbose:
         if remove_series:
@@ -466,6 +557,13 @@ def run_inference(input_path: str,
                   extra_file: str = None,
                   extra_sheet=None,
                   extra_date_col: str = None,
+                  bench_col: str = None,
+                  bench_file: str = None,
+                  bench_sheet=None,
+                  bench_date_col: str = None,
+                  bench_close_col: str = None,
+                  rel_method: str = "diff",
+                  signal_ret: str = "auto",
                   model: str = "jm",
                   max_feats: float = None,
                   pin_features=None,
@@ -507,6 +605,11 @@ def run_inference(input_path: str,
     with the trading delay applied, i.e. the position the 0/1 strategy would be holding. It
     is a restatement of the signal, not a backtested result.
 
+    With a benchmark given (`bench_col` / `bench_file`), the regimes are those of the
+    benchmark-subtracted return, so the answer is "이 섹터가 지금 시장을 이기는 국면인가"
+    rather than "시장이 지금 어떤 국면인가"; the recommended weight then reads as an
+    overweight/underweight of the sector, not as a risk-on/risk-off call on the market.
+
     Parameters
     ----------
     input_path : str
@@ -533,17 +636,20 @@ def run_inference(input_path: str,
         rf_unit=rf_unit, trading_days=trading_days, start_date=start_date, end_date=end_date,
         feature_set=feature_set, log_dd=log_dd, remove_series=remove_series, warmup=warmup,
         extra_features=extra_features, extra_file=extra_file, extra_sheet=extra_sheet,
-        extra_date_col=extra_date_col, model=model, pin_features=pin_features,
+        extra_date_col=extra_date_col, bench_col=bench_col, bench_file=bench_file,
+        bench_sheet=bench_sheet, bench_date_col=bench_date_col,
+        bench_close_col=bench_close_col, rel_method=rel_method, signal_ret=signal_ret,
+        model=model, pin_features=pin_features,
         cont=cont, grid_size=grid_size, verbose=verbose)
 
     # one fit, on the window preceding the current half-year, then that half-year online
-    result = run_rolling_jm(X, data.excess_ret, jump_penalty=jump_penalty, window=window,
+    result = run_rolling_jm(X, data.signal_ret, jump_penalty=jump_penalty, window=window,
                             min_window=min_window, last_refit_only=True,
                             n_components=n_components, clip_mul=clip_mul, n_init=n_init,
                             random_state=random_state, model=model, max_feats=max_feats,
                             pin_feats=pinned, cont=cont, grid_size=grid_size, verbose=verbose)
 
-    regimes = result.regimes.join(data[["close", "ret", "rf", "excess_ret"]])
+    regimes = result.regimes.join(data[market_columns(data)])
     regimes["weight"] = build_weights(result.regimes.regime, delay=delay, bull_state=0,
                                       min_cash=min_cash, max_cash=max_cash)
 
@@ -644,6 +750,14 @@ def run_pipeline(input_path: str,
                  extra_file: str = None,
                  extra_sheet=None,
                  extra_date_col: str = None,
+                 bench_col: str = None,
+                 bench_file: str = None,
+                 bench_sheet=None,
+                 bench_date_col: str = None,
+                 bench_close_col: str = None,
+                 rel_method: str = "diff",
+                 signal_ret: str = "auto",
+                 backtest_ret: str = "asset",
                  model: str = "jm",
                  max_feats: float = None,
                  pin_features=None,
@@ -693,7 +807,11 @@ def run_pipeline(input_path: str,
     """
     Run the whole pipeline and write the results to `outdir`.
 
-    The steps are: load and clean the price file, convert prices into excess returns,
+    The steps are: load and clean the price file, convert prices into excess returns -- or,
+    with a benchmark given, into returns with the benchmark's taken out (`bench_col` /
+    `bench_file`, the sector-level use: the regimes are then the sector's own rather than
+    the market's, and `backtest_ret` decides whether the strategy is scored on the sector
+    itself or on the sector against that benchmark) --
     engineer the EWM downside deviation and Sortino features (plus any custom variable),
     re-estimate the jump model every six months over a rolling window while inferring the
     regimes online in between, optionally run the rolling HMM benchmark, and backtest the
@@ -744,28 +862,48 @@ def run_pipeline(input_path: str,
         rf_unit=rf_unit, trading_days=trading_days, start_date=start_date, end_date=end_date,
         feature_set=feature_set, log_dd=log_dd, remove_series=remove_series, warmup=warmup,
         extra_features=extra_features, extra_file=extra_file, extra_sheet=extra_sheet,
-        extra_date_col=extra_date_col, model=model, pin_features=pin_features,
+        extra_date_col=extra_date_col, bench_col=bench_col, bench_file=bench_file,
+        bench_sheet=bench_sheet, bench_date_col=bench_date_col,
+        bench_close_col=bench_close_col, rel_method=rel_method, signal_ret=signal_ret,
+        model=model, pin_features=pin_features,
         cont=cont, grid_size=grid_size, verbose=verbose)
+    signal_col = resolve_signal_return(data, signal_ret)
+    # resolved before the refits, not after: a basis the data cannot support is a typo, and a
+    # typo should not cost the whole rolling fit before it is reported
+    bt_ret, bt_rf, basis_name = resolve_backtest_basis(data, backtest_ret)
 
     # 3) semiannual refits on a rolling window + online inference in between
-    result = run_rolling_jm(X, data.excess_ret, jump_penalty=jump_penalty, window=window,
+    result = run_rolling_jm(X, data.signal_ret, jump_penalty=jump_penalty, window=window,
                             min_window=min_window, n_components=n_components, clip_mul=clip_mul,
                             n_init=n_init, random_state=random_state, start_date=refit_start,
                             model=model, max_feats=max_feats, pin_feats=pinned,
                             cont=cont, grid_size=grid_size, verbose=verbose)
 
-    # 4) 0/1 strategy backtest on the online inferred signal
-    strategy = run_0_1_strategy(result.regimes.regime, data.ret, data.rf,
+    # 4) 0/1 strategy backtest on the online inferred signal, on whichever position the run
+    #    is scoring: the asset itself, or the asset against the benchmark that was subtracted
+    strategy = run_0_1_strategy(result.regimes.regime, bt_ret, bt_rf,
                                 delay=delay, bull_state=0, **cost_kwargs)
     summary = regime_summary(result.regimes.regime, bear_state=n_components - 1)
+    if verbose:
+        if backtest_ret == "relative":
+            print("백테스트 기준: 상대수익률 — 국면이 좋으면 자산 매수·벤치마크 매도, 나쁘면 벤치마크 대비 중립.")
+            print("  · 성과표의 모든 숫자는 벤치마크 대비 초과성과이고, Sharpe 는 정보비율(IR)로 읽습니다.")
+        elif signal_col == "rel_ret":
+            print("백테스트 기준: 자산 자체 — 국면이 좋으면 자산, 나쁘면 현금. 국면만 벤치마크를 차감해 잡고 "
+                  "성과는 자산의 절대수익률로 계산합니다.")
+            print("  · 벤치마크 대비 초과성과로 보려면 --backtest-ret relative 를 쓰세요.")
 
     # 5) optional HMM benchmark over the same period
     hmm_result = hmm_strategy = hmm_summary = None
-    model_label = f"{result.model.upper()} 0/1"
+    model_label = (f"{result.model.upper()} 0/1" if backtest_ret == "asset"
+                   else f"{result.model.upper()} 0/1 ({basis_name})")
     performance = performance_table(strategy, trading_days=trading_days, label=model_label)
     if hmm:
         from hmm_benchmark import run_rolling_hmm
-        hmm_result = run_rolling_hmm(data.ret, window=hmm_window or window, min_window=min_window,
+        # the benchmark model has to see the same series the jump model was fitted on, or the
+        # two are not answering the same question
+        hmm_input = data.rel_ret if signal_col == "rel_ret" else data.ret
+        hmm_result = run_rolling_hmm(hmm_input, window=hmm_window or window, min_window=min_window,
                                      refit_every=hmm_refit_every, smooth_k=hmm_smooth_k,
                                      n_components=n_components, n_init=hmm_n_init,
                                      covariance_type=hmm_covariance_type,
@@ -774,14 +912,14 @@ def run_pipeline(input_path: str,
         hmm_summary = regime_summary(hmm_result.regimes.regime, bear_state=n_components - 1)
         # compare both models over the period they share
         common = result.regimes.index.intersection(hmm_result.regimes.index)
-        hmm_strategy = run_0_1_strategy(hmm_result.regimes.regime.reindex(common), data.ret,
-                                        data.rf, delay=delay, bull_state=0, **cost_kwargs)
+        hmm_strategy = run_0_1_strategy(hmm_result.regimes.regime.reindex(common), bt_ret,
+                                        bt_rf, delay=delay, bull_state=0, **cost_kwargs)
         jm_aligned = strategy
         if len(common) < len(strategy):
             warnings.warn(
                 f"{result.model.upper()}({strategy.index[0]}~)과 HMM({hmm_result.regimes.index[0]}~)의 추론 구간이 달라 "
                 f"공통 구간 {common[0]} ~ {common[-1]}에서 성과를 비교합니다.")
-            jm_aligned = run_0_1_strategy(result.regimes.regime.reindex(common), data.ret, data.rf,
+            jm_aligned = run_0_1_strategy(result.regimes.regime.reindex(common), bt_ret, bt_rf,
                                           delay=delay, bull_state=0, **cost_kwargs)
         performance = performance_table(jm_aligned, trading_days=trading_days, label=model_label,
                                         others={"HMM 0/1": hmm_strategy})
@@ -792,7 +930,7 @@ def run_pipeline(input_path: str,
         regime_dict = {result.model.upper(): result.regimes.regime}
         if hmm_result is not None:
             regime_dict["HMM"] = hmm_result.regimes.regime
-        robustness_table = delay_robustness_table(regime_dict, data.ret, data.rf,
+        robustness_table = delay_robustness_table(regime_dict, bt_ret, bt_rf,
                                                   delays=delay_list, trading_days=trading_days,
                                                   **cost_kwargs)
 
@@ -814,7 +952,7 @@ def run_pipeline(input_path: str,
 
     # 8) write everything out
     written = []
-    regimes_out = result.regimes.join(data[["close", "ret", "rf", "excess_ret"]])
+    regimes_out = result.regimes.join(data[market_columns(data)])
     regimes_out = regimes_out.join(strategy[["weight", "jm"]].rename(columns={"jm": "strategy_ret"}))
     outputs = [("regimes.csv", regimes_out),
                ("refit_params.csv", result.params.set_index("refit_date")),
@@ -971,6 +1109,9 @@ def main(argv=None) -> int:
     if args.inference:
         if args.hmm:
             warnings.warn("--hmm 은 백테스트 벤치마크라 --inference 모드에서는 무시합니다.")
+        if args.backtest_ret != "asset":
+            warnings.warn("--backtest-ret 은 백테스트 옵션이라 --inference 모드에서는 무시합니다. "
+                          "국면 자체는 --signal-ret 이 정합니다.")
         run_inference(input_path=args.input, outdir=args.outdir, sheet=args.sheet,
                       date_col=args.date_col, close_col=args.close_col, rf_col=args.rf_col,
                       rf_unit=args.rf_unit, trading_days=args.trading_days,
@@ -979,6 +1120,10 @@ def main(argv=None) -> int:
                       remove_series=args.remove_series, warmup=args.warmup,
                       extra_features=args.extra_feature, extra_file=args.extra_file,
                       extra_sheet=args.extra_sheet, extra_date_col=args.extra_date_col,
+                      bench_col=args.bench_col, bench_file=args.bench_file,
+                      bench_sheet=args.bench_sheet, bench_date_col=args.bench_date_col,
+                      bench_close_col=args.bench_close_col, rel_method=args.rel_method,
+                      signal_ret=args.signal_ret,
                       model=args.model, max_feats=args.max_feats,
                       pin_features=args.pin_feature, jump_penalty=args.jump_penalty,
                       window=args.window, min_window=args.min_window,
@@ -998,6 +1143,10 @@ def main(argv=None) -> int:
                  remove_series=args.remove_series, warmup=args.warmup,
                  extra_features=args.extra_feature, extra_file=args.extra_file,
                  extra_sheet=args.extra_sheet, extra_date_col=args.extra_date_col,
+                 bench_col=args.bench_col, bench_file=args.bench_file,
+                 bench_sheet=args.bench_sheet, bench_date_col=args.bench_date_col,
+                 bench_close_col=args.bench_close_col, rel_method=args.rel_method,
+                 signal_ret=args.signal_ret, backtest_ret=args.backtest_ret,
                  model=args.model, max_feats=args.max_feats, pin_features=args.pin_feature,
                  jump_penalty=args.jump_penalty, window=args.window, min_window=args.min_window,
                  n_components=args.n_components, clip_mul=args.clip_mul, n_init=args.n_init,
