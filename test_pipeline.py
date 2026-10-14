@@ -24,8 +24,9 @@ from data_io import (attach_benchmark, load_benchmark_series, load_market_data,
                      relative_return, resolve_signal_return)
 from features import (EXAMPLE_HLS, EXTRA_DD_HLS, EXTRA_WINDOWS, FEATURE_SETS, apply_transform,
                       build_extra_features, build_features, compute_ewm_DD, feature_engineer,
-                      feature_series, feature_series_name, feature_set_columns, parse_extra_spec,
-                      resolve_pinned_features, resolve_removed_features)
+                      feature_horizons, feature_series, feature_series_name, feature_set_columns,
+                      normalize_horizon, parse_extra_spec, resolve_pinned_features,
+                      resolve_removed_features, resolve_removed_horizons)
 from hmm_benchmark import smooth_states
 from regime_episodes import (align_paths, compare_episode_paths, episode_metrics,
                              extract_episodes, length_scenarios, normalized_path,
@@ -33,7 +34,7 @@ from regime_episodes import (align_paths, compare_episode_paths, episode_metrics
 from rolling import (DEFAULT_GRID_SIZE, init_model, refit_schedule, resolve_grid_size,
                      resolve_max_feats, run_rolling_jm, semiannual_anchors, state_losses)
 from feature_search import (build_groups, deflated_sharpe, grid_candidates,
-                            period_metrics, split_periods, walk_forward)
+                            period_metrics, split_periods, stepwise_candidates, walk_forward)
 from run_pipeline import (load_data_with_extras, market_columns, prepare_inputs,
                           run_feature_search, run_inference)
 from sparse_pin import PinnedSparseJumpModel, solve_lasso_pinned
@@ -189,6 +190,49 @@ def test_remove_series():
         raise AssertionError("피처를 모두 제거하면 ValueError를 내야 합니다.")
     except ValueError:
         pass
+
+
+def test_remove_horizon():
+    """A horizon takes out every statistic measured over it, and nothing without a horizon."""
+    assert feature_horizons("std_20") == ["20"]
+    assert feature_horizons("vol-ratio_5-20") == ["5", "20"]
+    assert feature_horizons("ret-cumlog") == [] and feature_horizons("VIX_ewm20") == []
+    assert normalize_horizon(5) == normalize_horizon("5d") == normalize_horizon(" 5일") == "5"
+
+    ret = pd.Series(np.random.default_rng(3).normal(0., .01, 600),
+                    index=pd.bdate_range("2020-01-01", periods=600).date)
+    extra = pd.DataFrame({"VIX_ewm20": np.linspace(10., 20., 600)}, index=ret.index)
+    full = build_features(ret, ver="extra", warmup=100, extra_features=extra)
+    cut = build_features(ret, ver="extra", warmup=100, extra_features=extra, remove_horizons=["5"])
+    dropped = [col for col in full.columns if col not in cut.columns]
+    assert dropped == resolve_removed_horizons(full.columns, ["5"])
+    # every 5-day statistic, and the ratio that needs the 5-day volatility
+    for col in ("ret_5", "sortino_5", "std_5", "var_5", "mad_5", "rms_5", "vol-log_5",
+                "vol-chg_5", "DD_5", "vol-ratio_5-20"):
+        assert col in dropped, col
+    assert "vol-ratio_20-60" in cut.columns and "ret-cumlog" in cut.columns
+    assert "VIX_ewm20" in cut.columns
+    # the column list without computing anything agrees with the matrix
+    assert feature_set_columns("extra", remove_horizons=["5"]) == [
+        col for col in cut.columns if col != "VIX_ewm20"]
+    # series and horizon removals combine
+    both = build_features(ret, ver="extra", warmup=100, remove_series=["var"], remove_horizons=["5", "60"])
+    assert not [col for col in both.columns if col.startswith("var_")]
+    assert not [col for col in both.columns if set(feature_horizons(col)) & {"5", "60"}]
+    # a horizon the set does not use is a typo
+    try:
+        build_features(ret, ver="example", warmup=100, remove_horizons=["10"])
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("the example set has no 10-day column")
+    # and a pinned feature cannot be removed through its horizon
+    try:
+        resolve_pinned_features(cut.columns, ["sortino_5"], ver="extra", remove_horizons=["5"])
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("sortino_5 was removed with the 5-day horizon")
 
 
 def test_remove_custom_variable():
@@ -1304,8 +1348,8 @@ def test_search_groups_cover_every_option_once():
     assert len(grid_candidates(by_name["paper"])) == 3
     assert by_name["example"].pool == ["ret", "DD-log", "sortino"]
     assert len(grid_candidates(by_name["example"])) == 7
-    # the 15 series of "extra" would be 2^15 runs, so it falls back to the greedy elimination
-    assert len(by_name["extra"].pool) == 15 and by_name["extra"].mode == "greedy"
+    # the 15 series of "extra" would be 2^15 runs, so it falls back to forward selection
+    assert len(by_name["extra"].pool) == 15 and by_name["extra"].mode == "forward"
     assert [c.removed for c in grid_candidates(by_name["extra"])] == [()]
     # every candidate's matrix keeps at least one column
     for group in groups:
@@ -1337,6 +1381,89 @@ def test_search_respects_removals_and_pins():
     # the plain model ignores pins, so nothing is protected there
     plain = build_groups(["paper"], log_dd_mode="off", pin_features=["sortino_60"], model="jm")[0]
     assert "sortino" in plain.pool
+
+
+def test_search_by_horizon():
+    """The horizon unit removes whole horizons; "both" mixes them with series."""
+    by_horizon = build_groups(["paper", "example", "extra"], log_dd_mode="off", unit="horizon",
+                              custom_columns=["VIX_ewm20"])
+    pools = {group.name: group.pool for group in by_horizon}
+    assert pools == {"paper": ["@10", "@20", "@60"], "example": ["@5", "@20", "@60"],
+                     "extra": ["@5", "@10", "@20", "@60"]}
+    extra = by_horizon[2]
+    assert extra.mode == "exhaustive" and len(grid_candidates(extra)) == 2 ** 4
+    # with the custom variable left over, even removing every horizon leaves a matrix
+    assert extra.remaining(extra.pool) == ["ret-simple", "ret-log", "ret-abs", "ret-sq",
+                                           "ret-cumlog", "VIX_ewm20"]
+    candidate = extra.candidate(("@60", "@5"))
+    assert candidate.horizons == ("5", "60") and candidate.removed == ()
+    assert candidate.label == "extra -5d -60d"
+    assert candidate.cli == "--feature-set extra --remove-horizon 5 --remove-horizon 60"
+    # without a custom variable, removing every horizon of "paper" would empty it
+    paper = build_groups(["paper"], log_dd_mode="off", unit="horizon")[0]
+    assert len(grid_candidates(paper)) == 7
+
+    both = build_groups(["example"], log_dd_mode="off", unit="both")[0]
+    assert both.pool == ["ret", "DD-log", "sortino", "@5", "@20", "@60"]
+    # a horizon a removed series already emptied is dropped, so the candidate is the series alone
+    paper = build_groups(["paper"], log_dd_mode="off", unit="both")[0]
+    assert paper.candidate(("DD", "@10")) == paper.candidate(("DD",))
+    assert len({c.label for c in grid_candidates(paper)}) < len(grid_candidates(paper))
+    mixed = both.candidate(("@5", "sortino"))
+    assert mixed.label == "example -sortino -5d"
+    assert both.remaining(mixed.items) == ["ret_20", "DD-log_20", "ret_60", "DD-log_60"]
+
+    # a pinned column keeps its horizon in the matrix, and the user's horizons stay removed
+    pinned = build_groups(["extra"], log_dd_mode="off", unit="horizon", model="sjm",
+                          pin_features=["sortino_60"], remove_horizons=["10"])[0]
+    assert pinned.pool == ["@5", "@20"] and pinned.fixed_horizons == ("10",)
+    assert pinned.candidate(("@5",)).cli == ("--feature-set extra --remove-horizon 10 "
+                                              "--remove-horizon 5")
+
+
+def test_forward_selection_grows_the_matrix_one_item_at_a_time():
+    """Forward selection starts from nothing and adds one series per step; backward removes one."""
+    group = build_groups(["extra"], log_dd_mode="off", custom_columns=["VIX_ewm20"])[0]
+    assert group.mode == "forward" and len(group.pool) == 16
+    # it starts with every series removed, i.e. from an empty matrix...
+    group.current = group.forward_start
+    assert group.remaining(group.current) == []
+    # ...so the first step is every series on its own, labelled by what it adds
+    first = stepwise_candidates(group)
+    assert len(first) == 16
+    assert {c.label for c in first} == {f"extra +{name}" for name in group.pool}
+    alone = [c for c in first if c.label == "extra +DD"][0]
+    assert group.remaining(alone.items) == ["DD_5", "DD_10", "DD_20", "DD_60"]
+    # the label is display only: the configuration is still the removal list it reproduces through
+    assert alone == group.candidate(alone.items)
+    assert alone.cli.count("--remove-series") == 15 and "--remove-series DD" not in alone.cli
+    # once DD is in, the next step adds each of the other 15 to it
+    group.current = alone.items
+    second = stepwise_candidates(group)
+    assert len(second) == 15 and all(c.label.startswith("extra +") for c in second)
+    assert "extra +std +DD" in {c.label for c in second}
+
+    # backward elimination (still accepted as "greedy") removes one series from the full set
+    backward = build_groups(["extra"], log_dd_mode="off", removal="greedy")[0]
+    assert backward.mode == "backward" and backward.current == ()
+    assert len(stepwise_candidates(backward)) == 15
+
+    # by horizon, forward selection starts from the columns that have no horizon
+    by_horizon = build_groups(["extra"], log_dd_mode="off", unit="horizon", removal="forward")[0]
+    by_horizon.current = by_horizon.forward_start
+    assert by_horizon.remaining(by_horizon.current) == ["ret-simple", "ret-log", "ret-abs",
+                                                        "ret-sq", "ret-cumlog"]
+    assert {c.label for c in stepwise_candidates(by_horizon)} == {
+        "extra +5d", "extra +10d", "extra +20d", "extra +60d"}
+
+    # with both units it adds series, and once something is in, may also drop a horizon
+    both = build_groups(["example"], log_dd_mode="off", unit="both", removal="forward")[0]
+    both.current = both.forward_start
+    assert {c.label for c in stepwise_candidates(both)} == {"example +ret", "example +DD-log",
+                                                            "example +sortino"}
+    both.current = both.candidate(("DD-log", "sortino")).items          # ret is in
+    labels = {c.label for c in stepwise_candidates(both)}
+    assert {"example +ret +DD-log", "example +ret +sortino", "example +ret -5d"} <= labels
 
 
 def test_split_periods():
@@ -1447,6 +1574,48 @@ def test_run_feature_search_end_to_end():
         names = sorted(os.path.basename(path) for path in out["written"])
         assert names == ["search_results.csv", "search_returns.csv", "search_summary.csv",
                          "search_walkforward.csv"]
+
+
+def test_run_feature_search_forward():
+    """A forward search on "extra" runs end to end, and every step it takes raises the IS Sharpe."""
+    with tempfile.TemporaryDirectory() as folder:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = run_feature_search(_write_sample_input(folder), outdir=folder,
+                                     feature_set="paper", warmup=60, jump_penalty=10.,
+                                     window=300, min_window=250, n_init=2, cont=False,
+                                     search_sets="extra", search_log_dd="off", search_jobs=1,
+                                     search_max_runs=40, plot=False, verbose=False)
+        group = out["groups"][0]
+        assert group.mode == "forward" and group.steps
+        # the first step picks one series out of an empty start; each later one must improve
+        assert group.steps[0]["from"] == -np.inf and group.steps[0]["move"].startswith("+")
+        for previous, step in zip(group.steps, group.steps[1:]):
+            assert step["to"] > previous["to"]
+        labels = set(out["results"]["label"])
+        # every single series was tried on its own, and the full set is there for reference
+        assert sum(label.count("+") == 1 for label in labels) >= 15
+        assert "extra" in labels and "paper" in labels
+
+
+def test_run_feature_search_by_horizon():
+    """A horizon search runs end to end and its recommendation reproduces through the options."""
+    with tempfile.TemporaryDirectory() as folder:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = run_feature_search(_write_sample_input(folder), outdir=folder,
+                                     feature_set="paper", warmup=60, jump_penalty=10.,
+                                     window=300, min_window=250, n_init=2,
+                                     search_sets="paper", search_log_dd="off",
+                                     search_unit="horizon", search_jobs=1, plot=False,
+                                     verbose=False)
+        results = out["results"]
+        # the 7 non-empty horizon subsets of paper's 10/20/60 days
+        assert len(results) == 7
+        assert set(results["removed_horizons"]) == {"", "10", "20", "60", "10 20", "10 60", "20 60"}
+        row = results.loc[results["removed_horizons"] == "10 60"].iloc[0]
+        assert row["features"] == "sortino_20"
+        assert row["cli"] == "--feature-set paper --remove-horizon 10 --remove-horizon 60"
 
 
 def main() -> int:

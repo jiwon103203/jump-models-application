@@ -12,8 +12,8 @@ Two things keep that ranking honest.
 1. **The choice is made on one stretch of history and judged on another.** The backtest
    period is split into a selection (in-sample, IS) part and a hold-out (out-of-sample,
    OOS) part that follows it. Every combination is ranked by its Sharpe ratio over the IS
-   part only, and the greedy elimination of feature series also looks at IS Sharpe ratios
-   only, so the OOS part takes no part in any decision. The regimes themselves are online
+   part only, and the stepwise searches (forward selection, backward elimination) also look
+   at IS Sharpe ratios only, so the OOS part takes no part in any decision. The regimes themselves are online
    in both parts -- each re-estimation sees only the days before it -- so the OOS Sharpe of
    the chosen combination is a genuine out-of-sample number for the *choice* as well as for
    the model parameters.
@@ -29,13 +29,21 @@ The candidates are generated per (feature set, log-DD) group:
 
 - ``exhaustive``: every subset of the removable series is removed in turn (as long as one
   column is left), which is exact but grows as `2^k`;
-- ``greedy``: backward elimination -- remove the series whose removal raises the IS Sharpe
-  ratio the most, and repeat until no removal helps;
+- ``forward``: forward selection -- start from nothing, add the series that gives the best
+  IS Sharpe ratio on its own, then the one that raises it the most alongside it, and repeat
+  until no addition helps; the matrix grows from the few series that carry the signal;
+- ``backward`` (also accepted as ``greedy``): backward elimination -- start from the full
+  set, remove the series whose removal raises the IS Sharpe ratio the most, and repeat until
+  no removal helps;
 - ``single``: the full set and every single-series removal;
 - ``none``: the full set only, which compares feature sets and scales but removes nothing;
 - ``auto`` (default): ``exhaustive`` where it costs at most `max_subsets` runs (the
-  "paper" and "example" sets) and ``greedy`` elsewhere (the 35-column "extra" set, whose
+  "paper" and "example" sets) and ``forward`` elsewhere (the 35-column "extra" set, whose
   15 series would make `2^15` runs).
+
+The same modes apply to horizons (``unit="horizon"``: forward selection then adds 5, 10, 20
+or 60 days back one at a time) and to both together (``unit="both"``: forward selection adds
+series and may drop a horizon on the way).
 
 Series holding a pinned feature (``--pin-feature``, sparse model only) are never removed,
 and series the user removed (``--remove-series``) stay removed in every candidate.
@@ -54,12 +62,18 @@ import pandas as pd
 from scipy.stats import norm
 
 from backtest import performance_metrics, regime_summary, resolve_cost_bps, run_0_1_strategy
-from features import (FEATURE_SETS, build_features, feature_series, feature_series_name,
-                      feature_set_columns, resolve_pinned_features, resolve_removed_features)
+from features import (FEATURE_SETS, build_features, feature_horizon_set, feature_horizons,
+                      feature_series, feature_series_name, feature_set_columns,
+                      normalize_horizon, resolve_pinned_features, resolve_removed_features,
+                      resolve_removed_horizons)
 from rolling import refit_schedule, run_rolling_jm
 
 TRADING_DAYS = 252
-REMOVAL_MODES = ("auto", "exhaustive", "greedy", "single", "none")
+REMOVAL_MODES = ("auto", "exhaustive", "forward", "backward", "single", "none")
+STEPWISE_MODES = ("forward", "backward")       # the modes that walk one item at a time
+MODE_ALIASES = {"greedy": "backward"}          # the name backward elimination first shipped under
+REMOVAL_UNITS = ("series", "horizon", "both")   # what one removal step takes out of the matrix
+HORIZON_MARK = "@"             # marks a horizon in a removal pool: "@5" is every 5-day column
 LOG_DD_MODES = ("both", "off", "on")
 DEFAULT_OOS_FRAC = .3          # share of the backtest period held out for the OOS test
 DEFAULT_WF_FOLDS = 3           # walk-forward re-selection blocks within the OOS part
@@ -77,7 +91,7 @@ EULER_GAMMA = 0.5772156649015329
 class Candidate:
     """
     One feature configuration: a feature set, the scale of its downside deviation, and the
-    series removed from it.
+    series and horizons removed from it.
 
     Attributes
     ----------
@@ -93,53 +107,85 @@ class Candidate:
     fixed : tuple of str
         The removal specifications the user gave (``--remove-series``) that apply to this
         feature set; they are removed in every candidate of the group.
+
+    horizons : tuple of str
+        The horizons the search removed (``"5"`` for every 5-day column), in pool order.
+
+    fixed_horizons : tuple of str
+        The horizons the user removed (``--remove-horizon``) that apply to this feature set.
+
+    shown : str or None
+        Forward selection only, and for display only: the label suffix listing what the
+        selection added back (``+std +DD``). A forward candidate removes most of its set, so
+        its label names what it kept rather than the dozen series it removed. It does not take
+        part in equality: two candidates removing the same things are the same configuration.
     """
     feature_set: str
     log_dd: bool = False
     removed: tuple = ()
     fixed: tuple = ()
+    horizons: tuple = ()
+    fixed_horizons: tuple = ()
+    shown: str = field(default=None, compare=False)
 
     @property
     def remove_series(self) -> list:
-        """Everything removed from the matrix: the user's specifications and the search's."""
+        """Every series removed from the matrix: the user's specifications and the search's."""
         return list(self.fixed) + list(self.removed)
 
     @property
+    def remove_horizons(self) -> list:
+        """Every horizon removed from the matrix: the user's and the search's."""
+        return list(self.fixed_horizons) + list(self.horizons)
+
+    @property
+    def items(self) -> tuple:
+        """What the search removed, as pool items: series names, then ``@``-marked horizons."""
+        return self.removed + tuple(HORIZON_MARK + h for h in self.horizons)
+
+    @property
     def label(self) -> str:
-        """A short name, e.g. ``extra log-dd -var -ret-cumlog``."""
+        """
+        A short name: what was removed (``extra log-dd -var -ret-cumlog -5d``), or for a
+        forward candidate what was added back, plus any horizon it removed (``extra +std -5d``).
+        """
         parts = [self.feature_set] + (["log-dd"] if self.log_dd else [])
-        return " ".join(parts + [f"-{name}" for name in self.removed])
+        if self.shown is not None:
+            return " ".join(parts + [self.shown])
+        return " ".join(parts + [f"-{name}" for name in self.removed]
+                        + [f"-{h}d" for h in self.horizons])
 
     @property
     def cli(self) -> str:
         """The command line options that reproduce the configuration in `run_pipeline.py`."""
         parts = [f"--feature-set {self.feature_set}"] + (["--log-dd"] if self.log_dd else [])
-        return " ".join(parts + [f"--remove-series {name}" for name in self.remove_series])
+        return " ".join(parts + [f"--remove-series {name}" for name in self.remove_series]
+                        + [f"--remove-horizon {h}" for h in self.remove_horizons])
 
 
 @dataclass
 class SearchGroup:
     """
     The candidates sharing a feature set and a downside deviation scale, and the state of
-    the search over the series that may be removed from them.
+    the search over the series and horizons that may be removed from them.
 
     Attributes
     ----------
-    feature_set, log_dd, fixed
+    feature_set, log_dd, fixed, fixed_horizons
         See `Candidate`.
 
     columns : list of str
         The columns of the group's full matrix, the user's removals already applied.
 
     pool : list of str
-        The series the search may remove: every series of `columns` except those holding a
-        pinned feature.
+        What the search may remove: series names (``"var"``) and ``@``-marked horizons
+        (``"@5"``), depending on the removal unit, except those holding a pinned feature.
 
     mode : str
         The removal search actually run for the group, one of `REMOVAL_MODES` but "auto".
 
     current : tuple of str
-        Greedy search only: the series removed so far.
+        Greedy search only: the pool items removed so far.
 
     current_score : float
         Greedy search only: the IS Sharpe ratio of `current`.
@@ -156,20 +202,53 @@ class SearchGroup:
     columns: list
     pool: list
     mode: str
+    fixed_horizons: tuple = ()
     current: tuple = ()
     current_score: float = np.nan
     done: bool = False
     steps: list = field(default_factory=list)
 
-    def candidate(self, removed=()) -> Candidate:
-        """The candidate removing `removed` on top of the user's removals, in pool order."""
-        removed = tuple(name for name in self.pool if name in set(removed))
-        return Candidate(self.feature_set, self.log_dd, removed, self.fixed)
+    def candidate(self, removed=(), forward: bool = False) -> Candidate:
+        """
+        The candidate removing the pool items `removed` on top of the user's removals.
+
+        With `forward`, its label lists what a forward selection added back to its starting
+        point (`forward_start`) -- ``+std +DD`` -- and any horizon it removed on the way.
+        """
+        removed = set(removed)
+        items = [item for item in self.pool if item in removed]
+        series = tuple(item for item in items if not item.startswith(HORIZON_MARK))
+        # series go first, so a horizon whose every column a removed series already took
+        # ("paper -DD" and the 10 days of DD_10) adds nothing -- and would name no column
+        left = {h for col in self.remaining(series) for h in feature_horizons(col)}
+        horizons = tuple(item[len(HORIZON_MARK):] for item in items
+                         if item.startswith(HORIZON_MARK) and item[len(HORIZON_MARK):] in left)
+        shown = None
+        if forward:
+            start = set(self.forward_start)
+            kept = set(series) | {HORIZON_MARK + h for h in horizons}
+            added = [f"+{item_label(item)}" for item in self.pool if item in start and item not in removed]
+            dropped = [f"-{item_label(item)}" for item in self.pool if item not in start and item in kept]
+            shown = " ".join(added + dropped) or "+(없음)"
+        return Candidate(self.feature_set, self.log_dd, series, self.fixed, horizons,
+                         self.fixed_horizons, shown)
+
+    @property
+    def forward_start(self) -> tuple:
+        """
+        Where a forward selection starts, as the pool items removed there: every series when
+        the pool has series (the selection then adds series back one at a time, and under the
+        "both" unit may also drop a horizon on the way), or else every horizon (it adds
+        horizons back, starting from the columns that have none).
+        """
+        series = tuple(item for item in self.pool if not item.startswith(HORIZON_MARK))
+        return series or tuple(self.pool)
 
     def remaining(self, removed) -> list:
-        """The columns left once the series of `removed` are taken out."""
+        """The columns left once the pool items of `removed` are taken out."""
         removed = set(removed)
-        return [col for col in self.columns if feature_series_name(col) not in removed]
+        return [col for col in self.columns if feature_series_name(col) not in removed
+                and not any(HORIZON_MARK + h in removed for h in feature_horizons(col))]
 
     @property
     def name(self) -> str:
@@ -221,7 +300,18 @@ def _matching_specs(columns, specs) -> list:
     return out
 
 
-def _pinned_columns(columns, pin_features, feature_set, log_dd, fixed) -> list:
+def _matching_horizons(columns, horizons) -> list:
+    """The horizons that match at least one of `columns`, normalized, in order."""
+    present = set(feature_horizon_set(columns))
+    out = []
+    for spec in horizons or ():
+        horizon = normalize_horizon(spec)
+        if horizon in present and horizon not in out:
+            out.append(horizon)
+    return out
+
+
+def _pinned_columns(columns, pin_features, feature_set, log_dd, fixed, fixed_horizons=()) -> list:
     """
     The pinned columns of a group, resolved one specification at a time.
 
@@ -234,7 +324,8 @@ def _pinned_columns(columns, pin_features, feature_set, log_dd, fixed) -> list:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 pinned += resolve_pinned_features(columns, [spec], ver=feature_set,
-                                                  log_dd=log_dd, remove_series=fixed)
+                                                  log_dd=log_dd, remove_series=fixed,
+                                                  remove_horizons=fixed_horizons)
         except KeyError:
             continue
     return list(dict.fromkeys(pinned))
@@ -247,9 +338,11 @@ def build_groups(feature_sets,
                  pin_features=None,
                  model: str = "jm",
                  removal: str = "auto",
-                 max_subsets: int = DEFAULT_MAX_SUBSETS) -> list:
+                 max_subsets: int = DEFAULT_MAX_SUBSETS,
+                 unit: str = "series",
+                 remove_horizons=None) -> list:
     """
-    Lay out the (feature set, log-DD) groups of a search and the series each may remove.
+    Lay out the (feature set, log-DD) groups of a search and what each may remove.
 
     Parameters
     ----------
@@ -280,10 +373,24 @@ def build_groups(feature_sets,
     max_subsets : int, optional (default=64)
         Under "auto", the largest number of removal subsets searched exhaustively.
 
+    unit : str, optional (default="series")
+        One of `REMOVAL_UNITS`: what one removal takes out -- a series (``var``: the rolling
+        variance at every window), a horizon (``5``: every column measured over 5 days, see
+        `features.resolve_removed_horizons`), or either, in which case the pool holds both
+        and a candidate can drop, say, the rolling variance and the 5-day columns together.
+        Custom variables carry no horizon, so only the series unit can remove them.
+
+    remove_horizons : iterable of str, optional
+        The user's ``--remove-horizon``. Those matching a group's columns are removed in
+        every candidate of that group, like `remove_series`.
+
     Returns
     -------
     list of SearchGroup
     """
+    if unit not in REMOVAL_UNITS:
+        raise ValueError(f"지원하지 않는 --search-unit 값입니다: {unit}. 가능한 값: {REMOVAL_UNITS}")
+    removal = MODE_ALIASES.get(removal, removal)
     if removal not in REMOVAL_MODES:
         raise ValueError(f"지원하지 않는 --search-removal 값입니다: {removal}. 가능한 값: {REMOVAL_MODES}")
     custom_columns = [str(col) for col in custom_columns or ()]
@@ -299,22 +406,38 @@ def build_groups(feature_sets,
             fixed = tuple(_matching_specs(all_columns, remove_series))
             columns = [col for col in all_columns
                        if col not in set(resolve_removed_features(all_columns, fixed))]
-            pinned = (_pinned_columns(columns, pin_features, feature_set, log_dd, fixed)
-                      if model == "sjm" else [])
-            kept_series = {feature_series_name(col) for col in pinned}
-            pool = [name for name in feature_series(columns) if name not in kept_series]
+            fixed_horizons = tuple(_matching_horizons(columns, remove_horizons))
+            columns = [col for col in columns
+                       if col not in set(resolve_removed_horizons(columns, fixed_horizons))]
+            pinned = (_pinned_columns(columns, pin_features, feature_set, log_dd, fixed,
+                                      fixed_horizons) if model == "sjm" else [])
+            pool = []
+            if unit in ("series", "both"):
+                kept_series = {feature_series_name(col) for col in pinned}
+                pool += [name for name in feature_series(columns) if name not in kept_series]
+            if unit in ("horizon", "both"):
+                kept_horizons = {h for col in pinned for h in feature_horizons(col)}
+                pool += [HORIZON_MARK + h for h in feature_horizon_set(columns)
+                         if h not in kept_horizons]
             mode = removal
             if mode == "auto":
-                mode = "exhaustive" if 2 ** len(pool) - 1 <= max_subsets else "greedy"
-            groups.append(SearchGroup(feature_set, log_dd, fixed, columns, pool, mode))
+                mode = "exhaustive" if 2 ** len(pool) - 1 <= max_subsets else "forward"
+            groups.append(SearchGroup(feature_set, log_dd, fixed, columns, pool, mode,
+                                      fixed_horizons))
     return groups
+
+
+def item_label(item: str) -> str:
+    """How a pool item reads in the log: a series as is, a horizon as ``5d``."""
+    return item[len(HORIZON_MARK):] + "d" if item.startswith(HORIZON_MARK) else item
 
 
 def grid_candidates(group: SearchGroup) -> list:
     """
     The candidates a group evaluates up front: all of them for "exhaustive", the full set
-    and its single removals for "single", and the full set alone for "greedy" and "none"
-    (the greedy elimination generates the rest step by step).
+    and its single removals for "single", and the full set alone for "forward", "backward"
+    and "none" -- the stepwise searches generate the rest step by step, and a forward one
+    keeps the full set for reference only.
     """
     if group.mode == "exhaustive":
         subsets = itertools.chain.from_iterable(
@@ -326,15 +449,35 @@ def grid_candidates(group: SearchGroup) -> list:
     return [group.candidate(subset) for subset in subsets if group.remaining(subset)]
 
 
-def greedy_candidates(group: SearchGroup) -> list:
-    """The next step of a greedy elimination: every one-series extension of `current`."""
-    out = []
-    for name in group.pool:
-        if name in group.current:
+def stepwise_candidates(group: SearchGroup) -> list:
+    """
+    The next step of a stepwise search from `group.current` (the pool items removed so far).
+
+    Backward elimination tries removing each item still in the matrix. Forward selection tries
+    adding back each item its starting point removed -- a series (with every horizon of it the
+    matrix still holds) or, under the horizon unit, a horizon -- and, under the "both" unit,
+    also removing a horizon, so that "add DD, then drop the 5-day columns" is a path it can
+    take. A move that leaves the matrix empty or unchanged is skipped.
+    """
+    current = set(group.current)
+    before = group.remaining(current)
+    moves = []
+    if group.mode == "backward":
+        moves = [current | {item} for item in group.pool if item not in current]
+    else:
+        start = set(group.forward_start)
+        moves = [current - {item} for item in group.pool if item in current and item in start]
+        moves += [current | {item} for item in group.pool
+                  if item not in current and item not in start and before]
+    out, seen = [], set()
+    for removed in moves:
+        after = group.remaining(removed)
+        if not after or after == before:
             continue
-        removed = group.current + (name,)
-        if group.remaining(removed):
-            out.append(group.candidate(removed))
+        candidate = group.candidate(removed, forward=group.mode == "forward")
+        if candidate.label not in seen:
+            seen.add(candidate.label)
+            out.append(candidate)
     return out
 
 
@@ -645,7 +788,8 @@ class FeatureSearch:
         """The feature matrix of a candidate."""
         return build_features(self.signal_ret, ver=candidate.feature_set, warmup=self.warmup,
                               log_dd=candidate.log_dd, extra_features=self.extra_df,
-                              remove_series=candidate.remove_series or None)
+                              remove_series=candidate.remove_series or None,
+                              remove_horizons=candidate.remove_horizons or None)
 
     def first_refit(self, candidate: Candidate):
         """The first day of the candidate's online regimes, found without fitting anything."""
@@ -664,7 +808,8 @@ class FeatureSearch:
         kwargs = dict(self.fit_kwargs)
         if self.pin_features and kwargs.get("model", "jm") == "sjm":
             kwargs["pin_feats"] = _pinned_columns(X.columns, self.pin_features, candidate.feature_set,
-                                                  candidate.log_dd, candidate.remove_series)
+                                                  candidate.log_dd, candidate.remove_series,
+                                                  candidate.remove_horizons)
         return kwargs
 
     def score(self, record: SearchRecord) -> float:
@@ -679,7 +824,7 @@ class FeatureSearch:
         Backtest the candidates not seen yet and return the record of every one of them.
 
         Candidates past `max_runs` are dropped with a warning, and the search is marked as
-        capped so that the greedy loop stops.
+        capped so that the stepwise loop stops.
         """
         out, todo, seen = [], [], {}
         for candidate in candidates:
@@ -734,7 +879,9 @@ def run_search(signal_ret: pd.Series,
                feature_sets=None,
                log_dd_mode: str = "both",
                removal: str = "auto",
+               unit: str = "series",
                remove_series=None,
+               remove_horizons=None,
                pin_features=None,
                max_subsets: int = DEFAULT_MAX_SUBSETS,
                min_improve: float = 0.,
@@ -768,11 +915,12 @@ def run_search(signal_ret: pd.Series,
         The configuration the run was given on the command line, which the winner is judged
         against. Defaults to the "paper" set of the article.
 
-    feature_sets, log_dd_mode, removal, max_subsets
+    feature_sets, log_dd_mode, removal, max_subsets, unit
         The candidates to search, see `build_groups`.
 
-    remove_series, pin_features
-        The user's ``--remove-series`` and ``--pin-feature``, see `build_groups`.
+    remove_series, remove_horizons, pin_features
+        The user's ``--remove-series``, ``--remove-horizon`` and ``--pin-feature``, see
+        `build_groups`.
 
     min_improve : float, optional (default=0.)
         Greedy search only: the smallest rise of the IS Sharpe ratio a removal must bring to
@@ -819,18 +967,29 @@ def run_search(signal_ret: pd.Series,
     custom_columns = list(extra_df.columns) if extra_df is not None else []
     groups = build_groups(feature_sets, log_dd_mode=log_dd_mode, custom_columns=custom_columns,
                           remove_series=remove_series, pin_features=pin_features, model=model,
-                          removal=removal, max_subsets=max_subsets)
-    # a removal applies to whichever sets hold what it names ("var" exists in "extra" only),
-    # the baseline included; one that matches no set at all is a typo, as in a plain run
+                          removal=removal, max_subsets=max_subsets, unit=unit,
+                          remove_horizons=remove_horizons)
+    # a removal applies to whichever sets hold what it names ("var" exists in "extra" only,
+    # the 10-day horizon in "paper" and "extra"), the baseline included; one that matches no
+    # set at all is a typo, as in a plain run
     baseline_columns = feature_set_columns(baseline.feature_set, log_dd=baseline.log_dd) + custom_columns
-    baseline = Candidate(baseline.feature_set, baseline.log_dd, (),
-                         tuple(_matching_specs(baseline_columns, baseline.fixed)))
+    baseline_fixed = tuple(_matching_specs(baseline_columns, baseline.fixed))
+    baseline_columns = [col for col in baseline_columns
+                        if col not in set(resolve_removed_features(baseline_columns, baseline_fixed))]
+    baseline = Candidate(baseline.feature_set, baseline.log_dd, (), baseline_fixed, (),
+                         tuple(_matching_horizons(baseline_columns, baseline.fixed_horizons)))
     unmatched = [spec for spec in remove_series or ()
                  if spec not in baseline.fixed and not any(spec in group.fixed for group in groups)]
     if unmatched:
         raise KeyError(f"제거할 피처 {unmatched}가 탐색하는 어느 피처 세트에도 없습니다. "
                        f"시리즈 이름(예: 'var'), 개별 피처 이름(예: 'var_20'), 또는 커스텀 변수 지정"
                        f"(예: 'VIX:ewm:20') 중 하나여야 합니다.")
+    unmatched = [spec for spec in remove_horizons or ()
+                 if normalize_horizon(spec) not in baseline.fixed_horizons
+                 and not any(normalize_horizon(spec) in group.fixed_horizons for group in groups)]
+    if unmatched:
+        raise KeyError(f"제거할 기간 {unmatched}가 탐색하는 어느 피처 세트에도 없습니다 "
+                       f"(paper: 10·20·60일, example: 5·20·60일, extra: 5·10·20·60일).")
     buy_bps, sell_bps = resolve_cost_bps(strategy_kwargs.get("cost_bps", 10.),
                                          strategy_kwargs.get("buy_cost_bps"),
                                          strategy_kwargs.get("sell_cost_bps"))
@@ -857,8 +1016,13 @@ def run_search(signal_ret: pd.Series,
             print(f"\n변수 옵션 탐색: 그룹 {len(groups)}개, 1단계 후보 {n_grid}개 "
                   f"(병렬 {search.jobs}개, 실행 한도 {max_runs}회)")
             for group in groups:
-                print(f"  · {group.name:<14} 피처 {len(group.columns):>2}개, 제거 후보 시리즈 "
-                      f"{len(group.pool)}개 → {group.mode}")
+                n_series = sum(not item.startswith(HORIZON_MARK) for item in group.pool)
+                horizons = [item_label(item) for item in group.pool if item.startswith(HORIZON_MARK)]
+                pool = (f"시리즈 {n_series}개" if unit != "horizon" else "") + \
+                       (" + " if unit == "both" else "") + \
+                       (f"기간 {len(horizons)}개({'·'.join(horizons)})" if unit != "series" else "")
+                print(f"  · {group.name:<14} 피처 {len(group.columns):>2}개, 제거 후보 {pool} "
+                      f"→ {group.mode}")
             print(f"선택(IS) 구간 {is_start} ~ {oos_start_date} 전일, "
                   f"검증(OOS) 구간 {oos_start_date} ~ {end} — 순위는 IS Sharpe로만 매깁니다.")
 
@@ -866,15 +1030,32 @@ def run_search(signal_ret: pd.Series,
         first = [baseline] + [candidate for group in groups for candidate in grid_candidates(group)]
         search.evaluate(first, stage="grid")
 
-        # stage 2+: greedy backward elimination, all greedy groups advancing in lockstep so
-        # that one batch of fits keeps every worker busy
-        greedy = [group for group in groups if group.mode == "greedy"]
-        for group in greedy:
-            group.current_score = search.score(search.by_label[group.candidate().label])
+        # stage 2+: stepwise searches, every stepwise group advancing in lockstep so that one
+        # batch of fits keeps every worker busy. A backward elimination starts from the full
+        # set; a forward selection from its starting point, which is often an empty matrix --
+        # scored -inf, so that its first step takes the best single item whatever it scores
+        stepwise = [group for group in groups if group.mode in STEPWISE_MODES]
+        starts = []
+        for group in stepwise:
+            if group.mode == "forward":
+                group.current = group.forward_start
+                if group.remaining(group.current):
+                    starts.append(group.candidate(group.current, forward=True))
+        search.evaluate(starts, stage="forward-0")
+        for group in stepwise:
+            if group.mode == "backward":
+                group.current_score = search.score(search.by_label[group.candidate().label])
+            elif group.remaining(group.current):
+                label = group.candidate(group.current, forward=True).label
+                group.current_score = (search.score(search.by_label[label])
+                                       if label in search.by_label else np.nan)
+            else:
+                group.current_score = -np.inf
         step = 0
         while not search.capped:
-            active = [group for group in greedy if not group.done and np.isfinite(group.current_score)]
-            batches = {group.name: greedy_candidates(group) for group in active}
+            active = [group for group in stepwise
+                      if not group.done and not np.isnan(group.current_score)]
+            batches = {group.name: stepwise_candidates(group) for group in active}
             for group in active:
                 if not batches[group.name]:
                     group.done = True
@@ -883,11 +1064,11 @@ def run_search(signal_ret: pd.Series,
                 break
             step += 1
             if verbose:
-                print(f"탐욕 제거 {step}단계: " + ", ".join(
-                    f"{group.name}(현재 -{len(group.current)}개, IS {group.current_score:.3f})"
-                    for group in active))
+                print(f"단계별 탐색 {step}단계: " + ", ".join(
+                    f"{group.name}({_direction(group)}, 현재 {_state(group)}, "
+                    f"IS {group.current_score:.3f})" for group in active))
             search.evaluate([c for group in active for c in batches[group.name]],
-                            stage=f"greedy-{step}")
+                            stage=f"step-{step}")
             for group in active:
                 scored = [(search.score(search.by_label[c.label]), c) for c in batches[group.name]
                           if c.label in search.by_label]
@@ -896,18 +1077,22 @@ def run_search(signal_ret: pd.Series,
                     group.done = True
                     continue
                 best_score, best = max(scored, key=lambda pair: pair[0])
-                if best_score > group.current_score + min_improve:
-                    added = [name for name in best.removed if name not in group.current]
-                    group.steps.append({"step": step, "removed": added[0] if added else "",
+                # the first forward step has nothing to beat: the empty start has no score
+                threshold = group.current_score + (min_improve if np.isfinite(group.current_score) else 0.)
+                if best_score > threshold:
+                    move = _move(group.current, best.items)
+                    group.steps.append({"step": step, "move": move,
                                         "from": group.current_score, "to": best_score})
                     if verbose:
-                        print(f"  → {group.name}: -{added[0] if added else '?'} 채택 "
-                              f"(IS Sharpe {group.current_score:.3f} → {best_score:.3f})")
-                    group.current, group.current_score = best.removed, best_score
+                        before = (f"{group.current_score:.3f}" if np.isfinite(group.current_score)
+                                  else "없음")
+                        print(f"  → {group.name}: {move} 채택 (IS Sharpe {before} → {best_score:.3f})")
+                    group.current, group.current_score = best.items, best_score
                 else:
                     group.done = True
                     if verbose:
-                        print(f"  → {group.name}: 더 제거해도 IS Sharpe가 오르지 않아 종료 "
+                        verb = "더 제거해도" if group.mode == "backward" else "더 늘려도"
+                        print(f"  → {group.name}: {verb} IS Sharpe가 오르지 않아 종료 "
                               f"(최고 후보 {best_score:.3f} ≤ 현재 {group.current_score:.3f}"
                               f"{f' + {min_improve:g}' if min_improve else ''})")
 
@@ -919,6 +1104,25 @@ def run_search(signal_ret: pd.Series,
     return summarize_search(search, groups, baseline, is_start, oos_start_date, end,
                             wf_folds=wf_folds, buy_bps=buy_bps, sell_bps=sell_bps,
                             trading_days=trading_days)
+
+
+def _direction(group: SearchGroup) -> str:
+    return "전진 선택" if group.mode == "forward" else "후진 제거"
+
+
+def _state(group: SearchGroup) -> str:
+    """Where a stepwise search stands: items removed, or for forward selection items added."""
+    if group.mode == "backward":
+        return f"-{len(group.current)}개"
+    added = len(set(group.forward_start) - set(group.current))
+    return f"+{added}개"
+
+
+def _move(before, after) -> str:
+    """One stepwise move, as it reads in the log: ``+DD`` (added back) or ``-5d`` (removed)."""
+    before, after = set(before), set(after)
+    return " ".join([f"+{item_label(item)}" for item in sorted(before - after)]
+                    + [f"-{item_label(item)}" for item in sorted(after - before)]) or "?"
 
 
 def summarize_search(search: FeatureSearch,
@@ -969,6 +1173,7 @@ def summarize_search(search: FeatureSearch,
         candidate = record.candidate
         row = {"label": candidate.label, "feature_set": candidate.feature_set,
                "log_dd": candidate.log_dd, "removed": " ".join(candidate.removed),
+               "removed_horizons": " ".join(candidate.horizons),
                "n_features": len(record.columns), "stage": record.stage,
                "is_baseline": record is base_record}
         for period, values in metrics.items():
@@ -984,6 +1189,7 @@ def summarize_search(search: FeatureSearch,
     for record in failed:
         rows.append({"label": record.candidate.label, "feature_set": record.candidate.feature_set,
                      "log_dd": record.candidate.log_dd, "removed": " ".join(record.candidate.removed),
+                     "removed_horizons": " ".join(record.candidate.horizons),
                      "n_features": len(record.columns), "stage": record.stage,
                      "is_baseline": record is base_record, "features": " ".join(record.columns),
                      "cli": record.candidate.cli, "error": record.error})
