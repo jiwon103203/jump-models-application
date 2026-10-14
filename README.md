@@ -80,6 +80,7 @@ res["performance"]         # 전략 성과표
 | `--feature-set` | `paper` | `paper`: 논문 Table 2의 3개 피처(DD hl=10, Sortino hl=20·60). `example`: 저장소 나스닥 예제의 9개 피처(hl 5·20·60 × 수익률·log DD·Sortino). `extra`: `example`의 수익률·Sortino 6개 + 수익률·변동성 파생 25개 + `DD_5`·`DD_10`·`DD_20`·`DD_60` = 35개 (3-1 참고) |
 | `--log-dd` | 꺼짐 | `paper`·`extra`의 downside deviation을 로그 변환(`DD_10` → `DD-log_10`). `example`은 원래 로그 스케일이라 영향이 없습니다 |
 | `--remove-series` | 없음 | 피처 **시리즈를 통째로 제거**. `--remove-series var` 는 `var_5`·`var_20`·`var_60`을 모두 뺍니다. 개별 피처 이름·커스텀 변수 지정도 받고, 여러 번 지정 가능 (3-7 참고) |
+| `--remove-horizon` | 없음 | **기간(거래일)을 통째로 제거**. `--remove-horizon 5`는 `ret_5`·`sortino_5`·`std_5`·`DD_5` 등 5일로 잰 피처를 모두 뺍니다. 여러 번 지정 가능 (3-7 참고) |
 | `--warmup` | 252 | EWM 초기 불안정 구간으로 버릴 행 수 |
 | `--relative-benchmark` | 없음 | 벤치마크(코스피 등) 종가가 담긴 **별도 csv/엑셀 파일**. 날짜 열과 `close`(종가) 열을 자동 인식해 자산 수익률에서 이 지수의 수익률을 차감합니다 (3-12 참고) |
 | `--relative-benchmark-col` | 없음 | 벤치마크가 **같은 입력 파일** 안에 있을 때 그 종가 열 이름. 종가 열과 헷갈릴 수 있어 자동 인식하지 않습니다. `--relative-benchmark`와 택일 |
@@ -105,7 +106,8 @@ res["performance"]         # 전략 성과표
 | `--n-init` | 10 | 좌표하강 재시작 횟수. 줄이면 빨라지고 해의 안정성은 떨어집니다 |
 | `--delays` | `1,5,10` | 거래 지연 로버스트니스 표에 쓸 지연 일수 목록. `--no-robustness`로 생략 |
 | `--search` | 꺼짐 | **변수 옵션 탐색 모드**. 피처 세트 × `--log-dd` × 시리즈 제거 조합을 모두 백테스트해 IS Sharpe 최고 조합을 고르고 OOS에서 검증 (3-13 참고) |
-| `--search-sets`, `--search-log-dd`, `--search-removal` | `paper,example,extra`, `both`, `auto` | 탐색 범위: 피처 세트 / `--log-dd` 켬·끔 / 시리즈 제거 방식(`auto`·`exhaustive`·`greedy`·`single`·`none`) |
+| `--search-sets`, `--search-log-dd`, `--search-removal` | `paper,example,extra`, `both`, `auto` | 탐색 범위: 피처 세트 / `--log-dd` 켬·끔 / 제거 탐색 방식(`auto`·`exhaustive`·`greedy`·`single`·`none`) |
+| `--search-unit` | `series` | 제거 단위: `series`(통계 종류별) / `horizon`(5·10·20·60일 기간별) / `both`(둘을 섞어서) |
 | `--search-oos-start`, `--search-oos-frac` | 없음, 0.3 | 검증(OOS) 구간 시작일. 미지정 시 평가 구간의 마지막 30% |
 | `--search-wf-folds` | 3 | OOS를 나눠 구간마다 다시 고르는 워크포워드 재선택 구간 수 |
 | `--search-jobs`, `--search-max-runs` | -1(전 코어), 300 | 병렬 프로세스 수, 롤링 적합 최대 횟수 |
@@ -306,7 +308,7 @@ python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm
 - `--model jm`에는 피처 선택 자체가 없으므로 지정해도 경고만 내고 무시합니다.
 - 실제로 무엇이 고정됐는지는 실행 로그(`고정 피처: [...]`, 가중 요약의 `*` 표시)와 `feat_weights.png`(고정 피처는 실선)에서 확인할 수 있습니다.
 
-### 3-7. 피처 시리즈 제거 (`--remove-series`)
+### 3-7. 피처 시리즈·기간 제거 (`--remove-series`, `--remove-horizon`)
 
 `--feature-set`은 정해진 묶음이라 "extra는 쓰고 싶은데 이 계열만 빼고 싶다"는 조정이 안 됩니다. `--remove-series`가 그 자리로, **같은 통계를 horizon만 바꿔 만든 열 묶음(시리즈)을 통째로** 뺍니다.
 
@@ -350,6 +352,29 @@ python run_pipeline.py --input 내데이터.xlsx --feature-set extra --remove-se
 - **`--log-dd`를 함께 쓰면 이름이 바뀝니다.** 시리즈 이름은 `DD` → `DD-log`, 개별 열은 `DD_5` → `DD-log_5`가 되므로 제거 지정도 그에 맞춰야 합니다.
 - **제거는 행을 버리기 전에 일어납니다.** 즉 `vol-chg_60`(60일 시차)처럼 앞부분이 길게 NaN인 열을 빼면 그만큼 데이터가 되살아납니다. `--warmup`이 그보다 크면 차이는 없습니다.
 - 무엇이 빠졌는지는 실행 로그의 `제거한 피처: [...]` 줄에서 확인할 수 있고, 제거한 열은 `feat_weights.csv`·`feat_weights.png`와 `refit_params.csv`에도 아예 나타나지 않습니다.
+
+#### 기간 단위 제거 (`--remove-horizon`)
+
+`--remove-series`가 피처 행렬을 **통계 종류** 방향으로 자른다면, `--remove-horizon`은 **기간** 방향으로 자릅니다. `--remove-horizon 5`는 통계 종류와 상관없이 5일로 잰 열을 모두 뺍니다.
+
+```bash
+# 5일짜리 피처 전부 제거 (ret_5, sortino_5, std_5, var_5, mad_5, rms_5, vol-log_5, vol-chg_5, DD_5, vol-ratio_5-20)
+python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm --remove-horizon 5
+
+# 시리즈 제거와 섞어 쓰기: var 전체 + 5일·60일 전체
+python run_pipeline.py --input 내데이터.xlsx --feature-set extra --remove-series var \
+    --remove-horizon 5 --remove-horizon 60
+```
+
+| 세트 | 쓰는 기간 |
+|---|---|
+| `paper` | 10일(`DD_10`), 20일·60일(`sortino_20`·`sortino_60`) |
+| `example` | 5·20·60일 |
+| `extra` | 5·10·20·60일 (10일은 `DD_10` 하나뿐) |
+
+- **두 기간을 비교하는 열은 어느 쪽을 빼도 빠집니다.** `vol-ratio_5-20`은 5일 변동성과 20일 변동성의 비율이라 `5`나 `20` 중 하나만 지정해도 제거됩니다.
+- **기간이 없는 열은 영향이 없습니다.** `ret-simple`·`ret-log`·`ret-abs`·`ret-sq`·`ret-cumlog`와 커스텀 변수(`VIX_ewm20`의 `ewm20`은 변환이지 기간이 아님)는 그대로 남습니다.
+- `5`, `5d`, `5일` 모두 같은 지정이고, 세트에 없는 기간(예: `example`의 `10`)은 오타로 보고 오류를 냅니다. 고정한 피처(`--pin-feature`)를 기간 제거로 빼려 하면 역시 오류입니다.
 
 ### 3-8. 연속형 점프 모델과 레짐 확률 (`--no-cont`, `--grid-size`)
 
@@ -573,9 +598,20 @@ python run_pipeline.py --input 내데이터.xlsx --search --model sjm \
 
 # 커스텀 변수도 제거 후보가 됩니다 (시리즈 이름 = 첫 '_' 앞, 예: VIX_ewm20 → VIX)
 python run_pipeline.py --input 내데이터.xlsx --search --extra-feature VIX:ewm:20
+
+# 시리즈뿐 아니라 5·10·20·60일 기간 단위 제거도 함께 탐색
+python run_pipeline.py --input 내데이터.xlsx --search --search-unit both
 ```
 
-**무엇을 탐색하나.** 피처 세트(`--search-sets`)와 `--log-dd`(`--search-log-dd`)의 조합마다 **제거 가능한 시리즈**(3-7의 시리즈 단위)를 빼 보며 비교합니다. 모델·`--window`·`--jump-penalty`·거래 지연·비용·현금 한도·벤치마크 등 **나머지 옵션은 준 값으로 고정**되어, 피처 옵션만 달라집니다. 제거 방식(`--search-removal`)은 다음과 같습니다.
+**무엇을 탐색하나.** 피처 세트(`--search-sets`)와 `--log-dd`(`--search-log-dd`)의 조합마다 **제거 가능한 항목**을 빼 보며 비교합니다. 항목의 단위는 `--search-unit`이 정합니다.
+
+| `--search-unit` | 한 번에 빼는 것 | 제거 후보 (paper / example / extra) |
+|---|---|---|
+| `series` (기본) | 통계 종류 하나 — `var`면 `var_5`·`var_20`·`var_60` (`--remove-series`) | 2 / 3 / 15개 |
+| `horizon` | 기간 하나 — `5d`면 `ret_5`·`sortino_5`·`std_5`·`DD_5` … (`--remove-horizon`) | 3 / 3 / 4개 |
+| `both` | 둘 중 무엇이든 — 예: `var`와 `5d`를 함께 | 5 / 6 / 19개 |
+
+기간 제거는 결과표에서 `extra -var -5d`처럼 `d`를 붙여 표시하고, 권장 옵션에는 `--remove-horizon 5`로 나옵니다. 커스텀 변수는 기간이 없어 `series` 단위로만 빠집니다. 같은 열 구성이 되는 조합(예: `paper -DD`와 `paper -DD -10d` — `DD_10`이 이미 빠졌으니 10일은 더 뺄 것이 없음)은 한 번만 적합합니다. 모델·`--window`·`--jump-penalty`·거래 지연·비용·현금 한도·벤치마크 등 **나머지 옵션은 준 값으로 고정**되어, 피처 옵션만 달라집니다. 제거 방식(`--search-removal`)은 다음과 같습니다.
 
 | 방식 | 하는 일 | 실행 횟수 |
 |---|---|---|
@@ -585,10 +621,10 @@ python run_pipeline.py --input 내데이터.xlsx --search --extra-feature VIX:ew
 | `none` | 제거 없이 세트·log-dd만 비교 | 1 |
 | `auto` (기본) | 부분집합 수가 `--search-max-subsets`(64) 이하면 `exhaustive`, 아니면 `greedy` | — |
 
-기본값에서는 `paper`(시리즈 2개 → 3조합)와 `example`(3개 → 7조합)은 전수, `extra`(15개 → 32,767조합)는 탐욕 제거로 돌아갑니다. `example`은 원래 로그 스케일이라 `--log-dd`를 켜도 같으므로 한 번만 돌립니다. 열 구성이 똑같아지는 조합(예: `paper -DD`와 `paper log-dd -DD-log`)은 한 번만 적합하고 `aliases` 열에 함께 적습니다.
+기본값에서는 `paper`(시리즈 2개 → 3조합)와 `example`(3개 → 7조합)은 전수, `extra`(15개 → 32,767조합)는 탐욕 제거로 돌아갑니다. `--search-unit horizon`이면 `extra`도 기간 4개 → 15조합이라 전수로 돌고, `both`이면 `paper`(31)·`example`(63)는 전수, `extra`(2^19)는 탐욕 제거입니다. `both`는 실행 횟수가 크게 늘어나므로(합성 데이터 예시에서 `--search-log-dd off`로 153회) 시간을 감안하세요. `example`은 원래 로그 스케일이라 `--log-dd`를 켜도 같으므로 한 번만 돌립니다. 열 구성이 똑같아지는 조합(예: `paper -DD`와 `paper log-dd -DD-log`)은 한 번만 적합하고 `aliases` 열에 함께 적습니다.
 
-- `--remove-series`로 준 시리즈는 **그 시리즈가 있는 모든 후보에서 항상 빠진 채** 탐색합니다(예: `var`는 `extra`에만 적용). 어느 세트에도 없으면 오타로 보고 오류를 냅니다.
-- `--pin-feature`(sjm 전용)로 고정한 피처가 속한 시리즈는 **제거 후보에서 뺍니다**. `--model jm`에서는 고정이 의미가 없어 무시됩니다.
+- `--remove-series`·`--remove-horizon`으로 준 항목은 **그것이 있는 모든 후보에서 항상 빠진 채** 탐색합니다(예: `var`는 `extra`에만, `10`일은 `paper`·`extra`에만 적용). 어느 세트에도 없으면 오타로 보고 오류를 냅니다.
+- `--pin-feature`(sjm 전용)로 고정한 피처가 속한 시리즈와 기간은 **제거 후보에서 뺍니다**(예: `sortino_60`을 고정하면 `sortino`와 `60d`가 후보에서 빠짐). `--model jm`에서는 고정이 의미가 없어 무시됩니다.
 
 **과최적화를 막는 장치.** 평가 구간(모든 후보의 온라인 레짐이 공통으로 있는 기간)을 앞쪽 **선택(IS)** 과 뒤쪽 **검증(OOS)** 으로 나눕니다(기본 마지막 30%, `--search-oos-frac`/`--search-oos-start`).
 
@@ -629,7 +665,7 @@ IS–OOS Sharpe 순위 상관(Spearman): 0.31 (0에 가까우면 IS 순위가 OO
 
 | 파일 | 내용 |
 |---|---|
-| `search_results.csv` | 조합별 한 행, IS Sharpe 순위순: 라벨·피처 세트·log-dd·제거 시리즈·피처 수·IS/OOS/전체 Sharpe·IS/OOS 수익률과 MDD·회전율·bear 비중·연 전환 횟수·같은 열 구성의 별칭·피처 목록·**재현용 명령줄 옵션**(`cli`)·실패 시 오류 |
+| `search_results.csv` | 조합별 한 행, IS Sharpe 순위순: 라벨·피처 세트·log-dd·제거 시리즈(`removed`)·제거 기간(`removed_horizons`)·피처 수·IS/OOS/전체 Sharpe·IS/OOS 수익률과 MDD·회전율·bear 비중·연 전환 횟수·같은 열 구성의 별칭·피처 목록·**재현용 명령줄 옵션**(`cli`)·실패 시 오류 |
 | `search_walkforward.csv` | 워크포워드 구간별 시작·끝·선택된 조합·선택 시점 Sharpe·구간 Sharpe(선택 조합 / 기준 설정 / 매수보유) |
 | `search_returns.csv` | 날짜별 일간 수익률: 매수보유·기준 설정·IS 1위·워크포워드, 무위험금리, IS/OOS 구분 |
 | `search_summary.csv` | 구간, 조합 수, 각 Sharpe, Deflated Sharpe, 순위 상관, 판정, 권장 조합과 옵션 |
@@ -692,6 +728,7 @@ IS–OOS Sharpe 순위 상관(Spearman): 0.31 (0에 가까우면 IS 순위가 OO
 | (논문 밖) 연속형 JM (Nystrup et al. 2020) — 확률로 나오는 레짐 | `rolling.init_model(cont=True)` → `JumpModel(cont=True)` |
 | (논문 밖) 특정 피처를 선택에서 제외하고 항상 유지 | `features.resolve_pinned_features` → `sparse_pin.PinnedSparseJumpModel` |
 | (논문 밖) 피처 시리즈를 모델에 넣기 전에 제거 | `features.resolve_removed_features` → `features.build_features(remove_series=...)` |
+| (논문 밖) 피처 기간(5·10·20·60일)을 모델에 넣기 전에 제거 | `features.resolve_removed_horizons` → `features.build_features(remove_horizons=...)` |
 | (논문 밖) 변수 유형별 가중 비중 | `weights.group_feature_weights` → `plotting.plot_weight_groups` |
 | (논문 밖) 국면 길이의 거리 요인 / 페널티 요인 분해 | `rolling.state_losses` → `regime_episodes.episode_metrics` |
 | (논문 밖) 현재 반기만 추론하는 실행 모드 | `rolling.run_rolling_jm(last_refit_only=True)` → `run_pipeline.run_inference` |

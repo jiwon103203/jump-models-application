@@ -29,7 +29,9 @@ the downside deviation at all three halflives that set uses.
 Whole *series* of columns can be dropped from any of the sets: the columns of a set come in
 families that share a statistic and differ only in their horizon, and ``--remove-series var``
 takes the rolling variance out of the "extra" set at every window at once -- see
-`resolve_removed_features`.
+`resolve_removed_features`. The matrix can be cut along the other axis too: ``--remove-horizon 5``
+drops every column measured over 5 days, whatever its statistic -- see
+`resolve_removed_horizons`.
 
 Any subset of the resulting columns can be *pinned* so that the sparse jump model never
 drops it -- see `resolve_pinned_features` and `sparse_pin.PinnedSparseJumpModel`.
@@ -306,7 +308,8 @@ def feature_engineer(ret_ser: pd.Series, ver: str = "paper", log_dd: bool = Fals
     raise NotImplementedError(f"지원하지 않는 피처 세트입니다: {ver}. 가능한 값: {FEATURE_SETS}")
 
 
-def feature_set_columns(ver: str = "paper", log_dd: bool = False, remove_series=None) -> list:
+def feature_set_columns(ver: str = "paper", log_dd: bool = False, remove_series=None,
+                        remove_horizons=None) -> list:
     """
     List the columns a feature set contributes to the matrix, without computing them.
 
@@ -329,6 +332,9 @@ def feature_set_columns(ver: str = "paper", log_dd: bool = False, remove_series=
         Series or columns of the set to leave out, see `resolve_removed_features`. Nothing is
         checked here: a specification naming a custom variable, or nothing at all, simply
         drops no column of this set.
+
+    remove_horizons : iterable of str, optional
+        Horizons of the set to leave out, see `resolve_removed_horizons`. Unchecked as well.
 
     Returns
     -------
@@ -358,7 +364,9 @@ def feature_set_columns(ver: str = "paper", log_dd: bool = False, remove_series=
     else:
         raise NotImplementedError(f"지원하지 않는 피처 세트입니다: {ver}. 가능한 값: {FEATURE_SETS}")
 
-    return _drop_removed(columns, remove_series) if remove_series else columns
+    if remove_series:
+        columns = _drop_removed(columns, remove_series)
+    return _drop_horizons(columns, remove_horizons) if remove_horizons else columns
 
 
 ############################################
@@ -607,6 +615,96 @@ def resolve_removed_features(columns, specs) -> list:
 
 
 ############################################
+## Removing a horizon
+############################################
+
+# a horizon is a plain window length (`std_20`) or a pair of them (`vol-ratio_5-20`); the
+# suffix of a custom variable (`VIX_ewm20`) is a transform, not a horizon -- the same rule
+# `weights.feature_horizon` applies
+_HORIZON_RE = re.compile(r"^\d+(?:-\d+)?$")
+
+
+def feature_horizons(column: str) -> list:
+    """
+    Return the horizons, in days, a feature column is measured over.
+
+    ``std_20`` gives ``["20"]``, ``vol-ratio_5-20`` gives ``["5", "20"]`` -- the log ratio of
+    the 5-day to the 20-day volatility depends on both -- and a column without a horizon
+    (``ret-cumlog``, or a custom variable such as ``VIX_ewm20``) gives ``[]``.
+    """
+    parts = str(column).split("_", 1)
+    if len(parts) == 1 or not _HORIZON_RE.match(parts[1]):
+        return []
+    return parts[1].split("-")
+
+
+def feature_horizon_set(columns) -> list:
+    """List the distinct horizons of `columns`, shortest first."""
+    return sorted({h for col in columns for h in feature_horizons(col)}, key=int)
+
+
+def normalize_horizon(spec) -> str:
+    """
+    Turn a horizon specification into the digits the column names carry: ``5``, ``"5"``,
+    ``"5d"`` and ``"5일"`` all give ``"5"``.
+    """
+    text = str(spec).strip().lower()
+    for suffix in ("days", "day", "d", "일"):
+        if text.endswith(suffix):
+            text = text[:-len(suffix)].strip()
+            break
+    if not text.isdigit():
+        raise ValueError(f"제거할 기간은 거래일 수여야 합니다 (예: 5, 20, 60): '{spec}'")
+    return str(int(text))
+
+
+def _drop_horizons(columns, horizons) -> list:
+    """`columns` minus those measured over any of `horizons`, without checking each matched one."""
+    removed = {normalize_horizon(h) for h in horizons or ()}
+    return [col for col in columns if not removed.intersection(feature_horizons(col))]
+
+
+def resolve_removed_horizons(columns, horizons) -> list:
+    """
+    Expand horizon removals into the feature columns they take out of the matrix.
+
+    Where `resolve_removed_features` cuts the matrix along its statistics (``var`` drops the
+    rolling variance at every window), this cuts it along its horizons: removing ``5`` drops
+    every column measured over 5 days -- ``ret_5``, ``sortino_5``, ``std_5``, ``DD_5`` and the
+    rest -- and also ``vol-ratio_5-20``, which compares the 5-day volatility with the 20-day
+    one and so cannot be computed without it. Columns without a horizon, custom variables
+    included, are never touched.
+
+    As with series, a horizon that matches no column is an error: it is a typo, or a horizon
+    the feature set does not use (``10`` exists in the "paper" and "extra" sets only).
+
+    Parameters
+    ----------
+    columns : iterable of str
+        The columns of the feature matrix, in order.
+
+    horizons : iterable of str or int, optional
+        The horizons to remove, see `normalize_horizon`. None or empty gives an empty list.
+
+    Returns
+    -------
+    list of str
+        The columns to drop, ordered as in `columns` and free of duplicates.
+    """
+    columns = [str(col) for col in columns]
+    removed = set()
+    for spec in horizons or ():
+        horizon = normalize_horizon(spec)
+        hit = [col for col in columns if horizon in feature_horizons(col)]
+        if not hit:
+            raise KeyError(
+                f"제거할 기간 '{spec}'에 해당하는 피처가 없습니다. "
+                f"사용 가능한 기간: {feature_horizon_set(columns)}")
+        removed.update(hit)
+    return [col for col in columns if col in removed]
+
+
+############################################
 ## The feature matrix
 ############################################
 
@@ -615,7 +713,8 @@ def build_features(ret_ser: pd.Series,
                    warmup: int = 252,
                    log_dd: bool = False,
                    extra_features: pd.DataFrame = None,
-                   remove_series=None) -> pd.DataFrame:
+                   remove_series=None,
+                   remove_horizons=None) -> pd.DataFrame:
     """
     Build the feature matrix and discard the burn-in period of the exponential weights.
 
@@ -647,6 +746,10 @@ def build_features(ret_ser: pd.Series,
         needs a long lookback -- ``vol-chg``, whose 60-day column is NaN over the first 60
         rows -- stops costing rows once it is removed.
 
+    remove_horizons : iterable of str, optional
+        Horizons to leave out of the matrix, e.g. ``["5"]`` for every 5-day column, see
+        `resolve_removed_horizons`. Applied after `remove_series`, before the rows are dropped.
+
     Returns
     -------
     pd.DataFrame
@@ -663,6 +766,11 @@ def build_features(ret_ser: pd.Series,
         if not len(X.columns):
             raise ValueError(
                 f"제거 지정 {list(remove_series)}이 모든 피처를 없앴습니다. 최소 한 개는 남아야 합니다.")
+    if remove_horizons:
+        X = X.drop(columns=resolve_removed_horizons(X.columns, remove_horizons))
+        if not len(X.columns):
+            raise ValueError(
+                f"기간 제거 {list(remove_horizons)}가 남은 피처를 모두 없앴습니다. 최소 한 개는 남아야 합니다.")
     if warmup > 0:
         X = X.iloc[warmup:]
     X = X.replace([np.inf, -np.inf], np.nan).dropna()
@@ -677,7 +785,7 @@ def build_features(ret_ser: pd.Series,
 ############################################
 
 def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = False,
-                            remove_series=None) -> list:
+                            remove_series=None, remove_horizons=None) -> list:
     """
     Expand pin specifications into the feature columns they name.
 
@@ -726,6 +834,9 @@ def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = F
         reported as removed rather than as missing, and keeps a group from warning about
         columns that were dropped on purpose.
 
+    remove_horizons : iterable of str, optional
+        The horizons left out of the matrix, see `resolve_removed_horizons`; treated the same way.
+
     Returns
     -------
     list of str
@@ -733,8 +844,10 @@ def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = F
     """
     columns = [str(col) for col in columns]
     known = set(columns)
-    base = set(feature_set_columns(ver, log_dd=log_dd, remove_series=remove_series))
+    base = set(feature_set_columns(ver, log_dd=log_dd, remove_series=remove_series,
+                                   remove_horizons=remove_horizons))
     removed_names = _removal_names(remove_series)
+    removed_horizons = {normalize_horizon(h) for h in remove_horizons or ()}
     pinned = set()
 
     for spec in specs or ():
@@ -746,7 +859,8 @@ def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = F
         if group not in PIN_GROUPS:
             column = name if name in known else _spec_column_name(name)
             if column not in known:
-                if _is_removed(column or name, removed_names):
+                if (_is_removed(column or name, removed_names)
+                        or removed_horizons.intersection(feature_horizons(column or name))):
                     raise KeyError(
                         f"고정할 피처 '{name}'은 제거 지정으로 이미 빠진 피처입니다. "
                         "고정하려면 제거 목록에서 빼 주세요.")
@@ -768,7 +882,8 @@ def resolve_pinned_features(columns, specs, ver: str = "paper", log_dd: bool = F
             if not wanted:
                 warnings.warn("커스텀 변수가 없어 'custom' 고정 지정이 아무 피처도 선택하지 않았습니다.")
         else:
-            wanted = feature_set_columns(group, log_dd=log_dd, remove_series=remove_series)
+            wanted = feature_set_columns(group, log_dd=log_dd, remove_series=remove_series,
+                                         remove_horizons=remove_horizons)
             missing = [col for col in wanted if col not in known]
             if missing:
                 warnings.warn(

@@ -54,12 +54,16 @@ import pandas as pd
 from scipy.stats import norm
 
 from backtest import performance_metrics, regime_summary, resolve_cost_bps, run_0_1_strategy
-from features import (FEATURE_SETS, build_features, feature_series, feature_series_name,
-                      feature_set_columns, resolve_pinned_features, resolve_removed_features)
+from features import (FEATURE_SETS, build_features, feature_horizon_set, feature_horizons,
+                      feature_series, feature_series_name, feature_set_columns,
+                      normalize_horizon, resolve_pinned_features, resolve_removed_features,
+                      resolve_removed_horizons)
 from rolling import refit_schedule, run_rolling_jm
 
 TRADING_DAYS = 252
 REMOVAL_MODES = ("auto", "exhaustive", "greedy", "single", "none")
+REMOVAL_UNITS = ("series", "horizon", "both")   # what one removal step takes out of the matrix
+HORIZON_MARK = "@"             # marks a horizon in a removal pool: "@5" is every 5-day column
 LOG_DD_MODES = ("both", "off", "on")
 DEFAULT_OOS_FRAC = .3          # share of the backtest period held out for the OOS test
 DEFAULT_WF_FOLDS = 3           # walk-forward re-selection blocks within the OOS part
@@ -77,7 +81,7 @@ EULER_GAMMA = 0.5772156649015329
 class Candidate:
     """
     One feature configuration: a feature set, the scale of its downside deviation, and the
-    series removed from it.
+    series and horizons removed from it.
 
     Attributes
     ----------
@@ -93,53 +97,73 @@ class Candidate:
     fixed : tuple of str
         The removal specifications the user gave (``--remove-series``) that apply to this
         feature set; they are removed in every candidate of the group.
+
+    horizons : tuple of str
+        The horizons the search removed (``"5"`` for every 5-day column), in pool order.
+
+    fixed_horizons : tuple of str
+        The horizons the user removed (``--remove-horizon``) that apply to this feature set.
     """
     feature_set: str
     log_dd: bool = False
     removed: tuple = ()
     fixed: tuple = ()
+    horizons: tuple = ()
+    fixed_horizons: tuple = ()
 
     @property
     def remove_series(self) -> list:
-        """Everything removed from the matrix: the user's specifications and the search's."""
+        """Every series removed from the matrix: the user's specifications and the search's."""
         return list(self.fixed) + list(self.removed)
 
     @property
+    def remove_horizons(self) -> list:
+        """Every horizon removed from the matrix: the user's and the search's."""
+        return list(self.fixed_horizons) + list(self.horizons)
+
+    @property
+    def items(self) -> tuple:
+        """What the search removed, as pool items: series names, then ``@``-marked horizons."""
+        return self.removed + tuple(HORIZON_MARK + h for h in self.horizons)
+
+    @property
     def label(self) -> str:
-        """A short name, e.g. ``extra log-dd -var -ret-cumlog``."""
+        """A short name, e.g. ``extra log-dd -var -ret-cumlog -5d``."""
         parts = [self.feature_set] + (["log-dd"] if self.log_dd else [])
-        return " ".join(parts + [f"-{name}" for name in self.removed])
+        return " ".join(parts + [f"-{name}" for name in self.removed]
+                        + [f"-{h}d" for h in self.horizons])
 
     @property
     def cli(self) -> str:
         """The command line options that reproduce the configuration in `run_pipeline.py`."""
         parts = [f"--feature-set {self.feature_set}"] + (["--log-dd"] if self.log_dd else [])
-        return " ".join(parts + [f"--remove-series {name}" for name in self.remove_series])
+        return " ".join(parts + [f"--remove-series {name}" for name in self.remove_series]
+                        + [f"--remove-horizon {h}" for h in self.remove_horizons])
 
 
 @dataclass
 class SearchGroup:
     """
     The candidates sharing a feature set and a downside deviation scale, and the state of
-    the search over the series that may be removed from them.
+    the search over the series and horizons that may be removed from them.
 
     Attributes
     ----------
-    feature_set, log_dd, fixed
+    feature_set, log_dd, fixed, fixed_horizons
         See `Candidate`.
 
     columns : list of str
         The columns of the group's full matrix, the user's removals already applied.
 
     pool : list of str
-        The series the search may remove: every series of `columns` except those holding a
-        pinned feature.
+        What the search may remove: series names (``"var"``) and ``@``-marked horizons
+        (``"@5"``), depending on the removal unit, except those holding a pinned feature.
 
     mode : str
         The removal search actually run for the group, one of `REMOVAL_MODES` but "auto".
 
     current : tuple of str
-        Greedy search only: the series removed so far.
+        Greedy search only: the pool items removed so far.
 
     current_score : float
         Greedy search only: the IS Sharpe ratio of `current`.
@@ -156,20 +180,30 @@ class SearchGroup:
     columns: list
     pool: list
     mode: str
+    fixed_horizons: tuple = ()
     current: tuple = ()
     current_score: float = np.nan
     done: bool = False
     steps: list = field(default_factory=list)
 
     def candidate(self, removed=()) -> Candidate:
-        """The candidate removing `removed` on top of the user's removals, in pool order."""
-        removed = tuple(name for name in self.pool if name in set(removed))
-        return Candidate(self.feature_set, self.log_dd, removed, self.fixed)
+        """The candidate removing the pool items `removed` on top of the user's removals."""
+        removed = set(removed)
+        items = [item for item in self.pool if item in removed]
+        series = tuple(item for item in items if not item.startswith(HORIZON_MARK))
+        # series go first, so a horizon whose every column a removed series already took
+        # ("paper -DD" and the 10 days of DD_10) adds nothing -- and would name no column
+        left = {h for col in self.remaining(series) for h in feature_horizons(col)}
+        horizons = tuple(item[len(HORIZON_MARK):] for item in items
+                         if item.startswith(HORIZON_MARK) and item[len(HORIZON_MARK):] in left)
+        return Candidate(self.feature_set, self.log_dd, series, self.fixed, horizons,
+                         self.fixed_horizons)
 
     def remaining(self, removed) -> list:
-        """The columns left once the series of `removed` are taken out."""
+        """The columns left once the pool items of `removed` are taken out."""
         removed = set(removed)
-        return [col for col in self.columns if feature_series_name(col) not in removed]
+        return [col for col in self.columns if feature_series_name(col) not in removed
+                and not any(HORIZON_MARK + h in removed for h in feature_horizons(col))]
 
     @property
     def name(self) -> str:
@@ -221,7 +255,18 @@ def _matching_specs(columns, specs) -> list:
     return out
 
 
-def _pinned_columns(columns, pin_features, feature_set, log_dd, fixed) -> list:
+def _matching_horizons(columns, horizons) -> list:
+    """The horizons that match at least one of `columns`, normalized, in order."""
+    present = set(feature_horizon_set(columns))
+    out = []
+    for spec in horizons or ():
+        horizon = normalize_horizon(spec)
+        if horizon in present and horizon not in out:
+            out.append(horizon)
+    return out
+
+
+def _pinned_columns(columns, pin_features, feature_set, log_dd, fixed, fixed_horizons=()) -> list:
     """
     The pinned columns of a group, resolved one specification at a time.
 
@@ -234,7 +279,8 @@ def _pinned_columns(columns, pin_features, feature_set, log_dd, fixed) -> list:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 pinned += resolve_pinned_features(columns, [spec], ver=feature_set,
-                                                  log_dd=log_dd, remove_series=fixed)
+                                                  log_dd=log_dd, remove_series=fixed,
+                                                  remove_horizons=fixed_horizons)
         except KeyError:
             continue
     return list(dict.fromkeys(pinned))
@@ -247,9 +293,11 @@ def build_groups(feature_sets,
                  pin_features=None,
                  model: str = "jm",
                  removal: str = "auto",
-                 max_subsets: int = DEFAULT_MAX_SUBSETS) -> list:
+                 max_subsets: int = DEFAULT_MAX_SUBSETS,
+                 unit: str = "series",
+                 remove_horizons=None) -> list:
     """
-    Lay out the (feature set, log-DD) groups of a search and the series each may remove.
+    Lay out the (feature set, log-DD) groups of a search and what each may remove.
 
     Parameters
     ----------
@@ -280,10 +328,23 @@ def build_groups(feature_sets,
     max_subsets : int, optional (default=64)
         Under "auto", the largest number of removal subsets searched exhaustively.
 
+    unit : str, optional (default="series")
+        One of `REMOVAL_UNITS`: what one removal takes out -- a series (``var``: the rolling
+        variance at every window), a horizon (``5``: every column measured over 5 days, see
+        `features.resolve_removed_horizons`), or either, in which case the pool holds both
+        and a candidate can drop, say, the rolling variance and the 5-day columns together.
+        Custom variables carry no horizon, so only the series unit can remove them.
+
+    remove_horizons : iterable of str, optional
+        The user's ``--remove-horizon``. Those matching a group's columns are removed in
+        every candidate of that group, like `remove_series`.
+
     Returns
     -------
     list of SearchGroup
     """
+    if unit not in REMOVAL_UNITS:
+        raise ValueError(f"지원하지 않는 --search-unit 값입니다: {unit}. 가능한 값: {REMOVAL_UNITS}")
     if removal not in REMOVAL_MODES:
         raise ValueError(f"지원하지 않는 --search-removal 값입니다: {removal}. 가능한 값: {REMOVAL_MODES}")
     custom_columns = [str(col) for col in custom_columns or ()]
@@ -299,15 +360,30 @@ def build_groups(feature_sets,
             fixed = tuple(_matching_specs(all_columns, remove_series))
             columns = [col for col in all_columns
                        if col not in set(resolve_removed_features(all_columns, fixed))]
-            pinned = (_pinned_columns(columns, pin_features, feature_set, log_dd, fixed)
-                      if model == "sjm" else [])
-            kept_series = {feature_series_name(col) for col in pinned}
-            pool = [name for name in feature_series(columns) if name not in kept_series]
+            fixed_horizons = tuple(_matching_horizons(columns, remove_horizons))
+            columns = [col for col in columns
+                       if col not in set(resolve_removed_horizons(columns, fixed_horizons))]
+            pinned = (_pinned_columns(columns, pin_features, feature_set, log_dd, fixed,
+                                      fixed_horizons) if model == "sjm" else [])
+            pool = []
+            if unit in ("series", "both"):
+                kept_series = {feature_series_name(col) for col in pinned}
+                pool += [name for name in feature_series(columns) if name not in kept_series]
+            if unit in ("horizon", "both"):
+                kept_horizons = {h for col in pinned for h in feature_horizons(col)}
+                pool += [HORIZON_MARK + h for h in feature_horizon_set(columns)
+                         if h not in kept_horizons]
             mode = removal
             if mode == "auto":
                 mode = "exhaustive" if 2 ** len(pool) - 1 <= max_subsets else "greedy"
-            groups.append(SearchGroup(feature_set, log_dd, fixed, columns, pool, mode))
+            groups.append(SearchGroup(feature_set, log_dd, fixed, columns, pool, mode,
+                                      fixed_horizons))
     return groups
+
+
+def item_label(item: str) -> str:
+    """How a pool item reads in the log: a series as is, a horizon as ``5d``."""
+    return item[len(HORIZON_MARK):] + "d" if item.startswith(HORIZON_MARK) else item
 
 
 def grid_candidates(group: SearchGroup) -> list:
@@ -327,7 +403,7 @@ def grid_candidates(group: SearchGroup) -> list:
 
 
 def greedy_candidates(group: SearchGroup) -> list:
-    """The next step of a greedy elimination: every one-series extension of `current`."""
+    """The next step of a greedy elimination: every one-item extension of `current`."""
     out = []
     for name in group.pool:
         if name in group.current:
@@ -645,7 +721,8 @@ class FeatureSearch:
         """The feature matrix of a candidate."""
         return build_features(self.signal_ret, ver=candidate.feature_set, warmup=self.warmup,
                               log_dd=candidate.log_dd, extra_features=self.extra_df,
-                              remove_series=candidate.remove_series or None)
+                              remove_series=candidate.remove_series or None,
+                              remove_horizons=candidate.remove_horizons or None)
 
     def first_refit(self, candidate: Candidate):
         """The first day of the candidate's online regimes, found without fitting anything."""
@@ -664,7 +741,8 @@ class FeatureSearch:
         kwargs = dict(self.fit_kwargs)
         if self.pin_features and kwargs.get("model", "jm") == "sjm":
             kwargs["pin_feats"] = _pinned_columns(X.columns, self.pin_features, candidate.feature_set,
-                                                  candidate.log_dd, candidate.remove_series)
+                                                  candidate.log_dd, candidate.remove_series,
+                                                  candidate.remove_horizons)
         return kwargs
 
     def score(self, record: SearchRecord) -> float:
@@ -734,7 +812,9 @@ def run_search(signal_ret: pd.Series,
                feature_sets=None,
                log_dd_mode: str = "both",
                removal: str = "auto",
+               unit: str = "series",
                remove_series=None,
+               remove_horizons=None,
                pin_features=None,
                max_subsets: int = DEFAULT_MAX_SUBSETS,
                min_improve: float = 0.,
@@ -768,11 +848,12 @@ def run_search(signal_ret: pd.Series,
         The configuration the run was given on the command line, which the winner is judged
         against. Defaults to the "paper" set of the article.
 
-    feature_sets, log_dd_mode, removal, max_subsets
+    feature_sets, log_dd_mode, removal, max_subsets, unit
         The candidates to search, see `build_groups`.
 
-    remove_series, pin_features
-        The user's ``--remove-series`` and ``--pin-feature``, see `build_groups`.
+    remove_series, remove_horizons, pin_features
+        The user's ``--remove-series``, ``--remove-horizon`` and ``--pin-feature``, see
+        `build_groups`.
 
     min_improve : float, optional (default=0.)
         Greedy search only: the smallest rise of the IS Sharpe ratio a removal must bring to
@@ -819,18 +900,29 @@ def run_search(signal_ret: pd.Series,
     custom_columns = list(extra_df.columns) if extra_df is not None else []
     groups = build_groups(feature_sets, log_dd_mode=log_dd_mode, custom_columns=custom_columns,
                           remove_series=remove_series, pin_features=pin_features, model=model,
-                          removal=removal, max_subsets=max_subsets)
-    # a removal applies to whichever sets hold what it names ("var" exists in "extra" only),
-    # the baseline included; one that matches no set at all is a typo, as in a plain run
+                          removal=removal, max_subsets=max_subsets, unit=unit,
+                          remove_horizons=remove_horizons)
+    # a removal applies to whichever sets hold what it names ("var" exists in "extra" only,
+    # the 10-day horizon in "paper" and "extra"), the baseline included; one that matches no
+    # set at all is a typo, as in a plain run
     baseline_columns = feature_set_columns(baseline.feature_set, log_dd=baseline.log_dd) + custom_columns
-    baseline = Candidate(baseline.feature_set, baseline.log_dd, (),
-                         tuple(_matching_specs(baseline_columns, baseline.fixed)))
+    baseline_fixed = tuple(_matching_specs(baseline_columns, baseline.fixed))
+    baseline_columns = [col for col in baseline_columns
+                        if col not in set(resolve_removed_features(baseline_columns, baseline_fixed))]
+    baseline = Candidate(baseline.feature_set, baseline.log_dd, (), baseline_fixed, (),
+                         tuple(_matching_horizons(baseline_columns, baseline.fixed_horizons)))
     unmatched = [spec for spec in remove_series or ()
                  if spec not in baseline.fixed and not any(spec in group.fixed for group in groups)]
     if unmatched:
         raise KeyError(f"제거할 피처 {unmatched}가 탐색하는 어느 피처 세트에도 없습니다. "
                        f"시리즈 이름(예: 'var'), 개별 피처 이름(예: 'var_20'), 또는 커스텀 변수 지정"
                        f"(예: 'VIX:ewm:20') 중 하나여야 합니다.")
+    unmatched = [spec for spec in remove_horizons or ()
+                 if normalize_horizon(spec) not in baseline.fixed_horizons
+                 and not any(normalize_horizon(spec) in group.fixed_horizons for group in groups)]
+    if unmatched:
+        raise KeyError(f"제거할 기간 {unmatched}가 탐색하는 어느 피처 세트에도 없습니다 "
+                       f"(paper: 10·20·60일, example: 5·20·60일, extra: 5·10·20·60일).")
     buy_bps, sell_bps = resolve_cost_bps(strategy_kwargs.get("cost_bps", 10.),
                                          strategy_kwargs.get("buy_cost_bps"),
                                          strategy_kwargs.get("sell_cost_bps"))
@@ -857,8 +949,13 @@ def run_search(signal_ret: pd.Series,
             print(f"\n변수 옵션 탐색: 그룹 {len(groups)}개, 1단계 후보 {n_grid}개 "
                   f"(병렬 {search.jobs}개, 실행 한도 {max_runs}회)")
             for group in groups:
-                print(f"  · {group.name:<14} 피처 {len(group.columns):>2}개, 제거 후보 시리즈 "
-                      f"{len(group.pool)}개 → {group.mode}")
+                n_series = sum(not item.startswith(HORIZON_MARK) for item in group.pool)
+                horizons = [item_label(item) for item in group.pool if item.startswith(HORIZON_MARK)]
+                pool = (f"시리즈 {n_series}개" if unit != "horizon" else "") + \
+                       (" + " if unit == "both" else "") + \
+                       (f"기간 {len(horizons)}개({'·'.join(horizons)})" if unit != "series" else "")
+                print(f"  · {group.name:<14} 피처 {len(group.columns):>2}개, 제거 후보 {pool} "
+                      f"→ {group.mode}")
             print(f"선택(IS) 구간 {is_start} ~ {oos_start_date} 전일, "
                   f"검증(OOS) 구간 {oos_start_date} ~ {end} — 순위는 IS Sharpe로만 매깁니다.")
 
@@ -897,13 +994,13 @@ def run_search(signal_ret: pd.Series,
                     continue
                 best_score, best = max(scored, key=lambda pair: pair[0])
                 if best_score > group.current_score + min_improve:
-                    added = [name for name in best.removed if name not in group.current]
+                    added = [item_label(item) for item in best.items if item not in group.current]
                     group.steps.append({"step": step, "removed": added[0] if added else "",
                                         "from": group.current_score, "to": best_score})
                     if verbose:
                         print(f"  → {group.name}: -{added[0] if added else '?'} 채택 "
                               f"(IS Sharpe {group.current_score:.3f} → {best_score:.3f})")
-                    group.current, group.current_score = best.removed, best_score
+                    group.current, group.current_score = best.items, best_score
                 else:
                     group.done = True
                     if verbose:
@@ -969,6 +1066,7 @@ def summarize_search(search: FeatureSearch,
         candidate = record.candidate
         row = {"label": candidate.label, "feature_set": candidate.feature_set,
                "log_dd": candidate.log_dd, "removed": " ".join(candidate.removed),
+               "removed_horizons": " ".join(candidate.horizons),
                "n_features": len(record.columns), "stage": record.stage,
                "is_baseline": record is base_record}
         for period, values in metrics.items():
@@ -984,6 +1082,7 @@ def summarize_search(search: FeatureSearch,
     for record in failed:
         rows.append({"label": record.candidate.label, "feature_set": record.candidate.feature_set,
                      "log_dd": record.candidate.log_dd, "removed": " ".join(record.candidate.removed),
+                     "removed_horizons": " ".join(record.candidate.horizons),
                      "n_features": len(record.columns), "stage": record.stage,
                      "is_baseline": record is base_record, "features": " ".join(record.columns),
                      "cli": record.candidate.cli, "error": record.error})

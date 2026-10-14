@@ -79,6 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="피처 시리즈를 통째로 제거. 예: --remove-series var 는 var_5·var_20·var_60을 "
                             "모두 뺍니다. 개별 피처 이름(var_20, ret-cumlog)이나 커스텀 변수 지정"
                             "(VIX:ewm:20)도 받으며, 여러 번 지정할 수 있습니다")
+    group.add_argument("--remove-horizon", action="append", default=None, metavar="DAYS",
+                       help="기간(거래일)을 통째로 제거. 예: --remove-horizon 5 는 ret_5·sortino_5·std_5·DD_5 등 "
+                            "5일로 잰 피처를 모두 빼고, 5일 변동성을 쓰는 vol-ratio_5-20 도 뺍니다. "
+                            "기간이 없는 피처(ret-cumlog, 커스텀 변수)는 영향이 없습니다. 여러 번 지정할 수 있습니다")
     group.add_argument("--warmup", type=int, default=252, help="EWM 워밍업으로 버릴 초기 행 수")
 
     group = parser.add_argument_group("커스텀 변수")
@@ -192,6 +196,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "greedy: IS Sharpe를 가장 올리는 시리즈를 하나씩 빼는 후진 제거 / "
                             "single: 한 시리즈씩만 제거 / none: 제거 없이 세트만 비교 / "
                             "auto: 부분집합이 --search-max-subsets 이하면 exhaustive, 아니면 greedy")
+    group.add_argument("--search-unit", default="series", choices=("series", "horizon", "both"),
+                       help="제거 단위. series: 통계 종류별(var → var_5·var_20·var_60) / "
+                            "horizon: 기간별(5일 → ret_5·sortino_5·std_5·DD_5 …) / both: 둘을 섞어 "
+                            "(예: var 와 5일을 함께 제거)")
     group.add_argument("--search-max-subsets", type=int, default=64,
                        help="auto 에서 exhaustive 로 돌릴 최대 부분집합 수 (paper 3개, example 7개, "
                             "extra 는 2^15-1개라 greedy)")
@@ -453,6 +461,7 @@ def prepare_inputs(input_path: str,
                    feature_set: str = "paper",
                    log_dd: bool = False,
                    remove_series=None,
+                   remove_horizons=None,
                    warmup: int = 252,
                    extra_features=None,
                    extra_file: str = None,
@@ -511,18 +520,20 @@ def prepare_inputs(input_path: str,
         verbose=verbose)
 
     X = build_features(data.signal_ret, ver=feature_set, warmup=warmup, log_dd=log_dd,
-                       extra_features=extra_df, remove_series=remove_series)
+                       extra_features=extra_df, remove_series=remove_series,
+                       remove_horizons=remove_horizons)
     if verbose:
-        if remove_series:
+        if remove_series or remove_horizons:
             built = (feature_set_columns(feature_set, log_dd=log_dd)
                      + (list(extra_df.columns) if extra_df is not None else []))
             dropped = [col for col in built if col not in set(X.columns)]
-            print(f"제거한 피처: {dropped} ({len(dropped)}/{len(built)}개, 지정: {list(remove_series)})")
+            given = list(remove_series or []) + [f"{h}일" for h in remove_horizons or []]
+            print(f"제거한 피처: {dropped} ({len(dropped)}/{len(built)}개, 지정: {given})")
         print(f"피처({feature_set}): {list(X.columns)} / {len(X)}행, {X.index[0]} ~ {X.index[-1]}")
 
     # feature-set names such as "paper" become the columns they stand for
     pinned = resolve_pinned_features(X.columns, pin_features, ver=feature_set, log_dd=log_dd,
-                                     remove_series=remove_series)
+                                     remove_series=remove_series, remove_horizons=remove_horizons)
     if verbose and pinned and model == "sjm":       # `run_rolling_jm` warns and ignores them otherwise
         print(f"고정 피처: {pinned} ({len(pinned)}/{X.shape[1]}개, 재추정마다 항상 유지)")
 
@@ -633,6 +644,7 @@ def run_inference(input_path: str,
                   feature_set: str = "paper",
                   log_dd: bool = False,
                   remove_series=None,
+                  remove_horizons=None,
                   warmup: int = 252,
                   extra_features=None,
                   extra_file: str = None,
@@ -715,7 +727,8 @@ def run_inference(input_path: str,
     data, X, pinned = prepare_inputs(
         input_path, sheet=sheet, date_col=date_col, close_col=close_col, rf_col=rf_col,
         rf_unit=rf_unit, trading_days=trading_days, start_date=start_date, end_date=end_date,
-        feature_set=feature_set, log_dd=log_dd, remove_series=remove_series, warmup=warmup,
+        feature_set=feature_set, log_dd=log_dd, remove_series=remove_series,
+        remove_horizons=remove_horizons, warmup=warmup,
         extra_features=extra_features, extra_file=extra_file, extra_sheet=extra_sheet,
         extra_date_col=extra_date_col, bench_col=bench_col, bench_file=bench_file,
         bench_sheet=bench_sheet, bench_date_col=bench_date_col,
@@ -826,6 +839,7 @@ def run_pipeline(input_path: str,
                  feature_set: str = "paper",
                  log_dd: bool = False,
                  remove_series=None,
+                 remove_horizons=None,
                  warmup: int = 252,
                  extra_features=None,
                  extra_file: str = None,
@@ -941,7 +955,8 @@ def run_pipeline(input_path: str,
     data, X, pinned = prepare_inputs(
         input_path, sheet=sheet, date_col=date_col, close_col=close_col, rf_col=rf_col,
         rf_unit=rf_unit, trading_days=trading_days, start_date=start_date, end_date=end_date,
-        feature_set=feature_set, log_dd=log_dd, remove_series=remove_series, warmup=warmup,
+        feature_set=feature_set, log_dd=log_dd, remove_series=remove_series,
+        remove_horizons=remove_horizons, warmup=warmup,
         extra_features=extra_features, extra_file=extra_file, extra_sheet=extra_sheet,
         extra_date_col=extra_date_col, bench_col=bench_col, bench_file=bench_file,
         bench_sheet=bench_sheet, bench_date_col=bench_date_col,
@@ -1195,6 +1210,7 @@ def run_feature_search(input_path: str,
                        feature_set: str = "paper",
                        log_dd: bool = False,
                        remove_series=None,
+                       remove_horizons=None,
                        warmup: int = 252,
                        extra_features=None,
                        extra_file: str = None,
@@ -1230,6 +1246,7 @@ def run_feature_search(input_path: str,
                        search_sets="paper,example,extra",
                        search_log_dd: str = "both",
                        search_removal: str = "auto",
+                       search_unit: str = "series",
                        search_max_subsets: int = 64,
                        search_min_improve: float = 0.,
                        search_oos_start=None,
@@ -1260,8 +1277,11 @@ def run_feature_search(input_path: str,
     does. A walk-forward re-selection within the OOS part and the deflated Sharpe ratio
     complete the picture, see `feature_search`.
 
-    `remove_series` is removed from every candidate as well, and the series holding a feature
-    pinned through `pin_features` (sparse model only) are never removed.
+    `search_unit` decides what one removal takes out: a whole series (the statistic at every
+    horizon), a whole horizon (every statistic measured over, say, 5 days), or either.
+    `remove_series` and `remove_horizons` are removed from every candidate as well, and the
+    series and horizons holding a feature pinned through `pin_features` (sparse model only)
+    are never removed.
 
     Parameters
     ----------
@@ -1299,12 +1319,14 @@ def run_feature_search(input_path: str,
                       max_feats=max_feats, cont=cont, grid_size=grid_size)
     strategy_kwargs = dict(delay=delay, cost_bps=cost_bps, buy_cost_bps=buy_cost_bps,
                            sell_cost_bps=sell_cost_bps, min_cash=min_cash, max_cash=max_cash)
-    baseline = Candidate(feature_set, log_dd, (), tuple(remove_series or ()))
+    baseline = Candidate(feature_set, log_dd, (), tuple(remove_series or ()), (),
+                         tuple(remove_horizons or ()))
 
     # the pins are resolved per candidate, since a removal can change what a group name holds
     out = run_search(data.signal_ret, bt_ret, bt_rf, extra_df=extra_df, baseline=baseline,
                      feature_sets=search_sets, log_dd_mode=search_log_dd,
-                     removal=search_removal, remove_series=remove_series,
+                     removal=search_removal, unit=search_unit, remove_series=remove_series,
+                     remove_horizons=remove_horizons,
                      pin_features=pin_features, max_subsets=search_max_subsets,
                      min_improve=search_min_improve, oos_start=search_oos_start,
                      oos_frac=search_oos_frac, wf_folds=search_wf_folds, jobs=search_jobs,
@@ -1347,13 +1369,13 @@ def run_feature_search(input_path: str,
         print(f"  {'순위':>4}  {'조합':<38} {'피처':>4} {'IS':>7} {'OOS':>7} {'전체':>7}")
         for rank, row in top.iterrows():
             mark = " *" if row["is_baseline"] else ""
-            print(f"  {rank:>4}  {row['label'][:38]:<38} {int(row['n_features']):>4} "
+            print(f"  {rank:>4}  {_clip(row['label']):<38} {int(row['n_features']):>4} "
                   f"{row['sharpe_is']:>7.3f} {row['sharpe_oos']:>7.3f} {row['sharpe_full']:>7.3f}{mark}")
         if not results.head(search_top)["is_baseline"].any():
             base = results.loc[results["is_baseline"]].iloc[0]
-            print(f"  {base.name:>4}  {base['label'][:38]:<38} {int(base['n_features']):>4} "
+            print(f"  {base.name:>4}  {_clip(base['label']):<38} {int(base['n_features']):>4} "
                   f"{base['sharpe_is']:>7.3f} {base['sharpe_oos']:>7.3f} {base['sharpe_full']:>7.3f} *")
-        print("  (* 기준 설정 = 명령줄로 준 피처 옵션)")
+        print("  (* 기준 설정 = 명령줄로 준 피처 옵션, …는 잘린 이름 — 전체는 search_results.csv)")
         print("-" * 72)
         gap = summary["best_sharpe_oos"] - summary["baseline_sharpe_oos"]
         print(f"Buy & hold  : IS {summary['bh_sharpe_is']:6.3f} / OOS {summary['bh_sharpe_oos']:6.3f}")
@@ -1388,6 +1410,12 @@ def run_feature_search(input_path: str,
     return out
 
 
+def _clip(text: str, width: int = 38) -> str:
+    """Cut a label to `width` characters for the console table, marking the cut."""
+    text = str(text)
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
 def main(argv=None) -> int:
     """Parse the command line arguments and run the pipeline, a single inference, or a search."""
     args = build_parser().parse_args(argv)
@@ -1401,7 +1429,8 @@ def main(argv=None) -> int:
                            rf_unit=args.rf_unit, trading_days=args.trading_days,
                            start_date=args.start_date, end_date=args.end_date,
                            feature_set=args.feature_set, log_dd=args.log_dd,
-                           remove_series=args.remove_series, warmup=args.warmup,
+                           remove_series=args.remove_series,
+                           remove_horizons=args.remove_horizon, warmup=args.warmup,
                            extra_features=args.extra_feature, extra_file=args.extra_file,
                            extra_sheet=args.extra_sheet, extra_date_col=args.extra_date_col,
                            bench_col=args.bench_col, bench_file=args.bench_file,
@@ -1418,7 +1447,7 @@ def main(argv=None) -> int:
                            buy_cost_bps=args.buy_cost_bps, sell_cost_bps=args.sell_cost_bps,
                            min_cash=args.min_cash, max_cash=args.max_cash,
                            search_sets=args.search_sets, search_log_dd=args.search_log_dd,
-                           search_removal=args.search_removal,
+                           search_removal=args.search_removal, search_unit=args.search_unit,
                            search_max_subsets=args.search_max_subsets,
                            search_min_improve=args.search_min_improve,
                            search_oos_start=args.search_oos_start,
@@ -1439,7 +1468,8 @@ def main(argv=None) -> int:
                       rf_unit=args.rf_unit, trading_days=args.trading_days,
                       start_date=args.start_date, end_date=args.end_date,
                       feature_set=args.feature_set, log_dd=args.log_dd,
-                      remove_series=args.remove_series, warmup=args.warmup,
+                      remove_series=args.remove_series,
+                      remove_horizons=args.remove_horizon, warmup=args.warmup,
                       extra_features=args.extra_feature, extra_file=args.extra_file,
                       extra_sheet=args.extra_sheet, extra_date_col=args.extra_date_col,
                       bench_col=args.bench_col, bench_file=args.bench_file,
@@ -1462,7 +1492,8 @@ def main(argv=None) -> int:
                  rf_unit=args.rf_unit, trading_days=args.trading_days,
                  start_date=args.start_date, end_date=args.end_date,
                  feature_set=args.feature_set, log_dd=args.log_dd,
-                 remove_series=args.remove_series, warmup=args.warmup,
+                 remove_series=args.remove_series,
+                 remove_horizons=args.remove_horizon, warmup=args.warmup,
                  extra_features=args.extra_feature, extra_file=args.extra_file,
                  extra_sheet=args.extra_sheet, extra_date_col=args.extra_date_col,
                  bench_col=args.bench_col, bench_file=args.bench_file,

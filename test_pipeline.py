@@ -24,8 +24,9 @@ from data_io import (attach_benchmark, load_benchmark_series, load_market_data,
                      relative_return, resolve_signal_return)
 from features import (EXAMPLE_HLS, EXTRA_DD_HLS, EXTRA_WINDOWS, FEATURE_SETS, apply_transform,
                       build_extra_features, build_features, compute_ewm_DD, feature_engineer,
-                      feature_series, feature_series_name, feature_set_columns, parse_extra_spec,
-                      resolve_pinned_features, resolve_removed_features)
+                      feature_horizons, feature_series, feature_series_name, feature_set_columns,
+                      normalize_horizon, parse_extra_spec, resolve_pinned_features,
+                      resolve_removed_features, resolve_removed_horizons)
 from hmm_benchmark import smooth_states
 from regime_episodes import (align_paths, compare_episode_paths, episode_metrics,
                              extract_episodes, length_scenarios, normalized_path,
@@ -189,6 +190,49 @@ def test_remove_series():
         raise AssertionError("피처를 모두 제거하면 ValueError를 내야 합니다.")
     except ValueError:
         pass
+
+
+def test_remove_horizon():
+    """A horizon takes out every statistic measured over it, and nothing without a horizon."""
+    assert feature_horizons("std_20") == ["20"]
+    assert feature_horizons("vol-ratio_5-20") == ["5", "20"]
+    assert feature_horizons("ret-cumlog") == [] and feature_horizons("VIX_ewm20") == []
+    assert normalize_horizon(5) == normalize_horizon("5d") == normalize_horizon(" 5일") == "5"
+
+    ret = pd.Series(np.random.default_rng(3).normal(0., .01, 600),
+                    index=pd.bdate_range("2020-01-01", periods=600).date)
+    extra = pd.DataFrame({"VIX_ewm20": np.linspace(10., 20., 600)}, index=ret.index)
+    full = build_features(ret, ver="extra", warmup=100, extra_features=extra)
+    cut = build_features(ret, ver="extra", warmup=100, extra_features=extra, remove_horizons=["5"])
+    dropped = [col for col in full.columns if col not in cut.columns]
+    assert dropped == resolve_removed_horizons(full.columns, ["5"])
+    # every 5-day statistic, and the ratio that needs the 5-day volatility
+    for col in ("ret_5", "sortino_5", "std_5", "var_5", "mad_5", "rms_5", "vol-log_5",
+                "vol-chg_5", "DD_5", "vol-ratio_5-20"):
+        assert col in dropped, col
+    assert "vol-ratio_20-60" in cut.columns and "ret-cumlog" in cut.columns
+    assert "VIX_ewm20" in cut.columns
+    # the column list without computing anything agrees with the matrix
+    assert feature_set_columns("extra", remove_horizons=["5"]) == [
+        col for col in cut.columns if col != "VIX_ewm20"]
+    # series and horizon removals combine
+    both = build_features(ret, ver="extra", warmup=100, remove_series=["var"], remove_horizons=["5", "60"])
+    assert not [col for col in both.columns if col.startswith("var_")]
+    assert not [col for col in both.columns if set(feature_horizons(col)) & {"5", "60"}]
+    # a horizon the set does not use is a typo
+    try:
+        build_features(ret, ver="example", warmup=100, remove_horizons=["10"])
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("the example set has no 10-day column")
+    # and a pinned feature cannot be removed through its horizon
+    try:
+        resolve_pinned_features(cut.columns, ["sortino_5"], ver="extra", remove_horizons=["5"])
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("sortino_5 was removed with the 5-day horizon")
 
 
 def test_remove_custom_variable():
@@ -1339,6 +1383,44 @@ def test_search_respects_removals_and_pins():
     assert "sortino" in plain.pool
 
 
+def test_search_by_horizon():
+    """The horizon unit removes whole horizons; "both" mixes them with series."""
+    by_horizon = build_groups(["paper", "example", "extra"], log_dd_mode="off", unit="horizon",
+                              custom_columns=["VIX_ewm20"])
+    pools = {group.name: group.pool for group in by_horizon}
+    assert pools == {"paper": ["@10", "@20", "@60"], "example": ["@5", "@20", "@60"],
+                     "extra": ["@5", "@10", "@20", "@60"]}
+    extra = by_horizon[2]
+    assert extra.mode == "exhaustive" and len(grid_candidates(extra)) == 2 ** 4
+    # with the custom variable left over, even removing every horizon leaves a matrix
+    assert extra.remaining(extra.pool) == ["ret-simple", "ret-log", "ret-abs", "ret-sq",
+                                           "ret-cumlog", "VIX_ewm20"]
+    candidate = extra.candidate(("@60", "@5"))
+    assert candidate.horizons == ("5", "60") and candidate.removed == ()
+    assert candidate.label == "extra -5d -60d"
+    assert candidate.cli == "--feature-set extra --remove-horizon 5 --remove-horizon 60"
+    # without a custom variable, removing every horizon of "paper" would empty it
+    paper = build_groups(["paper"], log_dd_mode="off", unit="horizon")[0]
+    assert len(grid_candidates(paper)) == 7
+
+    both = build_groups(["example"], log_dd_mode="off", unit="both")[0]
+    assert both.pool == ["ret", "DD-log", "sortino", "@5", "@20", "@60"]
+    # a horizon a removed series already emptied is dropped, so the candidate is the series alone
+    paper = build_groups(["paper"], log_dd_mode="off", unit="both")[0]
+    assert paper.candidate(("DD", "@10")) == paper.candidate(("DD",))
+    assert len({c.label for c in grid_candidates(paper)}) < len(grid_candidates(paper))
+    mixed = both.candidate(("@5", "sortino"))
+    assert mixed.label == "example -sortino -5d"
+    assert both.remaining(mixed.items) == ["ret_20", "DD-log_20", "ret_60", "DD-log_60"]
+
+    # a pinned column keeps its horizon in the matrix, and the user's horizons stay removed
+    pinned = build_groups(["extra"], log_dd_mode="off", unit="horizon", model="sjm",
+                          pin_features=["sortino_60"], remove_horizons=["10"])[0]
+    assert pinned.pool == ["@5", "@20"] and pinned.fixed_horizons == ("10",)
+    assert pinned.candidate(("@5",)).cli == ("--feature-set extra --remove-horizon 10 "
+                                              "--remove-horizon 5")
+
+
 def test_split_periods():
     """The OOS part is the tail of the evaluation period, given as a share or as a date."""
     index = pd.Index(pd.bdate_range("2020-01-01", periods=1000).date)
@@ -1447,6 +1529,26 @@ def test_run_feature_search_end_to_end():
         names = sorted(os.path.basename(path) for path in out["written"])
         assert names == ["search_results.csv", "search_returns.csv", "search_summary.csv",
                          "search_walkforward.csv"]
+
+
+def test_run_feature_search_by_horizon():
+    """A horizon search runs end to end and its recommendation reproduces through the options."""
+    with tempfile.TemporaryDirectory() as folder:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = run_feature_search(_write_sample_input(folder), outdir=folder,
+                                     feature_set="paper", warmup=60, jump_penalty=10.,
+                                     window=300, min_window=250, n_init=2,
+                                     search_sets="paper", search_log_dd="off",
+                                     search_unit="horizon", search_jobs=1, plot=False,
+                                     verbose=False)
+        results = out["results"]
+        # the 7 non-empty horizon subsets of paper's 10/20/60 days
+        assert len(results) == 7
+        assert set(results["removed_horizons"]) == {"", "10", "20", "60", "10 20", "10 60", "20 60"}
+        row = results.loc[results["removed_horizons"] == "10 60"].iloc[0]
+        assert row["features"] == "sortino_20"
+        assert row["cli"] == "--feature-set paper --remove-horizon 10 --remove-horizon 60"
 
 
 def main() -> int:
