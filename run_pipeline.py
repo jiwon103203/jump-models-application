@@ -191,20 +191,21 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--search-log-dd", default="both", choices=("both", "off", "on"),
                        help="--log-dd 를 켠 경우와 끈 경우를 모두(both) / 끈 경우만(off) / 켠 경우만(on) 탐색")
     group.add_argument("--search-removal", default="auto",
-                       choices=("auto", "exhaustive", "greedy", "single", "none"),
-                       help="시리즈 제거 탐색 방식. exhaustive: 제거 가능한 시리즈의 모든 부분집합 / "
-                            "greedy: IS Sharpe를 가장 올리는 시리즈를 하나씩 빼는 후진 제거 / "
-                            "single: 한 시리즈씩만 제거 / none: 제거 없이 세트만 비교 / "
-                            "auto: 부분집합이 --search-max-subsets 이하면 exhaustive, 아니면 greedy")
+                       choices=("auto", "exhaustive", "forward", "backward", "greedy", "single", "none"),
+                       help="변수 조합 탐색 방식. exhaustive: 제거 가능한 항목의 모든 부분집합 / "
+                            "forward: 빈 상태에서 IS Sharpe를 가장 올리는 시리즈를 하나씩 늘리는 전진 선택 / "
+                            "backward(=greedy): 전체에서 하나씩 빼는 후진 제거 / "
+                            "single: 한 항목씩만 제거 / none: 제거 없이 세트만 비교 / "
+                            "auto: 부분집합이 --search-max-subsets 이하면 exhaustive, 아니면 forward")
     group.add_argument("--search-unit", default="series", choices=("series", "horizon", "both"),
                        help="제거 단위. series: 통계 종류별(var → var_5·var_20·var_60) / "
                             "horizon: 기간별(5일 → ret_5·sortino_5·std_5·DD_5 …) / both: 둘을 섞어 "
                             "(예: var 와 5일을 함께 제거)")
     group.add_argument("--search-max-subsets", type=int, default=64,
                        help="auto 에서 exhaustive 로 돌릴 최대 부분집합 수 (paper 3개, example 7개, "
-                            "extra 는 2^15-1개라 greedy)")
+                            "extra 는 2^15-1개라 forward)")
     group.add_argument("--search-min-improve", type=float, default=0.,
-                       help="greedy 에서 제거를 채택할 최소 IS Sharpe 상승폭 (예: 0.02). "
+                       help="forward/backward 에서 한 단계를 채택할 최소 IS Sharpe 상승폭 (예: 0.02). "
                             "양수로 두면 잡음 수준의 개선을 쫓지 않습니다")
     group.add_argument("--search-oos-start", default=None,
                        help="검증(OOS) 구간 시작일. 미지정 시 평가 구간의 마지막 --search-oos-frac 를 OOS로 둡니다")
@@ -1270,7 +1271,7 @@ def run_feature_search(input_path: str,
     is held at the values given, so that the feature options are the only thing that varies.
 
     The backtest period is split into a selection (IS) part and a hold-out (OOS) part. The
-    configurations are ranked, and the greedy elimination is steered, by the IS Sharpe
+    configurations are ranked, and the forward selection or backward elimination is steered, by the IS Sharpe
     ratio alone; the OOS part then tells whether the winner keeps its edge over the
     baseline -- the configuration given on the command line (`feature_set`, `log_dd`,
     `remove_series`) -- on data the choice never saw. The winner is recommended only if it

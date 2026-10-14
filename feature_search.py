@@ -12,8 +12,8 @@ Two things keep that ranking honest.
 1. **The choice is made on one stretch of history and judged on another.** The backtest
    period is split into a selection (in-sample, IS) part and a hold-out (out-of-sample,
    OOS) part that follows it. Every combination is ranked by its Sharpe ratio over the IS
-   part only, and the greedy elimination of feature series also looks at IS Sharpe ratios
-   only, so the OOS part takes no part in any decision. The regimes themselves are online
+   part only, and the stepwise searches (forward selection, backward elimination) also look
+   at IS Sharpe ratios only, so the OOS part takes no part in any decision. The regimes themselves are online
    in both parts -- each re-estimation sees only the days before it -- so the OOS Sharpe of
    the chosen combination is a genuine out-of-sample number for the *choice* as well as for
    the model parameters.
@@ -29,13 +29,21 @@ The candidates are generated per (feature set, log-DD) group:
 
 - ``exhaustive``: every subset of the removable series is removed in turn (as long as one
   column is left), which is exact but grows as `2^k`;
-- ``greedy``: backward elimination -- remove the series whose removal raises the IS Sharpe
-  ratio the most, and repeat until no removal helps;
+- ``forward``: forward selection -- start from nothing, add the series that gives the best
+  IS Sharpe ratio on its own, then the one that raises it the most alongside it, and repeat
+  until no addition helps; the matrix grows from the few series that carry the signal;
+- ``backward`` (also accepted as ``greedy``): backward elimination -- start from the full
+  set, remove the series whose removal raises the IS Sharpe ratio the most, and repeat until
+  no removal helps;
 - ``single``: the full set and every single-series removal;
 - ``none``: the full set only, which compares feature sets and scales but removes nothing;
 - ``auto`` (default): ``exhaustive`` where it costs at most `max_subsets` runs (the
-  "paper" and "example" sets) and ``greedy`` elsewhere (the 35-column "extra" set, whose
+  "paper" and "example" sets) and ``forward`` elsewhere (the 35-column "extra" set, whose
   15 series would make `2^15` runs).
+
+The same modes apply to horizons (``unit="horizon"``: forward selection then adds 5, 10, 20
+or 60 days back one at a time) and to both together (``unit="both"``: forward selection adds
+series and may drop a horizon on the way).
 
 Series holding a pinned feature (``--pin-feature``, sparse model only) are never removed,
 and series the user removed (``--remove-series``) stay removed in every candidate.
@@ -61,7 +69,9 @@ from features import (FEATURE_SETS, build_features, feature_horizon_set, feature
 from rolling import refit_schedule, run_rolling_jm
 
 TRADING_DAYS = 252
-REMOVAL_MODES = ("auto", "exhaustive", "greedy", "single", "none")
+REMOVAL_MODES = ("auto", "exhaustive", "forward", "backward", "single", "none")
+STEPWISE_MODES = ("forward", "backward")       # the modes that walk one item at a time
+MODE_ALIASES = {"greedy": "backward"}          # the name backward elimination first shipped under
 REMOVAL_UNITS = ("series", "horizon", "both")   # what one removal step takes out of the matrix
 HORIZON_MARK = "@"             # marks a horizon in a removal pool: "@5" is every 5-day column
 LOG_DD_MODES = ("both", "off", "on")
@@ -103,6 +113,12 @@ class Candidate:
 
     fixed_horizons : tuple of str
         The horizons the user removed (``--remove-horizon``) that apply to this feature set.
+
+    shown : str or None
+        Forward selection only, and for display only: the label suffix listing what the
+        selection added back (``+std +DD``). A forward candidate removes most of its set, so
+        its label names what it kept rather than the dozen series it removed. It does not take
+        part in equality: two candidates removing the same things are the same configuration.
     """
     feature_set: str
     log_dd: bool = False
@@ -110,6 +126,7 @@ class Candidate:
     fixed: tuple = ()
     horizons: tuple = ()
     fixed_horizons: tuple = ()
+    shown: str = field(default=None, compare=False)
 
     @property
     def remove_series(self) -> list:
@@ -128,8 +145,13 @@ class Candidate:
 
     @property
     def label(self) -> str:
-        """A short name, e.g. ``extra log-dd -var -ret-cumlog -5d``."""
+        """
+        A short name: what was removed (``extra log-dd -var -ret-cumlog -5d``), or for a
+        forward candidate what was added back, plus any horizon it removed (``extra +std -5d``).
+        """
         parts = [self.feature_set] + (["log-dd"] if self.log_dd else [])
+        if self.shown is not None:
+            return " ".join(parts + [self.shown])
         return " ".join(parts + [f"-{name}" for name in self.removed]
                         + [f"-{h}d" for h in self.horizons])
 
@@ -186,8 +208,13 @@ class SearchGroup:
     done: bool = False
     steps: list = field(default_factory=list)
 
-    def candidate(self, removed=()) -> Candidate:
-        """The candidate removing the pool items `removed` on top of the user's removals."""
+    def candidate(self, removed=(), forward: bool = False) -> Candidate:
+        """
+        The candidate removing the pool items `removed` on top of the user's removals.
+
+        With `forward`, its label lists what a forward selection added back to its starting
+        point (`forward_start`) -- ``+std +DD`` -- and any horizon it removed on the way.
+        """
         removed = set(removed)
         items = [item for item in self.pool if item in removed]
         series = tuple(item for item in items if not item.startswith(HORIZON_MARK))
@@ -196,8 +223,26 @@ class SearchGroup:
         left = {h for col in self.remaining(series) for h in feature_horizons(col)}
         horizons = tuple(item[len(HORIZON_MARK):] for item in items
                          if item.startswith(HORIZON_MARK) and item[len(HORIZON_MARK):] in left)
+        shown = None
+        if forward:
+            start = set(self.forward_start)
+            kept = set(series) | {HORIZON_MARK + h for h in horizons}
+            added = [f"+{item_label(item)}" for item in self.pool if item in start and item not in removed]
+            dropped = [f"-{item_label(item)}" for item in self.pool if item not in start and item in kept]
+            shown = " ".join(added + dropped) or "+(없음)"
         return Candidate(self.feature_set, self.log_dd, series, self.fixed, horizons,
-                         self.fixed_horizons)
+                         self.fixed_horizons, shown)
+
+    @property
+    def forward_start(self) -> tuple:
+        """
+        Where a forward selection starts, as the pool items removed there: every series when
+        the pool has series (the selection then adds series back one at a time, and under the
+        "both" unit may also drop a horizon on the way), or else every horizon (it adds
+        horizons back, starting from the columns that have none).
+        """
+        series = tuple(item for item in self.pool if not item.startswith(HORIZON_MARK))
+        return series or tuple(self.pool)
 
     def remaining(self, removed) -> list:
         """The columns left once the pool items of `removed` are taken out."""
@@ -345,6 +390,7 @@ def build_groups(feature_sets,
     """
     if unit not in REMOVAL_UNITS:
         raise ValueError(f"지원하지 않는 --search-unit 값입니다: {unit}. 가능한 값: {REMOVAL_UNITS}")
+    removal = MODE_ALIASES.get(removal, removal)
     if removal not in REMOVAL_MODES:
         raise ValueError(f"지원하지 않는 --search-removal 값입니다: {removal}. 가능한 값: {REMOVAL_MODES}")
     custom_columns = [str(col) for col in custom_columns or ()]
@@ -375,7 +421,7 @@ def build_groups(feature_sets,
                          if h not in kept_horizons]
             mode = removal
             if mode == "auto":
-                mode = "exhaustive" if 2 ** len(pool) - 1 <= max_subsets else "greedy"
+                mode = "exhaustive" if 2 ** len(pool) - 1 <= max_subsets else "forward"
             groups.append(SearchGroup(feature_set, log_dd, fixed, columns, pool, mode,
                                       fixed_horizons))
     return groups
@@ -389,8 +435,9 @@ def item_label(item: str) -> str:
 def grid_candidates(group: SearchGroup) -> list:
     """
     The candidates a group evaluates up front: all of them for "exhaustive", the full set
-    and its single removals for "single", and the full set alone for "greedy" and "none"
-    (the greedy elimination generates the rest step by step).
+    and its single removals for "single", and the full set alone for "forward", "backward"
+    and "none" -- the stepwise searches generate the rest step by step, and a forward one
+    keeps the full set for reference only.
     """
     if group.mode == "exhaustive":
         subsets = itertools.chain.from_iterable(
@@ -402,15 +449,35 @@ def grid_candidates(group: SearchGroup) -> list:
     return [group.candidate(subset) for subset in subsets if group.remaining(subset)]
 
 
-def greedy_candidates(group: SearchGroup) -> list:
-    """The next step of a greedy elimination: every one-item extension of `current`."""
-    out = []
-    for name in group.pool:
-        if name in group.current:
+def stepwise_candidates(group: SearchGroup) -> list:
+    """
+    The next step of a stepwise search from `group.current` (the pool items removed so far).
+
+    Backward elimination tries removing each item still in the matrix. Forward selection tries
+    adding back each item its starting point removed -- a series (with every horizon of it the
+    matrix still holds) or, under the horizon unit, a horizon -- and, under the "both" unit,
+    also removing a horizon, so that "add DD, then drop the 5-day columns" is a path it can
+    take. A move that leaves the matrix empty or unchanged is skipped.
+    """
+    current = set(group.current)
+    before = group.remaining(current)
+    moves = []
+    if group.mode == "backward":
+        moves = [current | {item} for item in group.pool if item not in current]
+    else:
+        start = set(group.forward_start)
+        moves = [current - {item} for item in group.pool if item in current and item in start]
+        moves += [current | {item} for item in group.pool
+                  if item not in current and item not in start and before]
+    out, seen = [], set()
+    for removed in moves:
+        after = group.remaining(removed)
+        if not after or after == before:
             continue
-        removed = group.current + (name,)
-        if group.remaining(removed):
-            out.append(group.candidate(removed))
+        candidate = group.candidate(removed, forward=group.mode == "forward")
+        if candidate.label not in seen:
+            seen.add(candidate.label)
+            out.append(candidate)
     return out
 
 
@@ -757,7 +824,7 @@ class FeatureSearch:
         Backtest the candidates not seen yet and return the record of every one of them.
 
         Candidates past `max_runs` are dropped with a warning, and the search is marked as
-        capped so that the greedy loop stops.
+        capped so that the stepwise loop stops.
         """
         out, todo, seen = [], [], {}
         for candidate in candidates:
@@ -963,15 +1030,32 @@ def run_search(signal_ret: pd.Series,
         first = [baseline] + [candidate for group in groups for candidate in grid_candidates(group)]
         search.evaluate(first, stage="grid")
 
-        # stage 2+: greedy backward elimination, all greedy groups advancing in lockstep so
-        # that one batch of fits keeps every worker busy
-        greedy = [group for group in groups if group.mode == "greedy"]
-        for group in greedy:
-            group.current_score = search.score(search.by_label[group.candidate().label])
+        # stage 2+: stepwise searches, every stepwise group advancing in lockstep so that one
+        # batch of fits keeps every worker busy. A backward elimination starts from the full
+        # set; a forward selection from its starting point, which is often an empty matrix --
+        # scored -inf, so that its first step takes the best single item whatever it scores
+        stepwise = [group for group in groups if group.mode in STEPWISE_MODES]
+        starts = []
+        for group in stepwise:
+            if group.mode == "forward":
+                group.current = group.forward_start
+                if group.remaining(group.current):
+                    starts.append(group.candidate(group.current, forward=True))
+        search.evaluate(starts, stage="forward-0")
+        for group in stepwise:
+            if group.mode == "backward":
+                group.current_score = search.score(search.by_label[group.candidate().label])
+            elif group.remaining(group.current):
+                label = group.candidate(group.current, forward=True).label
+                group.current_score = (search.score(search.by_label[label])
+                                       if label in search.by_label else np.nan)
+            else:
+                group.current_score = -np.inf
         step = 0
         while not search.capped:
-            active = [group for group in greedy if not group.done and np.isfinite(group.current_score)]
-            batches = {group.name: greedy_candidates(group) for group in active}
+            active = [group for group in stepwise
+                      if not group.done and not np.isnan(group.current_score)]
+            batches = {group.name: stepwise_candidates(group) for group in active}
             for group in active:
                 if not batches[group.name]:
                     group.done = True
@@ -980,11 +1064,11 @@ def run_search(signal_ret: pd.Series,
                 break
             step += 1
             if verbose:
-                print(f"탐욕 제거 {step}단계: " + ", ".join(
-                    f"{group.name}(현재 -{len(group.current)}개, IS {group.current_score:.3f})"
-                    for group in active))
+                print(f"단계별 탐색 {step}단계: " + ", ".join(
+                    f"{group.name}({_direction(group)}, 현재 {_state(group)}, "
+                    f"IS {group.current_score:.3f})" for group in active))
             search.evaluate([c for group in active for c in batches[group.name]],
-                            stage=f"greedy-{step}")
+                            stage=f"step-{step}")
             for group in active:
                 scored = [(search.score(search.by_label[c.label]), c) for c in batches[group.name]
                           if c.label in search.by_label]
@@ -993,18 +1077,22 @@ def run_search(signal_ret: pd.Series,
                     group.done = True
                     continue
                 best_score, best = max(scored, key=lambda pair: pair[0])
-                if best_score > group.current_score + min_improve:
-                    added = [item_label(item) for item in best.items if item not in group.current]
-                    group.steps.append({"step": step, "removed": added[0] if added else "",
+                # the first forward step has nothing to beat: the empty start has no score
+                threshold = group.current_score + (min_improve if np.isfinite(group.current_score) else 0.)
+                if best_score > threshold:
+                    move = _move(group.current, best.items)
+                    group.steps.append({"step": step, "move": move,
                                         "from": group.current_score, "to": best_score})
                     if verbose:
-                        print(f"  → {group.name}: -{added[0] if added else '?'} 채택 "
-                              f"(IS Sharpe {group.current_score:.3f} → {best_score:.3f})")
+                        before = (f"{group.current_score:.3f}" if np.isfinite(group.current_score)
+                                  else "없음")
+                        print(f"  → {group.name}: {move} 채택 (IS Sharpe {before} → {best_score:.3f})")
                     group.current, group.current_score = best.items, best_score
                 else:
                     group.done = True
                     if verbose:
-                        print(f"  → {group.name}: 더 제거해도 IS Sharpe가 오르지 않아 종료 "
+                        verb = "더 제거해도" if group.mode == "backward" else "더 늘려도"
+                        print(f"  → {group.name}: {verb} IS Sharpe가 오르지 않아 종료 "
                               f"(최고 후보 {best_score:.3f} ≤ 현재 {group.current_score:.3f}"
                               f"{f' + {min_improve:g}' if min_improve else ''})")
 
@@ -1016,6 +1104,25 @@ def run_search(signal_ret: pd.Series,
     return summarize_search(search, groups, baseline, is_start, oos_start_date, end,
                             wf_folds=wf_folds, buy_bps=buy_bps, sell_bps=sell_bps,
                             trading_days=trading_days)
+
+
+def _direction(group: SearchGroup) -> str:
+    return "전진 선택" if group.mode == "forward" else "후진 제거"
+
+
+def _state(group: SearchGroup) -> str:
+    """Where a stepwise search stands: items removed, or for forward selection items added."""
+    if group.mode == "backward":
+        return f"-{len(group.current)}개"
+    added = len(set(group.forward_start) - set(group.current))
+    return f"+{added}개"
+
+
+def _move(before, after) -> str:
+    """One stepwise move, as it reads in the log: ``+DD`` (added back) or ``-5d`` (removed)."""
+    before, after = set(before), set(after)
+    return " ".join([f"+{item_label(item)}" for item in sorted(before - after)]
+                    + [f"-{item_label(item)}" for item in sorted(after - before)]) or "?"
 
 
 def summarize_search(search: FeatureSearch,
