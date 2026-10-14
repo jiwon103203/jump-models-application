@@ -3,9 +3,11 @@
 End-to-end pipeline: a csv/Excel file of date, close price and risk-free rate in, and
 regime signals plus a 0/1 strategy backtest out, following Shu, Yu and Mulvey (2024).
 
-Two run modes share the same options: the default backtest, which walks the whole history,
-and `--inference`, which fits once on the window preceding the current half-year and infers
-that half-year alone -- the answer to "what regime are we in now" without the backtest.
+Three run modes share the same options: the default backtest, which walks the whole history;
+`--inference`, which fits once on the window preceding the current half-year and infers
+that half-year alone -- the answer to "what regime are we in now" without the backtest; and
+`--search`, which runs every feature option through the backtest and reports the one with the
+best Sharpe ratio, chosen in sample and checked out of sample.
 
 Example
 -------
@@ -14,6 +16,7 @@ Example
     python run_pipeline.py --input my_index.xlsx --feature-set extra --remove-series var
     python run_pipeline.py --input my_index.xlsx --inference
     python run_pipeline.py --input sector.xlsx --relative-benchmark kospi.xlsx  # 코스피 차감 섹터 신호
+    python run_pipeline.py --input my_index.xlsx --search          # 최적 변수 옵션 탐색 + OOS 검증
 
 Run `python run_pipeline.py --help` for the full list of options.
 """
@@ -172,6 +175,40 @@ def build_parser() -> argparse.ArgumentParser:
                        help="추론 전용 모드. 과거 롤링·백테스트를 건너뛰고, 현재 반기 직전 "
                             "--window 거래일로 한 번만 적합해 현재 반기의 레짐만 추론합니다. "
                             "거래비용·로버스트니스·HMM·국면 분석 옵션은 이 모드에서 쓰이지 않습니다")
+    group.add_argument("--search", action="store_true",
+                       help="변수 옵션 탐색 모드. 피처 세트 × --log-dd × 시리즈 제거 조합을 모두 백테스트해 "
+                            "Sharpe가 가장 높은 조합을 찾고, 과최적화를 막기 위해 IS 구간에서만 고른 뒤 "
+                            "OOS 구간에서 검증합니다. 모델·창·비용 등 나머지 옵션은 주어진 값으로 고정되고, "
+                            "--feature-set/--log-dd/--remove-series 는 비교 기준(baseline)이 됩니다")
+
+    group = parser.add_argument_group("변수 옵션 탐색 (--search 전용)")
+    group.add_argument("--search-sets", default="paper,example,extra",
+                       help="탐색할 피처 세트 (쉼표로 구분)")
+    group.add_argument("--search-log-dd", default="both", choices=("both", "off", "on"),
+                       help="--log-dd 를 켠 경우와 끈 경우를 모두(both) / 끈 경우만(off) / 켠 경우만(on) 탐색")
+    group.add_argument("--search-removal", default="auto",
+                       choices=("auto", "exhaustive", "greedy", "single", "none"),
+                       help="시리즈 제거 탐색 방식. exhaustive: 제거 가능한 시리즈의 모든 부분집합 / "
+                            "greedy: IS Sharpe를 가장 올리는 시리즈를 하나씩 빼는 후진 제거 / "
+                            "single: 한 시리즈씩만 제거 / none: 제거 없이 세트만 비교 / "
+                            "auto: 부분집합이 --search-max-subsets 이하면 exhaustive, 아니면 greedy")
+    group.add_argument("--search-max-subsets", type=int, default=64,
+                       help="auto 에서 exhaustive 로 돌릴 최대 부분집합 수 (paper 3개, example 7개, "
+                            "extra 는 2^15-1개라 greedy)")
+    group.add_argument("--search-min-improve", type=float, default=0.,
+                       help="greedy 에서 제거를 채택할 최소 IS Sharpe 상승폭 (예: 0.02). "
+                            "양수로 두면 잡음 수준의 개선을 쫓지 않습니다")
+    group.add_argument("--search-oos-start", default=None,
+                       help="검증(OOS) 구간 시작일. 미지정 시 평가 구간의 마지막 --search-oos-frac 를 OOS로 둡니다")
+    group.add_argument("--search-oos-frac", type=float, default=.3,
+                       help="OOS로 떼어 둘 평가 구간의 비율")
+    group.add_argument("--search-wf-folds", type=int, default=3,
+                       help="OOS 구간을 나눌 워크포워드 재선택 구간 수 (구간마다 직전까지의 Sharpe로 다시 고름)")
+    group.add_argument("--search-jobs", type=int, default=-1,
+                       help="병렬 프로세스 수 (0 이하: CPU 코어 수만큼). 롤링 1회가 수십 초라 병렬을 권장합니다")
+    group.add_argument("--search-max-runs", type=int, default=300,
+                       help="롤링 적합 최대 횟수 (안전장치)")
+    group.add_argument("--search-top", type=int, default=10, help="화면에 출력할 상위 조합 수")
 
     group = parser.add_argument_group("변수 유형별 가중치 (--model sjm 전용)")
     group.add_argument("--weight-group", default="type", choices=GROUPINGS,
@@ -343,6 +380,67 @@ def load_data_with_extras(input_path: str,
     return data, extra_df
 
 
+def load_signal_data(input_path: str,
+                     sheet=None,
+                     date_col=None,
+                     close_col=None,
+                     rf_col=None,
+                     rf_unit: str = "annual_percent",
+                     trading_days: int = TRADING_DAYS,
+                     start_date=None,
+                     end_date=None,
+                     extra_features=None,
+                     extra_file: str = None,
+                     extra_sheet=None,
+                     extra_date_col: str = None,
+                     bench_col: str = None,
+                     bench_file: str = None,
+                     bench_sheet=None,
+                     bench_date_col: str = None,
+                     bench_close_col: str = None,
+                     rel_method: str = "diff",
+                     signal_ret: str = "auto",
+                     verbose: bool = True) -> tuple:
+    """
+    Load the market data and the custom features, and pick the return series the features
+    are to be built on -- everything `prepare_inputs` does before the feature matrix.
+
+    It is split out for the feature search, which builds a different matrix per candidate
+    from the same data. The chosen series is left in `data` under `signal_ret`.
+
+    Returns
+    -------
+    (pd.DataFrame, pd.DataFrame or None)
+        The market data with `signal_ret`, and the custom features (None when there are none).
+    """
+    data, extra_df = load_data_with_extras(
+        input_path, extra_features=extra_features, extra_file=extra_file,
+        extra_sheet=extra_sheet, extra_date_col=extra_date_col,
+        bench_col=bench_col, bench_file=bench_file, bench_sheet=bench_sheet,
+        bench_date_col=bench_date_col, bench_close_col=bench_close_col, rel_method=rel_method,
+        sheet=sheet, date_col=date_col, close_col=close_col, rf_col=rf_col,
+        rf_unit=rf_unit, trading_days=trading_days, start_date=start_date, end_date=end_date)
+    # the return series the features are built on, and with them the bull/bear ordering
+    signal_col = resolve_signal_return(data, signal_ret)
+    data["signal_ret"] = data[signal_col]
+    if verbose:
+        print(f"데이터: {len(data)}거래일, {data.index[0]} ~ {data.index[-1]}")
+        print(f"연율 무위험금리 평균: {data.rf.mean() * trading_days:.2%}, "
+              f"자산 연율 수익률 평균: {data.ret.mean() * trading_days:.2%}")
+        if "rel_ret" in data:
+            print(f"벤치마크 연율 수익률 평균: {data.bench_ret.mean() * trading_days:.2%}, "
+                  f"상대(차감 후) 연율 수익률 평균: {data.rel_ret.mean() * trading_days:.2%} "
+                  f"(차감 방식 {rel_method})")
+        label = ("상대수익률 rel_ret — 벤치마크 신호를 뺀 자산 고유 신호"
+                 if signal_col == "rel_ret" else "초과수익률 excess_ret — 무위험금리만 뺀 논문 기준")
+        print(f"신호 기준 수익률: {label}")
+        if signal_col == "rel_ret":
+            print("  · 레짐 0(bull) = 벤치마크 대비 초과 국면, 레짐 1(bear) = 열위 국면입니다.")
+        if extra_df is not None:
+            print(f"커스텀 변수: {list(extra_df.columns)}")
+    return data, extra_df
+
+
 def prepare_inputs(input_path: str,
                    sheet=None,
                    date_col=None,
@@ -403,31 +501,14 @@ def prepare_inputs(input_path: str,
         `data` (the market data, with `signal_ret`), `X` (the feature matrix) and `pinned`
         (the resolved pinned feature columns, empty unless the sparse model is in use).
     """
-    data, extra_df = load_data_with_extras(
-        input_path, extra_features=extra_features, extra_file=extra_file,
-        extra_sheet=extra_sheet, extra_date_col=extra_date_col,
-        bench_col=bench_col, bench_file=bench_file, bench_sheet=bench_sheet,
-        bench_date_col=bench_date_col, bench_close_col=bench_close_col, rel_method=rel_method,
-        sheet=sheet, date_col=date_col, close_col=close_col, rf_col=rf_col,
-        rf_unit=rf_unit, trading_days=trading_days, start_date=start_date, end_date=end_date)
-    # the return series the features are built on, and with them the bull/bear ordering
-    signal_col = resolve_signal_return(data, signal_ret)
-    data["signal_ret"] = data[signal_col]
-    if verbose:
-        print(f"데이터: {len(data)}거래일, {data.index[0]} ~ {data.index[-1]}")
-        print(f"연율 무위험금리 평균: {data.rf.mean() * trading_days:.2%}, "
-              f"자산 연율 수익률 평균: {data.ret.mean() * trading_days:.2%}")
-        if "rel_ret" in data:
-            print(f"벤치마크 연율 수익률 평균: {data.bench_ret.mean() * trading_days:.2%}, "
-                  f"상대(차감 후) 연율 수익률 평균: {data.rel_ret.mean() * trading_days:.2%} "
-                  f"(차감 방식 {rel_method})")
-        label = ("상대수익률 rel_ret — 벤치마크 신호를 뺀 자산 고유 신호"
-                 if signal_col == "rel_ret" else "초과수익률 excess_ret — 무위험금리만 뺀 논문 기준")
-        print(f"신호 기준 수익률: {label}")
-        if signal_col == "rel_ret":
-            print("  · 레짐 0(bull) = 벤치마크 대비 초과 국면, 레짐 1(bear) = 열위 국면입니다.")
-        if extra_df is not None:
-            print(f"커스텀 변수: {list(extra_df.columns)}")
+    data, extra_df = load_signal_data(
+        input_path, sheet=sheet, date_col=date_col, close_col=close_col, rf_col=rf_col,
+        rf_unit=rf_unit, trading_days=trading_days, start_date=start_date, end_date=end_date,
+        extra_features=extra_features, extra_file=extra_file, extra_sheet=extra_sheet,
+        extra_date_col=extra_date_col, bench_col=bench_col, bench_file=bench_file,
+        bench_sheet=bench_sheet, bench_date_col=bench_date_col,
+        bench_close_col=bench_close_col, rel_method=rel_method, signal_ret=signal_ret,
+        verbose=verbose)
 
     X = build_features(data.signal_ret, ver=feature_set, warmup=warmup, log_dd=log_dd,
                        extra_features=extra_df, remove_series=remove_series)
@@ -1101,11 +1182,252 @@ def run_pipeline(input_path: str,
             "episodes": episode_result, "written": written}
 
 
+def run_feature_search(input_path: str,
+                       outdir: str = "out",
+                       sheet=None,
+                       date_col=None,
+                       close_col=None,
+                       rf_col=None,
+                       rf_unit: str = "annual_percent",
+                       trading_days: int = TRADING_DAYS,
+                       start_date=None,
+                       end_date=None,
+                       feature_set: str = "paper",
+                       log_dd: bool = False,
+                       remove_series=None,
+                       warmup: int = 252,
+                       extra_features=None,
+                       extra_file: str = None,
+                       extra_sheet=None,
+                       extra_date_col: str = None,
+                       bench_col: str = None,
+                       bench_file: str = None,
+                       bench_sheet=None,
+                       bench_date_col: str = None,
+                       bench_close_col: str = None,
+                       rel_method: str = "diff",
+                       signal_ret: str = "auto",
+                       backtest_ret: str = "asset",
+                       model: str = "jm",
+                       max_feats: float = None,
+                       pin_features=None,
+                       jump_penalty: float = 50.,
+                       window: int = 3000,
+                       min_window: int = 500,
+                       n_components: int = 2,
+                       clip_mul: float = 3.,
+                       n_init: int = 10,
+                       random_state: int = 0,
+                       refit_start=None,
+                       cont: bool = True,
+                       grid_size: float = DEFAULT_GRID_SIZE,
+                       delay: int = 1,
+                       cost_bps: float = DEFAULT_COST_BPS,
+                       buy_cost_bps: float = None,
+                       sell_cost_bps: float = None,
+                       min_cash: float = DEFAULT_MIN_CASH,
+                       max_cash: float = DEFAULT_MAX_CASH,
+                       search_sets="paper,example,extra",
+                       search_log_dd: str = "both",
+                       search_removal: str = "auto",
+                       search_max_subsets: int = 64,
+                       search_min_improve: float = 0.,
+                       search_oos_start=None,
+                       search_oos_frac: float = .3,
+                       search_wf_folds: int = 3,
+                       search_jobs: int = -1,
+                       search_max_runs: int = 300,
+                       search_top: int = 10,
+                       plot: bool = True,
+                       plot_font: str = None,
+                       verbose: bool = True) -> dict:
+    """
+    Run every feature option through the backtest and report the one with the best Sharpe
+    ratio, checked out of sample.
+
+    The feature sets of `search_sets`, each with and without the log downside deviation
+    (`search_log_dd`), are searched together with the removal of whole feature series
+    (`search_removal`, see `feature_search.build_groups`); the custom variables are carried by
+    every set and may be removed like any other series. Everything else -- the model, the
+    window, the jump penalty, the trading delay, the costs and cash limits, the benchmark --
+    is held at the values given, so that the feature options are the only thing that varies.
+
+    The backtest period is split into a selection (IS) part and a hold-out (OOS) part. The
+    configurations are ranked, and the greedy elimination is steered, by the IS Sharpe
+    ratio alone; the OOS part then tells whether the winner keeps its edge over the
+    baseline -- the configuration given on the command line (`feature_set`, `log_dd`,
+    `remove_series`) -- on data the choice never saw. The winner is recommended only if it
+    does. A walk-forward re-selection within the OOS part and the deflated Sharpe ratio
+    complete the picture, see `feature_search`.
+
+    `remove_series` is removed from every candidate as well, and the series holding a feature
+    pinned through `pin_features` (sparse model only) are never removed.
+
+    Parameters
+    ----------
+    input_path : str
+        Path of the csv/Excel file holding the date, close price and risk-free rate columns.
+
+    outdir : str, optional (default="out")
+        Folder the results are written to. Every file is prefixed `search_`.
+
+    Other parameters mirror the command line options; see `build_parser`.
+
+    Returns
+    -------
+    dict
+        The output of `feature_search.run_search`, plus `data` and `written`.
+    """
+    from feature_search import Candidate, run_search
+
+    os.makedirs(outdir, exist_ok=True)
+    resolve_cash_limits(min_cash, max_cash)
+    resolve_cost_bps(cost_bps, buy_cost_bps, sell_cost_bps)
+    data, extra_df = load_signal_data(
+        input_path, sheet=sheet, date_col=date_col, close_col=close_col, rf_col=rf_col,
+        rf_unit=rf_unit, trading_days=trading_days, start_date=start_date, end_date=end_date,
+        extra_features=extra_features, extra_file=extra_file, extra_sheet=extra_sheet,
+        extra_date_col=extra_date_col, bench_col=bench_col, bench_file=bench_file,
+        bench_sheet=bench_sheet, bench_date_col=bench_date_col,
+        bench_close_col=bench_close_col, rel_method=rel_method, signal_ret=signal_ret,
+        verbose=verbose)
+    bt_ret, bt_rf, basis_name = resolve_backtest_basis(data, backtest_ret)
+
+    fit_kwargs = dict(jump_penalty=jump_penalty, window=window, min_window=min_window,
+                      n_components=n_components, clip_mul=clip_mul, n_init=n_init,
+                      random_state=random_state, start_date=refit_start, model=model,
+                      max_feats=max_feats, cont=cont, grid_size=grid_size)
+    strategy_kwargs = dict(delay=delay, cost_bps=cost_bps, buy_cost_bps=buy_cost_bps,
+                           sell_cost_bps=sell_cost_bps, min_cash=min_cash, max_cash=max_cash)
+    baseline = Candidate(feature_set, log_dd, (), tuple(remove_series or ()))
+
+    # the pins are resolved per candidate, since a removal can change what a group name holds
+    out = run_search(data.signal_ret, bt_ret, bt_rf, extra_df=extra_df, baseline=baseline,
+                     feature_sets=search_sets, log_dd_mode=search_log_dd,
+                     removal=search_removal, remove_series=remove_series,
+                     pin_features=pin_features, max_subsets=search_max_subsets,
+                     min_improve=search_min_improve, oos_start=search_oos_start,
+                     oos_frac=search_oos_frac, wf_folds=search_wf_folds, jobs=search_jobs,
+                     max_runs=search_max_runs, warmup=warmup,
+                     fit_kwargs=fit_kwargs,
+                     strategy_kwargs=strategy_kwargs, trading_days=trading_days,
+                     verbose=verbose)
+
+    results, summary = out["results"], out["summary"]
+    written = []
+    outputs = [("search_results.csv", results),
+               ("search_walkforward.csv", out["walkforward"]),
+               ("search_returns.csv", out["returns"]),
+               ("search_summary.csv", summary.to_frame())]
+    for name, obj in outputs:
+        path = os.path.join(outdir, name)
+        obj.to_csv(path, encoding="utf-8-sig")
+        written.append(path)
+
+    if plot:
+        from plotting import plot_search_cumret, plot_search_is_oos, setup_font
+        if plot_font:
+            setup_font(plot_font)
+        written.append(plot_search_is_oos(results, summary, os.path.join(outdir, "search_is_oos.png")))
+        written.append(plot_search_cumret(out["returns"], summary,
+                                          os.path.join(outdir, "search_cumret.png")))
+
+    if verbose:
+        basis = "" if backtest_ret == "asset" else f" ({basis_name} 기준 — Sharpe는 정보비율로 읽습니다)"
+        print("\n" + "=" * 72)
+        print(f"변수 옵션 탐색 결과 — 기준: Sharpe ratio{basis}")
+        print(f"선택(IS): {summary['is_start']} ~ {summary['oos_start']} 전일 ({summary['n_is']}거래일) / "
+              f"검증(OOS): {summary['oos_start']} ~ {summary['end']} ({summary['n_oos']}거래일)")
+        print(f"평가한 조합 {summary['n_configs']}개 (롤링 적합 {summary['n_runs']}회"
+              f"{', 실패 ' + str(summary['n_failed']) + '개' if summary['n_failed'] else ''}"
+              f"{', 실행 한도 도달' if summary['capped'] else ''})")
+        print("-" * 72)
+        top = results.head(search_top)
+        print(f"IS Sharpe 상위 {len(top)}개 (OOS Sharpe는 참고용 — 순위에 쓰지 않음):")
+        print(f"  {'순위':>4}  {'조합':<38} {'피처':>4} {'IS':>7} {'OOS':>7} {'전체':>7}")
+        for rank, row in top.iterrows():
+            mark = " *" if row["is_baseline"] else ""
+            print(f"  {rank:>4}  {row['label'][:38]:<38} {int(row['n_features']):>4} "
+                  f"{row['sharpe_is']:>7.3f} {row['sharpe_oos']:>7.3f} {row['sharpe_full']:>7.3f}{mark}")
+        if not results.head(search_top)["is_baseline"].any():
+            base = results.loc[results["is_baseline"]].iloc[0]
+            print(f"  {base.name:>4}  {base['label'][:38]:<38} {int(base['n_features']):>4} "
+                  f"{base['sharpe_is']:>7.3f} {base['sharpe_oos']:>7.3f} {base['sharpe_full']:>7.3f} *")
+        print("  (* 기준 설정 = 명령줄로 준 피처 옵션)")
+        print("-" * 72)
+        gap = summary["best_sharpe_oos"] - summary["baseline_sharpe_oos"]
+        print(f"Buy & hold  : IS {summary['bh_sharpe_is']:6.3f} / OOS {summary['bh_sharpe_oos']:6.3f}")
+        print(f"기준 설정   : IS {summary['baseline_sharpe_is']:6.3f} / OOS {summary['baseline_sharpe_oos']:6.3f}"
+              f"  ({summary['baseline']})")
+        print(f"IS 최고     : IS {summary['best_sharpe_is']:6.3f} / OOS {summary['best_sharpe_oos']:6.3f}"
+              f"  ({summary['best']}) → OOS에서 기준 대비 {gap:+.3f}")
+        print(f"워크포워드  :           OOS {summary['wf_sharpe']:6.3f}"
+              f"  (OOS를 {summary['wf_folds']}구간으로 나눠 구간마다 직전까지의 Sharpe로 재선택: "
+              + " → ".join(f"{row.selected}" for row in out["walkforward"].itertuples()) + ")")
+        print(f"Deflated Sharpe ratio: {summary['dsr']:.2f} (시험한 조합 {summary['dsr_n_trials']}개 반영, "
+              f"운으로 기대되는 최고 IS Sharpe {summary['dsr_sr0']:.3f}; 0.95 이상이면 유의)")
+        print(f"IS–OOS Sharpe 순위 상관(Spearman): {summary['rank_corr_is_oos']:.2f} "
+              f"(0에 가까우면 IS 순위가 OOS에서 유지되지 않음 = 과최적화 신호)")
+        print("-" * 72)
+        if summary["best"] == summary["baseline"]:
+            print("판정: 기준 설정이 IS에서도 최고입니다 — 피처 옵션을 바꿀 근거가 없습니다.")
+        elif summary["oos_passed"]:
+            print("판정: OOS 통과 — IS 최고 조합이 검증 구간에서도 기준 설정보다 Sharpe가 높습니다.")
+        else:
+            print("판정: OOS 미통과 — IS 최고 조합이 검증 구간에서 기준 설정보다 못합니다(과최적화 가능성). "
+                  "기준 설정을 유지합니다.")
+        if summary["oos_passed"] and summary["best"] != summary["baseline"] and summary["dsr"] < .95:
+            print("  · 다만 Deflated Sharpe가 0.95 미만이라, 조합 수를 감안하면 IS 우위가 우연일 가능성이 남아 있습니다.")
+        print(f"권장 옵션: {summary['recommended_cli']}")
+        print("=" * 72)
+        print("저장된 파일:")
+        for path in written:
+            print(f"  {path}")
+
+    out.update({"data": data, "written": written})
+    return out
+
+
 def main(argv=None) -> int:
-    """Parse the command line arguments and run the pipeline, or a single inference."""
+    """Parse the command line arguments and run the pipeline, a single inference, or a search."""
     args = build_parser().parse_args(argv)
     if not args.quiet:
         warnings.simplefilter("always", UserWarning)
+    if args.search and args.inference:
+        raise SystemExit("--search 와 --inference 는 함께 쓸 수 없습니다.")
+    if args.search:
+        run_feature_search(input_path=args.input, outdir=args.outdir, sheet=args.sheet,
+                           date_col=args.date_col, close_col=args.close_col, rf_col=args.rf_col,
+                           rf_unit=args.rf_unit, trading_days=args.trading_days,
+                           start_date=args.start_date, end_date=args.end_date,
+                           feature_set=args.feature_set, log_dd=args.log_dd,
+                           remove_series=args.remove_series, warmup=args.warmup,
+                           extra_features=args.extra_feature, extra_file=args.extra_file,
+                           extra_sheet=args.extra_sheet, extra_date_col=args.extra_date_col,
+                           bench_col=args.bench_col, bench_file=args.bench_file,
+                           bench_sheet=args.bench_sheet, bench_date_col=args.bench_date_col,
+                           bench_close_col=args.bench_close_col, rel_method=args.rel_method,
+                           signal_ret=args.signal_ret, backtest_ret=args.backtest_ret,
+                           model=args.model, max_feats=args.max_feats,
+                           pin_features=args.pin_feature, jump_penalty=args.jump_penalty,
+                           window=args.window, min_window=args.min_window,
+                           n_components=args.n_components, clip_mul=args.clip_mul,
+                           n_init=args.n_init, random_state=args.random_state,
+                           refit_start=args.refit_start, cont=not args.no_cont,
+                           grid_size=args.grid_size, delay=args.delay, cost_bps=args.cost_bps,
+                           buy_cost_bps=args.buy_cost_bps, sell_cost_bps=args.sell_cost_bps,
+                           min_cash=args.min_cash, max_cash=args.max_cash,
+                           search_sets=args.search_sets, search_log_dd=args.search_log_dd,
+                           search_removal=args.search_removal,
+                           search_max_subsets=args.search_max_subsets,
+                           search_min_improve=args.search_min_improve,
+                           search_oos_start=args.search_oos_start,
+                           search_oos_frac=args.search_oos_frac,
+                           search_wf_folds=args.search_wf_folds, search_jobs=args.search_jobs,
+                           search_max_runs=args.search_max_runs, search_top=args.search_top,
+                           plot=not args.no_plot, plot_font=args.plot_font,
+                           verbose=not args.quiet)
+        return 0
     if args.inference:
         if args.hmm:
             warnings.warn("--hmm 은 백테스트 벤치마크라 --inference 모드에서는 무시합니다.")
