@@ -9,7 +9,7 @@ csv/엑셀 파일 하나(날짜·종가·무위험금리)를 넣으면 논문 [S
 5. **변수 유형별 가중 비중**(sjm)과 **bear 국면 분석 · 유사 국면 탐색 · 국면 종료 시나리오**
 6. 선택적으로 **HMM 벤치마크(논문 §3.3)** 와 성과 비교
 
-까지 수행하고 결과 csv와 그림을 저장합니다. 과거를 다시 걷지 않고 **지금 국면만** 알고 싶다면 `--inference`로 현재 반기 하나만 추론할 수 있습니다(3-11). 지수 전체가 아니라 **섹터 지수**의 고유 국면을 보고 싶다면 `--relative-benchmark`로 코스피를 차감하세요(3-12).
+까지 수행하고 결과 csv와 그림을 저장합니다. 과거를 다시 걷지 않고 **지금 국면만** 알고 싶다면 `--inference`로 현재 반기 하나만 추론할 수 있습니다(3-11). 지수 전체가 아니라 **섹터 지수**의 고유 국면을 보고 싶다면 `--relative-benchmark`로 코스피를 차감하세요(3-12). 피처 세트·`--log-dd`·시리즈 제거 조합 중 **Sharpe가 가장 좋은 변수 옵션**을 찾으려면 `--search`로 전부 돌려 보고 **OOS 구간에서 검증**할 수 있습니다(3-13).
 
 ---
 
@@ -104,6 +104,11 @@ res["performance"]         # 전략 성과표
 | `--start-date` / `--end-date` | 없음 | 분석 기간 필터 |
 | `--n-init` | 10 | 좌표하강 재시작 횟수. 줄이면 빨라지고 해의 안정성은 떨어집니다 |
 | `--delays` | `1,5,10` | 거래 지연 로버스트니스 표에 쓸 지연 일수 목록. `--no-robustness`로 생략 |
+| `--search` | 꺼짐 | **변수 옵션 탐색 모드**. 피처 세트 × `--log-dd` × 시리즈 제거 조합을 모두 백테스트해 IS Sharpe 최고 조합을 고르고 OOS에서 검증 (3-13 참고) |
+| `--search-sets`, `--search-log-dd`, `--search-removal` | `paper,example,extra`, `both`, `auto` | 탐색 범위: 피처 세트 / `--log-dd` 켬·끔 / 시리즈 제거 방식(`auto`·`exhaustive`·`greedy`·`single`·`none`) |
+| `--search-oos-start`, `--search-oos-frac` | 없음, 0.3 | 검증(OOS) 구간 시작일. 미지정 시 평가 구간의 마지막 30% |
+| `--search-wf-folds` | 3 | OOS를 나눠 구간마다 다시 고르는 워크포워드 재선택 구간 수 |
+| `--search-jobs`, `--search-max-runs` | -1(전 코어), 300 | 병렬 프로세스 수, 롤링 적합 최대 횟수 |
 | `--inference` | 꺼짐 | **추론 전용 모드**. 과거 롤링·백테스트를 건너뛰고 현재 반기 직전 `--window`거래일로 한 번 적합해 현재 반기만 추론 (3-11 참고) |
 | `--weight-group` | `type` | `sjm` 전용. 피처 가중을 묶어 볼 기준 (`type` / `type-horizon` / `series` / `horizon`) (3-9 참고) |
 | `--similar-target` | 마지막 국면 | 유사 국면 탐색의 기준 국면. 국면의 시작일이거나 국면 **안**의 날짜 (3-10 참고) |
@@ -554,9 +559,94 @@ python run_pipeline.py --input 반도체지수.xlsx --relative-benchmark kospi.x
 - **종가 열과 벤치마크 열이 같은 열로 인식되면 오류**를 냅니다. 상대수익률이 전 구간 0이면(같은 데이터를 두 번 준 경우) 경고를 출력합니다.
 - **`--backtest-ret`은 `--inference`에서는 쓰이지 않습니다**(백테스트가 없으므로). 무시한다고 경고합니다. 추론 모드의 국면 기준은 `--signal-ret`이 정합니다.
 
+### 3-13. 최적 변수 옵션 탐색과 OOS 검증 (`--search`)
+
+피처 옵션은 조합이 빠르게 늘어납니다. 피처 세트 3종 × `--log-dd` 켬/끔 × 어떤 시리즈를 뺄지(`--remove-series`)까지 손으로 하나씩 돌려 비교하기는 어렵고, 그렇게 고른 "최고 조합"은 **그 기간에 우연히 잘 맞은 조합**일 위험도 큽니다. `--search`는 조합을 전부(또는 실용적인 범위에서 최대한) 같은 롤링 백테스트로 돌리고, **고르는 구간과 검증하는 구간을 분리**해 그 위험을 걸러 냅니다.
+
+```bash
+# 기본: paper·example·extra × log-dd 켬/끔 × 시리즈 제거, 기준은 --feature-set(기본 paper)
+python run_pipeline.py --input 내데이터.xlsx --search
+
+# sparse JM으로, var는 항상 빼고 sortino_60은 항상 남긴 채, 2018년부터를 OOS로
+python run_pipeline.py --input 내데이터.xlsx --search --model sjm \
+    --remove-series var --pin-feature sortino_60 --search-oos-start 2018-01-01
+
+# 커스텀 변수도 제거 후보가 됩니다 (시리즈 이름 = 첫 '_' 앞, 예: VIX_ewm20 → VIX)
+python run_pipeline.py --input 내데이터.xlsx --search --extra-feature VIX:ewm:20
+```
+
+**무엇을 탐색하나.** 피처 세트(`--search-sets`)와 `--log-dd`(`--search-log-dd`)의 조합마다 **제거 가능한 시리즈**(3-7의 시리즈 단위)를 빼 보며 비교합니다. 모델·`--window`·`--jump-penalty`·거래 지연·비용·현금 한도·벤치마크 등 **나머지 옵션은 준 값으로 고정**되어, 피처 옵션만 달라집니다. 제거 방식(`--search-removal`)은 다음과 같습니다.
+
+| 방식 | 하는 일 | 실행 횟수 |
+|---|---|---|
+| `exhaustive` | 제거 가능한 시리즈의 **모든 부분집합**을 제거(최소 한 열은 남김) | `2^k − 1` |
+| `greedy` | **후진 제거**: IS Sharpe를 가장 많이 올리는 시리즈를 하나씩 빼고, 더 빼도 오르지 않으면 멈춤 | 대략 `k + (k−1) + …` (보통 수십 회) |
+| `single` | 전체 세트 + 시리즈 하나씩만 제거 | `k + 1` |
+| `none` | 제거 없이 세트·log-dd만 비교 | 1 |
+| `auto` (기본) | 부분집합 수가 `--search-max-subsets`(64) 이하면 `exhaustive`, 아니면 `greedy` | — |
+
+기본값에서는 `paper`(시리즈 2개 → 3조합)와 `example`(3개 → 7조합)은 전수, `extra`(15개 → 32,767조합)는 탐욕 제거로 돌아갑니다. `example`은 원래 로그 스케일이라 `--log-dd`를 켜도 같으므로 한 번만 돌립니다. 열 구성이 똑같아지는 조합(예: `paper -DD`와 `paper log-dd -DD-log`)은 한 번만 적합하고 `aliases` 열에 함께 적습니다.
+
+- `--remove-series`로 준 시리즈는 **그 시리즈가 있는 모든 후보에서 항상 빠진 채** 탐색합니다(예: `var`는 `extra`에만 적용). 어느 세트에도 없으면 오타로 보고 오류를 냅니다.
+- `--pin-feature`(sjm 전용)로 고정한 피처가 속한 시리즈는 **제거 후보에서 뺍니다**. `--model jm`에서는 고정이 의미가 없어 무시됩니다.
+
+**과최적화를 막는 장치.** 평가 구간(모든 후보의 온라인 레짐이 공통으로 있는 기간)을 앞쪽 **선택(IS)** 과 뒤쪽 **검증(OOS)** 으로 나눕니다(기본 마지막 30%, `--search-oos-frac`/`--search-oos-start`).
+
+1. **순위는 IS Sharpe로만 매깁니다.** 탐욕 제거의 매 단계 판단도 IS Sharpe만 봅니다. OOS 구간은 어떤 결정에도 쓰이지 않으므로, IS 1위 조합의 OOS Sharpe는 *조합 선택*까지 포함한 진짜 표본 외 성과입니다(레짐 자체는 원래부터 재추정 시점 이전 데이터만 보는 온라인 신호입니다).
+2. **OOS 판정**: IS 1위가 OOS에서도 **기준 설정**(명령줄의 `--feature-set`/`--log-dd`/`--remove-series`, 기본 `paper`)보다 Sharpe가 높으면 *통과*로 보고 권장합니다. 못 미치면 IS 우위가 일반화되지 않은 것으로 보고 **기준 설정 유지를 권장**합니다.
+3. **워크포워드 재선택** (`--search-wf-folds`, 기본 3): OOS를 3구간으로 나눠, 각 구간 시작 시점에 *그 직전까지*의 Sharpe로 1위를 다시 골라 그 구간을 거래합니다. "주기적으로 탐색을 다시 돌렸다면 실제로 얼마를 벌었나"에 해당하며, 조합이 바뀌는 날은 이전 조합의 비중에서 옮겨 가는 거래비용을 반영합니다.
+4. **Deflated Sharpe ratio** (Bailey & López de Prado, 2014): 조합을 N개 시험하면 실력이 없어도 1위의 Sharpe는 높게 나옵니다. 시험한 조합 수와 Sharpe 분산, 수익률의 왜도·첨도를 반영해 "1위의 IS 우위가 운이 아닐 확률"을 계산합니다. 0.95 이상이면 탐색 횟수를 감안해도 유의합니다.
+5. **IS–OOS 순위 상관(Spearman)**: 모든 조합의 IS Sharpe 순위와 OOS Sharpe 순위의 상관입니다. 0 근처면 IS 순위가 OOS에서 유지되지 않는다는 뜻 — 탐색이 잡음을 고르고 있다는 신호입니다.
+
+`--search-min-improve 0.02`처럼 양수를 주면, 탐욕 제거가 IS Sharpe를 그만큼 이상 올리는 제거만 채택해 잡음 수준의 개선을 쫓지 않습니다. 동률이면 피처 수가 적은 조합이 앞섭니다.
+
+합성 데이터(6000거래일, `--window 1000 --no-cont`)로 돌린 출력 예시입니다(숫자는 형식 설명용).
+
+```
+변수 옵션 탐색 결과 — 기준: Sharpe ratio
+선택(IS): 2003-01-01 ~ 2017-01-02 전일 (3653거래일) / 검증(OOS): 2017-01-02 ~ 2022-12-30 (1565거래일)
+평가한 조합 70개 (롤링 적합 70회)
+------------------------------------------------------------------------
+IS Sharpe 상위 10개 (OOS Sharpe는 참고용 — 순위에 쓰지 않음):
+  순위  조합                                    피처      IS     OOS    전체
+     1  extra log-dd -vol-log                     32   1.030   0.802   0.961
+     2  extra log-dd -ret-cumlog -vol-log         31   1.017   0.788   0.948
+   ...
+    68  paper                                      3   0.575   0.423   0.532 *
+------------------------------------------------------------------------
+Buy & hold  : IS  0.560 / OOS  0.313
+기준 설정   : IS  0.575 / OOS  0.423  (paper)
+IS 최고     : IS  1.030 / OOS  0.802  (extra log-dd -vol-log) → OOS에서 기준 대비 +0.378
+워크포워드  :           OOS  0.791  (OOS를 3구간으로 나눠 구간마다 직전까지의 Sharpe로 재선택: ...)
+Deflated Sharpe ratio: 1.00 (시험한 조합 70개 반영, 운으로 기대되는 최고 IS Sharpe 0.281; 0.95 이상이면 유의)
+IS–OOS Sharpe 순위 상관(Spearman): 0.31 (0에 가까우면 IS 순위가 OOS에서 유지되지 않음 = 과최적화 신호)
+------------------------------------------------------------------------
+판정: OOS 통과 — IS 최고 조합이 검증 구간에서도 기준 설정보다 Sharpe가 높습니다.
+권장 옵션: --feature-set extra --log-dd --remove-series vol-log
+```
+
+마지막 줄의 **권장 옵션을 그대로 붙여** 일반 백테스트(`run_pipeline.py --input ... <권장 옵션>`)나 `--inference`를 돌리면 됩니다. 산출물은 모두 `search_` 접두사가 붙습니다.
+
+| 파일 | 내용 |
+|---|---|
+| `search_results.csv` | 조합별 한 행, IS Sharpe 순위순: 라벨·피처 세트·log-dd·제거 시리즈·피처 수·IS/OOS/전체 Sharpe·IS/OOS 수익률과 MDD·회전율·bear 비중·연 전환 횟수·같은 열 구성의 별칭·피처 목록·**재현용 명령줄 옵션**(`cli`)·실패 시 오류 |
+| `search_walkforward.csv` | 워크포워드 구간별 시작·끝·선택된 조합·선택 시점 Sharpe·구간 Sharpe(선택 조합 / 기준 설정 / 매수보유) |
+| `search_returns.csv` | 날짜별 일간 수익률: 매수보유·기준 설정·IS 1위·워크포워드, 무위험금리, IS/OOS 구분 |
+| `search_summary.csv` | 구간, 조합 수, 각 Sharpe, Deflated Sharpe, 순위 상관, 판정, 권장 조합과 옵션 |
+| `search_is_oos.png` | 조합별 IS Sharpe(가로) vs OOS Sharpe(세로) 산점도. 오른쪽 위로 기울어 있어야 IS 순위를 믿을 수 있습니다 |
+| `search_cumret.png` | 위: 전체 구간 누적 초과수익(OOS 음영) / 아래: OOS만 0에서 다시 시작한 비교(워크포워드 포함) |
+
+알아둘 점은 다음과 같습니다.
+
+- **오래 걸립니다.** 롤링 1회(30년, 3000일 창, 재추정 약 60회)가 수십 초~수 분이고 기본 탐색은 보통 50~100회입니다. 기본값 `--search-jobs -1`이 CPU 코어를 모두 쓰며, `--no-cont`(이산 모델)·`--n-init` 축소·`--search-sets`/`--search-log-dd`로 범위를 줄이면 빨라집니다. `--search-max-runs`(300)에 닿으면 남은 후보를 건너뛰고 그 사실을 표시합니다.
+- **OOS 구간은 한 번만 쓸수록 의미가 있습니다.** 결과를 본 뒤 옵션을 바꿔 다시 탐색하기를 반복하면 OOS도 결국 선택에 쓰인 셈이 됩니다. 최종 확인용 구간을 따로 남기려면 `--end-date`로 데이터를 잘라 탐색하고, 남겨 둔 기간은 권장 옵션으로 한 번만 백테스트하세요.
+- **OOS가 짧으면 판정이 불안정합니다.** IS나 OOS가 1년(252거래일)보다 짧으면 경고합니다. 워크포워드 구간도 OOS를 다시 나누므로 각 구간이 너무 짧아지지 않게 `--search-wf-folds`를 조절하세요.
+- **비교 구간은 모든 조합이 공통으로 덮는 날짜입니다.** 피처 세트마다 워밍업 결측이 달라 첫 재추정 시점이 다를 수 있어, 가장 늦게 시작하는 조합에 맞춰 평가합니다.
+- `--backtest-ret relative`이면 Sharpe가 벤치마크 대비 **정보비율(IR)** 이 되고, 탐색도 그 기준으로 이뤄집니다. `--hmm`·국면 분석·지연 로버스트니스는 이 모드에서 돌지 않습니다.
+
 ## 4. 출력물 (`--outdir`)
 
-아래는 기본(백테스트) 실행의 산출물입니다. `--inference`는 `inference_` 접두사가 붙은 별도 파일을 냅니다(3-11).
+아래는 기본(백테스트) 실행의 산출물입니다. `--inference`는 `inference_` 접두사(3-11), `--search`는 `search_` 접두사(3-13)가 붙은 별도 파일을 냅니다.
 
 | 파일 | 내용 |
 |---|---|
@@ -605,6 +695,7 @@ python run_pipeline.py --input 반도체지수.xlsx --relative-benchmark kospi.x
 | (논문 밖) 변수 유형별 가중 비중 | `weights.group_feature_weights` → `plotting.plot_weight_groups` |
 | (논문 밖) 국면 길이의 거리 요인 / 페널티 요인 분해 | `rolling.state_losses` → `regime_episodes.episode_metrics` |
 | (논문 밖) 현재 반기만 추론하는 실행 모드 | `rolling.run_rolling_jm(last_refit_only=True)` → `run_pipeline.run_inference` |
+| (논문 밖) 변수 옵션 탐색 + IS/OOS 검증·워크포워드·Deflated Sharpe | `feature_search.run_search` → `run_pipeline.run_feature_search` |
 | (논문 밖) 유사 국면 탐색과 국면 종료 시점 | `regime_episodes.rank_similar_episodes`·`compare_episode_paths`·`length_scenarios` |
 
 ## 6. 구현상의 선택과 주의사항

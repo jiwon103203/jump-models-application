@@ -540,3 +540,120 @@ def plot_inference(regimes: pd.DataFrame,
         ax.grid(alpha=.25)
         ax.margins(x=0)
     return _save(fig, filepath)
+
+
+def plot_search_is_oos(results: pd.DataFrame,
+                       summary: pd.Series,
+                       filepath: str,
+                       figsize=(9, 7)) -> str:
+    """
+    Scatter the IS Sharpe ratio of every configuration a feature search tried against its OOS
+    Sharpe ratio.
+
+    This is the overfitting picture of a search. If the configurations that did well in the
+    selection period also do well afterwards, the cloud slopes upwards; if it is flat, the IS
+    ranking was mostly noise and the winner's edge should not be expected to last. The
+    baseline, the IS winner and buy-and-hold are marked for reference.
+
+    Parameters
+    ----------
+    results : pd.DataFrame
+        The `results` table of `feature_search.run_search`.
+
+    summary : pd.Series
+        The `summary` of the same search.
+
+    filepath : str
+        Where to save the figure.
+
+    figsize : tuple, optional
+        The figure size, in inches.
+
+    Returns
+    -------
+    str
+        The path of the saved figure.
+    """
+    table = results.dropna(subset=["sharpe_is", "sharpe_oos"])
+    fig, ax = plt.subplots(figsize=figsize)
+    colors = {"paper": "#1c7ed6", "example": "#7048e8", "extra": "#f08c00"}
+    for feature_set, part in table.groupby("feature_set", sort=False):
+        ax.scatter(part["sharpe_is"], part["sharpe_oos"], s=26, alpha=.7,
+                   color=colors.get(feature_set, "#868e96"), label=f"{feature_set} ({len(part)})")
+    base = table.loc[table["is_baseline"]]
+    if not base.empty:
+        ax.scatter(base["sharpe_is"], base["sharpe_oos"], s=140, facecolors="none",
+                   edgecolors="#212529", lw=1.6, label=f"Baseline: {summary['baseline']}", zorder=5)
+    best = table.iloc[:1]
+    ax.scatter(best["sharpe_is"], best["sharpe_oos"], s=180, marker="*", color=BEAR_COLOR,
+               label=f"Best IS: {summary['best']}", zorder=6)
+    ax.axvline(summary["bh_sharpe_is"], color="#868e96", lw=.9, ls=":")
+    ax.axhline(summary["bh_sharpe_oos"], color="#868e96", lw=.9, ls=":", label="Buy & hold (IS / OOS)")
+    corr = summary.get("rank_corr_is_oos", np.nan)
+    ax.set(xlabel="IS Sharpe (selection period)", ylabel="OOS Sharpe (hold-out period)",
+           title=f"Feature search: IS vs OOS Sharpe of {len(table)} configurations "
+                 f"(Spearman {corr:.2f})")
+    ax.grid(alpha=.25)
+    _warn_missing_font(table["label"])
+    ax.legend(loc="best", fontsize=8)
+    return _save(fig, filepath)
+
+
+def plot_search_cumret(returns: pd.DataFrame,
+                       summary: pd.Series,
+                       filepath: str,
+                       figsize=(16, 9)) -> str:
+    """
+    Plot the cumulative excess returns of a feature search: buy-and-hold, the baseline and
+    the IS winner over the whole evaluation period (top, the hold-out period shaded), and the
+    same curves plus the walk-forward re-selection over the hold-out period alone, all
+    starting from zero on its first day (bottom).
+
+    Parameters
+    ----------
+    returns : pd.DataFrame
+        The `returns` table of `feature_search.run_search`: one column of daily returns per
+        strategy, plus `rf` and `period`.
+
+    summary : pd.Series
+        The `summary` of the same search, for the OOS start date.
+
+    filepath : str
+        Where to save the figure.
+
+    figsize : tuple, optional
+        The figure size, in inches.
+
+    Returns
+    -------
+    str
+        The path of the saved figure.
+    """
+    curves = [col for col in returns.columns if col not in ("rf", "period")]
+    colors = dict(zip(curves, ("#1c7ed6", "#495057", "#f08c00", "#c92a2a")))
+    excess = returns[curves].sub(returns["rf"], axis=0)
+    oos = (returns["period"] == "OOS").to_numpy()
+    dates = pd.to_datetime(pd.Index(returns.index))
+
+    fig, axes = plt.subplots(2, 1, figsize=figsize, gridspec_kw={"height_ratios": [3, 2]})
+    for col in curves:
+        if col == "walk-forward":           # it only exists in the hold-out period
+            continue
+        axes[0].plot(dates, excess[col].cumsum(), label=col, color=colors[col], lw=1.3)
+    axes[0].fill_between(dates, 0, 1, where=oos, transform=axes[0].get_xaxis_transform(),
+                         color="#adb5bd", alpha=.2, step="pre",
+                         label=f"OOS from {summary['oos_start']}")
+    axes[0].set(title="Feature search: chosen in sample (white), tested out of sample (grey)",
+                ylabel="Cumulative excess return")
+    for col in curves:
+        # dashed, since the walk-forward rule trades the IS winner whenever it re-selects it
+        axes[1].plot(dates[oos], excess.loc[oos, col].cumsum(), label=col, color=colors[col],
+                     lw=1.3, ls="--" if col == "walk-forward" else "-")
+    axes[1].set(title="Hold-out period only, from zero", ylabel="Cumulative excess return")
+    for ax in axes:
+        _percent_axis(ax)
+        ax.grid(alpha=.25)
+        ax.legend(loc="upper left", fontsize=9)
+    _warn_missing_font(curves)
+    fig.tight_layout()
+    return _save(fig, filepath)

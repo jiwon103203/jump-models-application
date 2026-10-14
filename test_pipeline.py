@@ -32,7 +32,10 @@ from regime_episodes import (align_paths, compare_episode_paths, episode_metrics
                              rank_similar_episodes, resolve_target_episode, select_episodes)
 from rolling import (DEFAULT_GRID_SIZE, init_model, refit_schedule, resolve_grid_size,
                      resolve_max_feats, run_rolling_jm, semiannual_anchors, state_losses)
-from run_pipeline import load_data_with_extras, market_columns, prepare_inputs, run_inference
+from feature_search import (build_groups, deflated_sharpe, grid_candidates,
+                            period_metrics, split_periods, walk_forward)
+from run_pipeline import (load_data_with_extras, market_columns, prepare_inputs,
+                          run_feature_search, run_inference)
 from sparse_pin import PinnedSparseJumpModel, solve_lasso_pinned
 from weights import (CUSTOM_TYPE, GROUPINGS, NO_HORIZON, feature_group_map, feature_group_name,
                      feature_horizon, feature_type_name, group_feature_weights,
@@ -1284,6 +1287,166 @@ def test_run_inference_covers_the_current_half_only():
         # the plain model has no feature weights, so no weight tables are written
         assert out["weight_groups"] is None
         assert not [name for name in names if "weight" in name]
+
+
+############################################
+## 변수 옵션 탐색
+############################################
+
+def test_search_groups_cover_every_option_once():
+    """Each (set, log-DD) pair is a group, and the log scale is not searched twice for "example"."""
+    groups = build_groups(["paper", "example", "extra"], log_dd_mode="both")
+    assert [group.name for group in groups] == ["paper", "paper log-dd", "example", "extra", "extra log-dd"]
+    by_name = {group.name: group for group in groups}
+
+    # the small sets are searched exhaustively: every subset of their series but the empty matrix
+    assert by_name["paper"].pool == ["DD", "sortino"] and by_name["paper"].mode == "exhaustive"
+    assert len(grid_candidates(by_name["paper"])) == 3
+    assert by_name["example"].pool == ["ret", "DD-log", "sortino"]
+    assert len(grid_candidates(by_name["example"])) == 7
+    # the 15 series of "extra" would be 2^15 runs, so it falls back to the greedy elimination
+    assert len(by_name["extra"].pool) == 15 and by_name["extra"].mode == "greedy"
+    assert [c.removed for c in grid_candidates(by_name["extra"])] == [()]
+    # every candidate's matrix keeps at least one column
+    for group in groups:
+        for candidate in grid_candidates(group):
+            assert group.remaining(candidate.removed), candidate.label
+
+    single = build_groups(["extra"], log_dd_mode="off", removal="single")[0]
+    assert len(grid_candidates(single)) == 1 + 15
+
+
+def test_search_respects_removals_and_pins():
+    """The user's removals stay removed everywhere, and a pinned series is never removed."""
+    groups = build_groups(["paper", "extra"], log_dd_mode="off", custom_columns=["VIX_ewm20"],
+                          remove_series=["var"], pin_features=["sortino_60"], model="sjm")
+    paper, extra = groups
+    # "var" exists in "extra" only, so the other set searches as if it had not been given
+    assert paper.fixed == () and extra.fixed == ("var",)
+    assert "var" not in extra.pool and not [col for col in extra.columns if col.startswith("var_")]
+    # the custom variable is a series of its own, removable in every set
+    assert "VIX" in paper.pool and "VIX" in extra.pool
+    # the pinned Sortino ratio keeps its whole series in the matrix
+    assert "sortino" not in paper.pool and "sortino" not in extra.pool
+    candidate = extra.candidate(("DD", "ret"))
+    assert candidate.removed == ("ret", "DD")              # pool order, whatever the input order
+    assert candidate.remove_series == ["var", "ret", "DD"]
+    assert candidate.label == "extra -ret -DD"
+    assert candidate.cli == ("--feature-set extra --remove-series var --remove-series ret "
+                             "--remove-series DD")
+    # the plain model ignores pins, so nothing is protected there
+    plain = build_groups(["paper"], log_dd_mode="off", pin_features=["sortino_60"], model="jm")[0]
+    assert "sortino" in plain.pool
+
+
+def test_split_periods():
+    """The OOS part is the tail of the evaluation period, given as a share or as a date."""
+    index = pd.Index(pd.bdate_range("2020-01-01", periods=1000).date)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        start, oos_start, end = split_periods(index, oos_frac=.3)
+    assert start == index[0] and end == index[-1] and oos_start == index[700]
+    _, oos_start, _ = split_periods(index, oos_start=str(index[600]))
+    assert oos_start == index[600]
+    for bad in (str(index[0]), "2030-01-01"):
+        try:
+            split_periods(index, oos_start=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad} should leave an empty IS or OOS part")
+
+
+def _toy_strategy(ret, weight=1., cost=0.):
+    """A `run_0_1_strategy`-shaped frame with constant weight and no risk-free return."""
+    return pd.DataFrame({"weight": weight, "cost": cost, "rf": 0., "bh": ret, "jm": ret})
+
+
+def test_walk_forward_selects_on_the_past_only():
+    """Each block trades the configuration that was best before it, never the one best within it."""
+    index = pd.Index(pd.bdate_range("2020-01-01", periods=300).date)
+    rng = np.random.default_rng(0)
+    noise = pd.Series(rng.normal(0., .002, 300), index=index)
+    first_half = np.arange(300) < 150
+    # "early" earns until day 150 and loses after it; "late" does the opposite
+    early = noise + np.where(first_half, .003, -.003)
+    late = noise + np.where(first_half, -.001, .003)
+    strategies = {"early": _toy_strategy(early, weight=1.),
+                  "late": _toy_strategy(late, weight=0., cost=.0005)}
+    oos = index[100:]
+    table, ret = walk_forward(strategies, oos, index[0], folds=4, buy_bps=10., sell_bps=20.)
+
+    # block 1 starts on day 100, when "early" has the better record; by the last block "late"
+    # has caught up on the days since, even though it was the better one all along after day 150
+    assert table.loc[1, "selected"] == "early"
+    assert table.loc[4, "selected"] == "late"
+    assert ret.index.equals(oos)
+    # within a block the returns are the chosen configuration's own...
+    for row in table.itertuples():
+        mask = (oos >= row.start) & (oos <= row.end)
+        expected = strategies[row.selected]["jm"].loc[oos[mask]]
+        assert np.allclose(ret.loc[oos[mask]].iloc[1:], expected.iloc[1:])
+    # ...except the first day of a switch, where the move from the old weight is charged instead
+    switch = table.loc[table["selected"] != table["selected"].shift()].iloc[1:]
+    assert len(switch) == 1
+    day = switch["start"].iloc[0]
+    # from weight 1 ("early") to weight 0 ("late"): a sell of 100% at 20 bp, in place of "late"'s own cost
+    assert np.isclose(ret.loc[day], late.loc[day] + .0005 - 1. * 20. / 1e4)
+
+
+def test_deflated_sharpe_penalizes_the_number_of_trials():
+    """With one trial it is the probabilistic Sharpe ratio; more trials make the same winner less convincing."""
+    index = pd.Index(pd.bdate_range("2015-01-01", periods=2000).date)
+    rng = np.random.default_rng(1)
+    ret = pd.Series(rng.normal(.0004, .01, 2000), index=index)
+    rf = pd.Series(0., index=index)
+    sharpe = period_metrics(_toy_strategy(ret), trading_days=252)["Sharpe"]
+    alone = deflated_sharpe(ret, rf, sharpe, [sharpe])
+    assert alone["n_trials"] == 1 and alone["sr0"] == 0. and alone["dsr"] > .5
+    many = deflated_sharpe(ret, rf, sharpe, list(rng.normal(0., .3, 99)) + [sharpe])
+    assert many["n_trials"] == 100 and many["sr0"] > 0.
+    assert many["dsr"] < alone["dsr"]
+
+
+def test_run_feature_search_end_to_end():
+    """A small search runs, ranks by IS Sharpe only, tests the winner on OOS and writes its files."""
+    with tempfile.TemporaryDirectory() as folder:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = run_feature_search(_write_sample_input(folder), outdir=folder,
+                                     feature_set="paper", warmup=60, jump_penalty=10.,
+                                     window=300, min_window=250, n_init=2,
+                                     search_sets="paper,example", search_jobs=1,
+                                     search_wf_folds=2, plot=False, verbose=False)
+        results, summary = out["results"], out["summary"]
+
+        # ranked by the IS Sharpe ratio, best first
+        assert results["sharpe_is"].is_monotonic_decreasing
+        assert summary["best"] == results.iloc[0]["label"]
+        # paper (3) + paper log-dd (3, of which "-DD" is the same matrix as paper's) + example (7)
+        assert len(results) == 12 and summary["n_runs"] == 12
+        alias = results.loc[results["label"] == "paper -DD", "aliases"].iloc[0]
+        assert alias == "paper log-dd -DD-log"      # the log scale renames the series
+        assert int(results["is_baseline"].sum()) == 1
+        assert results.loc[results["is_baseline"], "label"].iloc[0] == "paper"
+
+        # the IS and OOS parts split the evaluation period, and the blocks cover the OOS part
+        assert summary["is_start"] < summary["oos_start"] <= summary["end"]
+        wf = out["walkforward"]
+        assert wf["start"].iloc[0] == summary["oos_start"] and wf["end"].iloc[-1] == summary["end"]
+        assert int(wf["n_days"].sum()) == summary["n_oos"]
+        returns = out["returns"]
+        assert returns["walk-forward"].notna().sum() == summary["n_oos"]
+        assert (returns.loc[returns["period"] == "IS", "walk-forward"].isna()).all()
+
+        # the winner is recommended only if it beats the baseline out of sample
+        passed = summary["best_sharpe_oos"] >= summary["baseline_sharpe_oos"]
+        assert bool(summary["oos_passed"]) == bool(passed or summary["best"] == summary["baseline"])
+        assert summary["recommended"] == (summary["best"] if summary["oos_passed"] else summary["baseline"])
+        assert summary["recommended_cli"].startswith("--feature-set ")
+
+        names = sorted(os.path.basename(path) for path in out["written"])
+        assert names == ["search_results.csv", "search_returns.csv", "search_summary.csv",
+                         "search_walkforward.csv"]
 
 
 def main() -> int:
