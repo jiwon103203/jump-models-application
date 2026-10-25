@@ -17,8 +17,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from backtest import (build_weights, delay_robustness_table, performance_table,
-                      resolve_backtest_basis, resolve_cash_limits, resolve_cost_bps,
+from backtest import (build_weights, delay_robustness_table, performance_by_period,
+                      performance_table, resolve_backtest_basis, resolve_cash_limits, resolve_cost_bps,
                       run_0_1_strategy)
 from data_io import (attach_benchmark, load_benchmark_series, load_market_data,
                      relative_return, resolve_signal_return)
@@ -31,8 +31,9 @@ from hmm_benchmark import smooth_states
 from regime_episodes import (align_paths, compare_episode_paths, episode_metrics,
                              extract_episodes, length_scenarios, normalized_path,
                              rank_similar_episodes, resolve_target_episode, select_episodes)
-from rolling import (DEFAULT_GRID_SIZE, init_model, refit_schedule, resolve_grid_size,
-                     resolve_max_feats, run_rolling_jm, semiannual_anchors, state_losses)
+from rolling import (DEFAULT_GRID_SIZE, centroid_distances, init_model, refit_schedule,
+                     resolve_grid_size, resolve_max_feats, run_rolling_jm, semiannual_anchors,
+                     state_losses)
 from feature_search import (build_groups, deflated_sharpe, grid_candidates,
                             period_metrics, split_periods, stepwise_candidates, walk_forward)
 from run_pipeline import (load_data_with_extras, market_columns, prepare_inputs,
@@ -880,6 +881,38 @@ def test_the_relative_backtest_scores_the_active_position():
     assert abs(table.loc["Sharpe", "JM 0/1 (상대)"] - ir) < 1e-9
 
 
+def test_performance_by_period_splits_the_calendar_years():
+    """The whole period comes first, then one block per year with the in-year return."""
+    rng = np.random.default_rng(3)
+    dates = pd.bdate_range("2020-10-01", "2022-03-31").date
+    regime = pd.Series(np.tile(np.repeat([0, 1], 30), len(dates) // 60 + 1)[:len(dates)],
+                       index=dates)
+    ret = pd.Series(rng.normal(.0005, .01, len(dates)), index=dates)
+    rf = pd.Series(1e-4, index=dates)
+    strategy = run_0_1_strategy(regime, ret, rf, delay=1, cost_bps=10.)
+
+    table = performance_by_period(strategy, label="JM 0/1")
+    assert table.index.names == ["period", "metric"]
+    assert list(table.index.get_level_values("period").unique()) == ["all", "2020", "2021", "2022"]
+    # the "all" block is the usual whole-period table
+    overall = performance_table(strategy, label="JM 0/1")
+    assert np.allclose(table.loc["all"].loc[overall.index], overall)
+    assert table.loc[("all", "Days"), "JM 0/1"] == len(dates)
+
+    years = pd.DatetimeIndex(pd.to_datetime(pd.Index(dates))).year
+    for year in (2020, 2021, 2022):
+        in_year = strategy.loc[years == year]
+        block = table.loc[str(year)]
+        # the return is what was made within the year, not an annualized rate
+        assert np.isclose(block.loc["Return", "JM 0/1"], (1. + in_year.jm).prod() - 1.)
+        assert np.isclose(block.loc["Return", "B & H"], (1. + in_year.bh).prod() - 1.)
+        assert block.loc["Days", "B & H"] == len(in_year)
+        # every other metric is that of the year's own slice
+        own = performance_table(in_year, label="JM 0/1")
+        assert np.allclose(block.loc[["Sharpe", "MDD", "Turnover"]], own.loc[["Sharpe", "MDD", "Turnover"]])
+    assert table.xs("Days", level="metric").drop(index="all")["B & H"].sum() == len(dates)
+
+
 ############################################
 ## 변수 유형별 가중치
 ############################################
@@ -1164,6 +1197,12 @@ def test_state_losses_explain_the_labels():
     agreement = float((nearest == result.regimes.regime.to_numpy()).mean())
     assert agreement > .5, agreement
 
+    # the distances are the same losses, read back as ‖x·w − μ‖ and named after the states
+    dist = centroid_distances(result.regimes)
+    assert list(dist.columns) == ["dist_bull", "dist_bear"]
+    assert np.allclose(.5 * dist.to_numpy() ** 2, losses.to_numpy())
+    assert (dist.to_numpy().argmin(axis=1) == nearest).all()
+
     episodes = extract_episodes(result.regimes.regime, ret.reindex(result.regimes.index))
     data = pd.DataFrame({"close": (1. + ret).cumprod(), "ret": ret}).reindex(result.regimes.index)
     metrics = episode_metrics(episodes, result.regimes, data, result.params)
@@ -1331,6 +1370,33 @@ def test_run_inference_covers_the_current_half_only():
         # the plain model has no feature weights, so no weight tables are written
         assert out["weight_groups"] is None
         assert not [name for name in names if "weight" in name]
+
+
+def test_run_inference_writes_centroid_distances_and_a_workbook():
+    """`centroid_distance` adds the distance columns, and `excel` the same tables as sheets."""
+    with tempfile.TemporaryDirectory() as folder:
+        out = run_inference(_write_sample_input(folder), outdir=folder, feature_set="paper",
+                            jump_penalty=10., window=300, min_window=250, warmup=60,
+                            n_init=2, plot=False, centroid_distance=True, excel=True,
+                            verbose=False)
+        regimes = out["regimes"]
+        assert {"dist_bull", "dist_bear"} <= set(regimes.columns)
+        assert np.allclose(regimes["dist_bear"], np.sqrt(2. * regimes["loss_1"]))
+
+        workbook = os.path.join(folder, "inference_results.xlsx")
+        assert workbook in out["written"]
+        sheets = pd.read_excel(workbook, sheet_name=None, index_col=0)
+        assert set(sheets) == {"inference_regimes", "inference_refit_params", "inference_summary"}
+        assert np.allclose(sheets["inference_regimes"]["dist_bull"], regimes["dist_bull"])
+        # and the csv carries the same columns
+        csv = pd.read_csv(os.path.join(folder, "inference_regimes.csv"), index_col=0)
+        assert np.allclose(csv["dist_bear"], regimes["dist_bear"])
+
+        # without the option the regimes stay as they were
+        plain = run_inference(_write_sample_input(folder), outdir=folder, feature_set="paper",
+                              jump_penalty=10., window=300, min_window=250, warmup=60,
+                              n_init=2, plot=False, verbose=False)
+        assert not [col for col in plain["regimes"].columns if col.startswith("dist_")]
 
 
 ############################################

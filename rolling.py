@@ -243,6 +243,42 @@ def state_losses(model_ins, X_processed) -> np.ndarray:
     return .5 * cdist(X_weighted, np.asarray(jm.centers_, dtype=float), "sqeuclidean")
 
 
+def state_name(k: int, n_components: int) -> str:
+    """The name of state `k`: "bull" for 0, "bear" for the last one, "mid<k>" in between."""
+    return "bull" if k == 0 else ("bear" if k == n_components - 1 else f"mid{k}")
+
+
+def centroid_distances(regimes: pd.DataFrame, n_components: int = 2) -> pd.DataFrame:
+    """
+    Turn the state losses of `run_rolling_jm` into the distance of every day to each centroid.
+
+    The loss of a day against state `k` is ``½‖x_t ⊙ w − μ_k‖²`` (`state_losses`), so the
+    Euclidean distance between the day's features and the centroid is ``√(2 · loss_k)``. It
+    is measured where the model clusters: the features clipped and standardized on the
+    training window of the refit in force (and multiplied by the feature weights for the
+    sparse model), so one unit is roughly one training-window standard deviation, and the
+    distances of two days under different refits are measured against different centroids.
+
+    Parameters
+    ----------
+    regimes : pd.DataFrame
+        The `regimes` table of a `RollingJMResult`, holding the `loss_<k>` columns.
+
+    n_components : int, optional (default=2)
+        The number of regimes.
+
+    Returns
+    -------
+    pd.DataFrame
+        Indexed like `regimes`, one `dist_<name>` column per state (`dist_bull`, `dist_bear`,
+        and `dist_mid<k>` for any state in between).
+    """
+    return pd.DataFrame({
+        f"dist_{state_name(k, n_components)}": np.sqrt(2. * regimes[f"loss_{k}"].clip(lower=0.))
+        for k in range(n_components)
+    }, index=regimes.index)
+
+
 def semiannual_anchors(index) -> list:
     """
     Locate the first trading day on or after January 1st and July 1st of every year covered
@@ -593,7 +629,7 @@ def run_rolling_jm(X: pd.DataFrame,
                 "train_end": X_train.index[-1],
                 "n_train": win,
                 "state": k,
-                "regime": "bull" if k == 0 else ("bear" if k == n_components - 1 else f"mid{k}"),
+                "regime": state_name(k, n_components),
                 "freq": float((labels_train == k).mean()),
                 "ret_ann": float(model_ins.ret_[k] * TRADING_DAYS),
                 "vol_ann": float(model_ins.vol_[k] * np.sqrt(TRADING_DAYS)),
