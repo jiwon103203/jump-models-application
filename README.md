@@ -70,7 +70,8 @@ from run_pipeline import run_pipeline
 res = run_pipeline("내데이터.xlsx", outdir="out", jump_penalty=50.)
 res["result"].regimes      # 온라인 추론 레짐 (regime + proba_0·proba_1 확률)
 res["result"].params       # 재추정별 추정 파라미터
-res["performance"]         # 전략 성과표
+res["performance"]         # 전략 성과표 (전체 기간)
+res["performance_periods"] # 전체 기간 + 연도별 성과표 (performance.csv 와 같은 내용)
 ```
 
 ## 3. 주요 옵션
@@ -124,6 +125,8 @@ res["performance"]         # 전략 성과표
 | `--no-episodes` | 꺼짐 | 국면 분석 전체를 건너뜀 |
 | `--episode-state` | 마지막 상태 | 국면을 끊을 상태 번호. `--n-components`를 3 이상으로 둘 때 씁니다 |
 | `--no-plot`, `--save-features`, `--quiet` | | 출력 제어 |
+| `--centroid-distance` | 꺼짐 | `regimes.csv`(추론 모드는 `inference_regimes.csv`)에 날짜별 **레짐 중심까지의 거리** `dist_bull`·`dist_bear` 열을 추가 (3-14 참고) |
+| `--excel` | 꺼짐 | csv 결과표를 시트별로 모은 **엑셀 파일** `results.xlsx`(추론 모드는 `inference_results.xlsx`)도 함께 저장 (3-14 참고) |
 | `--plot-font` | 자동 | 그림 폰트. 한글 라벨이 깨질 때 지정 (예: `NanumGothic`) |
 
 ### 3-1. 확장 피처 세트 (`--feature-set extra`)
@@ -523,11 +526,12 @@ python run_pipeline.py --input 내데이터.xlsx --feature-set extra --model sjm
 
 | 파일 | 내용 |
 |---|---|
-| `inference_regimes.csv` | 현재 반기의 날짜별 레짐·확률·상태 손실 + 종가·수익률·무위험금리·초과수익률(벤치마크를 주면 `bench_close`·`bench_ret`·`rel_ret`도 함께)과 **권장 위험자산 비중** |
+| `inference_regimes.csv` | 현재 반기의 날짜별 레짐·확률·상태 손실(`--centroid-distance`면 중심까지의 거리도) + 종가·수익률·무위험금리·초과수익률(벤치마크를 주면 `bench_close`·`bench_ret`·`rel_ret`도 함께)과 **권장 위험자산 비중** |
 | `inference_summary.csv` | 한 눈에 보는 요약: 기준일, 재추정일, 학습창 구간·길이, 추론 구간, 현재 레짐과 확률, 현재 국면 지속일수와 시작일, 반기 내 bear 비중, 권장 비중, 종가 |
 | `inference_refit_params.csv` | 그 한 번의 재추정에 대한 레짐별 파라미터 (일반 `refit_params.csv`와 같은 형식) |
 | `inference_feat_weights.csv` · `inference_weight_groups.csv` | `--model sjm` 사용 시 그 재추정의 피처 가중과 유형별 비중 (3-9) |
 | `inference_regimes.png` | 반기 종가 + bear 구간 음영, 아래에 P(bear) 패널. 기준일은 점으로 표시 |
+| `inference_results.xlsx` | `--excel` 사용 시 위 csv 표들을 시트별로 모은 엑셀 파일 (3-14) |
 
 알아둘 점은 다음과 같습니다.
 
@@ -694,16 +698,57 @@ IS–OOS Sharpe 순위 상관(Spearman): 0.31 (0에 가까우면 IS 순위가 OO
 - **비교 구간은 모든 조합이 공통으로 덮는 날짜입니다.** 피처 세트마다 워밍업 결측이 달라 첫 재추정 시점이 다를 수 있어, 가장 늦게 시작하는 조합에 맞춰 평가합니다.
 - `--backtest-ret relative`이면 Sharpe가 벤치마크 대비 **정보비율(IR)** 이 되고, 탐색도 그 기준으로 이뤄집니다. `--hmm`·국면 분석·지연 로버스트니스는 이 모드에서 돌지 않습니다.
 
+### 3-14. 중심점까지의 거리, 연도별 성과, 엑셀 출력 (`--centroid-distance`, `--excel`)
+
+```bash
+# regimes.csv 에 dist_bull·dist_bear 열을 추가하고, 결과표 전체를 results.xlsx 로도 저장
+python run_pipeline.py --input 내데이터.xlsx --centroid-distance --excel
+
+# 추론 모드도 같음: inference_regimes.csv + inference_results.xlsx
+python run_pipeline.py --input 내데이터.xlsx --inference --centroid-distance --excel
+```
+
+**중심점까지의 거리(`dist_*`)** 는 그날의 피처가 각 레짐의 군집 중심에서 얼마나 떨어져 있는지입니다. 예를 들어 어떤 날이 `dist_bull = 0.1`, `dist_bear = 10.1`이면 그날의 피처는 bull 중심 바로 옆에 있고 bear 중심과는 멀리 떨어져 있다는 뜻입니다.
+
+아래 두 표의 숫자는 형식을 보여주기 위한 예시입니다.
+
+| date | regime | … | dist_bull | dist_bear |
+|---|---|---|---|---|
+| 2020-03-16 | 1 | … | 4.57 | 0.78 |
+| 2020-06-01 | 0 | … | 0.41 | 3.12 |
+
+- **모델이 군집하는 공간에서 잰 유클리드 거리입니다.** 피처를 그 시점 학습창 기준으로 ±3σ 클리핑·표준화한 공간(`--model sjm`이면 피처 가중까지 곱한 공간)에서 `‖x·w − μ_k‖`이고, 단위는 대략 "학습창 표준편차 몇 개만큼"입니다. 원래 피처 단위의 중심값은 `refit_params.csv`의 `center_*` 열에 있습니다.
+- **`loss_*`와 같은 정보를 거리로 다시 쓴 것입니다.** `dist_k = √(2 · loss_k)`이므로 가장 가까운 중심은 두 열 어느 쪽으로 봐도 같습니다. `regime`과 가장 가까운 중심이 다른 날은 점프 페널티가 그 레짐에 붙잡아 두고 있는 날입니다(3-10의 페널티 요인).
+- **재추정마다 기준이 바뀝니다.** 중심과 표준화는 6개월마다 다시 적합되므로, `refit_date`가 다른 두 날의 거리는 서로 다른 중심을 기준으로 잰 값입니다. 같은 반기 안에서 비교하는 것이 가장 정확합니다.
+- 레짐을 3개 이상 쓰면 중간 상태는 `dist_mid1`처럼 번호가 붙습니다.
+
+**연도별 성과**는 따로 옵션 없이 항상 `performance.csv`에 들어갑니다. 첫 블록(`period = all`)이 기존의 전체 기간 성과표이고, 그 아래로 연도별 블록이 이어집니다. 각 블록 끝의 `Days` 행이 그 블록의 거래일 수입니다.
+
+| period | metric | B & H | JM 0/1 |
+|---|---|---|---|
+| all | Return | 0.112 | 0.135 |
+| all | … | … | … |
+| 2008 | Return | -0.418 | -0.052 |
+| 2008 | Sharpe | … | … |
+| 2008 | Days | 253 | 253 |
+
+- 연도 블록의 **`Return`은 그 해 안에서 실제로 번 누적수익률**입니다(전체 블록은 CAGR). 데이터가 일부만 덮는 첫 해·마지막 해를 1년으로 늘려 환산하지 않기 위해서이며, `Days`를 보면 부분 연도를 알 수 있습니다. 변동성·Sharpe·Calmar·Turnover·Cost는 전체 블록과 마찬가지로 연율이고, MDD는 그 해 안에서의 최대 낙폭입니다.
+- 파이썬에서 읽을 때는 `pd.read_csv("out/performance.csv", index_col=[0, 1])`로 읽은 뒤 `.loc["2008"]`, `.xs("Return", level="metric")`처럼 꺼내면 됩니다. 실행 화면에도 연도별 수익률 표가 함께 출력됩니다.
+- `--hmm`을 켜면 HMM 열도 연도별로 같이 계산됩니다.
+
+**엑셀 출력(`--excel`)** 은 csv를 대신하지 않고 **추가로** 씁니다. 그 실행이 저장한 csv 표마다 같은 이름(확장자 제외, 최대 31자)의 시트를 하나씩 만들어 한 파일에 모읍니다. 따라서 `--centroid-distance`를 함께 주면 `regimes` 시트에도 `dist_*` 열이 들어가고, `performance` 시트에는 연도별 성과가 들어갑니다. `openpyxl`이 필요합니다(2절 설치 명령에 포함). `--search` 모드에는 적용되지 않습니다.
+
 ## 4. 출력물 (`--outdir`)
 
 아래는 기본(백테스트) 실행의 산출물입니다. `--inference`는 `inference_` 접두사(3-11), `--search`는 `search_` 접두사(3-13)가 붙은 별도 파일을 냅니다.
 
 | 파일 | 내용 |
 |---|---|
-| `regimes.csv` | 날짜별 온라인 추론 레짐(0=bull, 1=bear), 레짐 확률(`proba_0`·`proba_1`), 상태별 손실(`loss_0`·`loss_1`), 사용된 재추정 시점, 종가·수익률·무위험금리·초과수익률(벤치마크를 주면 `bench_close`·`bench_ret`·`rel_ret`도 함께), 전략 비중과 전략 수익률. 기본(연속형)에서는 `proba_*`가 `--grid-size` 간격의 확률값이고, `--no-cont`를 주면 0/1 원핫입니다 (3-8 참고) |
+| `regimes.csv` | 날짜별 온라인 추론 레짐(0=bull, 1=bear), 레짐 확률(`proba_0`·`proba_1`), 상태별 손실(`loss_0`·`loss_1`), 사용된 재추정 시점, `--centroid-distance` 사용 시 레짐 중심까지의 거리(`dist_bull`·`dist_bear`, 3-14), 종가·수익률·무위험금리·초과수익률(벤치마크를 주면 `bench_close`·`bench_ret`·`rel_ret`도 함께), 전략 비중과 전략 수익률. 기본(연속형)에서는 `proba_*`가 `--grid-size` 간격의 확률값이고, `--no-cont`를 주면 0/1 원핫입니다 (3-8 참고) |
 | `refit_params.csv` | 재추정 시점 × 레짐별 학습창 구간, 학습창 내 비중·연율 수익률·연율 변동성, 자기전이확률, **원래 피처 단위로 되돌린 군집 중심** |
 | `strategy.csv` | 일별 비중·매수량(`bought`)·매도량(`sold`)·총 거래량(`traded`)·거래비용(`cost`)·무위험금리·매수보유 수익률·전략 수익률 |
-| `performance.csv` | 매수보유 vs JM 0/1 전략 성과(CAGR, 변동성, Sharpe, MDD, Calmar, ES 5%, Turnover, Leverage, 연율 거래비용 `Cost`) |
+| `performance.csv` | 매수보유 vs JM 0/1 전략 성과(CAGR, 변동성, Sharpe, MDD, Calmar, ES 5%, Turnover, Leverage, 연율 거래비용 `Cost`, 거래일 수 `Days`). 전체 기간(`period = all`) 아래에 **연도별 성과**가 이어집니다 (3-14) |
+| `results.xlsx` | `--excel` 사용 시 위 csv 표들을 시트별로 모은 엑셀 파일 (3-14) |
 | `insample_last_window.csv` | 마지막 학습창의 in-sample 레짐(온라인 추론과 비교용, 논문 Figure 4) |
 | `regimes_cumret.png` | 누적 초과수익 곡선 + 방어적 비중을 든 bear 구간 음영 (논문 Figure 5). 현금 비중 제한을 걸면 범례가 그때의 위험자산 비중을 표시 |
 | `refit_params.png` | 재추정에 따른 레짐별 군집 중심의 시간 변화 (논문 Figure 3, 연율 환산) |
@@ -745,6 +790,8 @@ IS–OOS Sharpe 순위 상관(Spearman): 0.31 (0에 가까우면 IS 순위가 OO
 | (논문 밖) 피처 기간(5·10·20·60일)을 모델에 넣기 전에 제거 | `features.resolve_removed_horizons` → `features.build_features(remove_horizons=...)` |
 | (논문 밖) 변수 유형별 가중 비중 | `weights.group_feature_weights` → `plotting.plot_weight_groups` |
 | (논문 밖) 국면 길이의 거리 요인 / 페널티 요인 분해 | `rolling.state_losses` → `regime_episodes.episode_metrics` |
+| (논문 밖) 날짜별 레짐 중심까지의 거리 | `rolling.state_losses` → `rolling.centroid_distances` |
+| (논문 밖) 연도별 성과표 | `backtest.yearly_performance_table` → `backtest.performance_by_period` |
 | (논문 밖) 현재 반기만 추론하는 실행 모드 | `rolling.run_rolling_jm(last_refit_only=True)` → `run_pipeline.run_inference` |
 | (논문 밖) 변수 옵션 탐색 + IS/OOS 검증·워크포워드·Deflated Sharpe | `feature_search.run_search` → `run_pipeline.run_feature_search` |
 | (논문 밖) 유사 국면 탐색과 국면 종료 시점 | `regime_episodes.rank_similar_episodes`·`compare_episode_paths`·`length_scenarios` |

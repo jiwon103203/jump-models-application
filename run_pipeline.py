@@ -33,7 +33,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from backtest import (BACKTEST_RETURNS, DEFAULT_COST_BPS, DEFAULT_MAX_CASH, DEFAULT_MIN_CASH,
                       build_weights, delay_robustness_table, format_performance_table,
-                      performance_table, regime_summary, resolve_backtest_basis,
+                      performance_by_period, performance_table, regime_summary,
+                      resolve_backtest_basis,
                       resolve_cash_limits, resolve_cost_bps, run_0_1_strategy)
 from data_io import (REL_METHODS, RF_UNITS, SIGNAL_RETURNS, TRADING_DAYS, attach_benchmark,
                      join_extra_table, load_benchmark_series, load_extra_table,
@@ -45,7 +46,7 @@ from regime_episodes import (ALIGN_CRITERIA, DEFAULT_HORIZON, DEFAULT_MAX_LAG,
                              compare_episode_paths, episode_metrics, extract_episodes,
                              length_scenarios, rank_similar_episodes, resolve_target_episode,
                              select_episodes)
-from rolling import DEFAULT_GRID_SIZE, MODELS, run_rolling_jm
+from rolling import DEFAULT_GRID_SIZE, MODELS, centroid_distances, run_rolling_jm, state_name
 from weights import GROUPINGS, group_feature_weights, weight_group_summary
 
 
@@ -255,6 +256,12 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--outdir", default="out", help="결과 저장 폴더")
     group.add_argument("--no-plot", action="store_true", help="플롯 생성을 건너뜀")
     group.add_argument("--save-features", action="store_true", help="피처 행렬도 csv로 저장")
+    group.add_argument("--centroid-distance", action="store_true",
+                       help="regimes.csv에 날짜별 레짐 중심까지의 거리(dist_bull·dist_bear) 열을 추가. "
+                            "모델이 군집하는 표준화(sjm이면 가중) 피처 공간의 유클리드 거리")
+    group.add_argument("--excel", action="store_true",
+                       help="csv 결과표를 시트별로 모은 엑셀 파일(results.xlsx, 추론 모드는 "
+                            "inference_results.xlsx)도 함께 저장")
     group.add_argument("--plot-font", default=None,
                        help="그림에 사용할 폰트 이름. 한글 라벨이 깨질 때 지정 (예: NanumGothic)")
     group.add_argument("--quiet", action="store_true", help="진행 상황 출력을 최소화")
@@ -284,6 +291,20 @@ def market_columns(data: pd.DataFrame) -> list:
     """
     return [col for col in ("close", "ret", "rf", "excess_ret",
                             "bench_close", "bench_ret", "rel_ret") if col in data.columns]
+
+
+def write_excel(path: str, outputs: list) -> str:
+    """
+    Write the `(file name, table)` pairs of a run into one workbook, one sheet per csv.
+
+    Each sheet is named after its csv without the extension (Excel caps names at 31
+    characters), and holds the same table, so the workbook is the csv files side by side.
+    """
+    with pd.ExcelWriter(path) as writer:
+        for name, obj in outputs:
+            frame = obj.to_frame() if isinstance(obj, pd.Series) else obj
+            frame.to_excel(writer, sheet_name=os.path.splitext(name)[0][:31])
+    return path
 
 
 def parse_delays(delays) -> tuple:
@@ -677,6 +698,8 @@ def run_inference(input_path: str,
                   plot: bool = True,
                   plot_font: str = None,
                   save_features: bool = False,
+                  centroid_distance: bool = False,
+                  excel: bool = False,
                   verbose: bool = True) -> dict:
     """
     Infer the regimes of the current half-year only, and report where the market stands now.
@@ -698,6 +721,10 @@ def run_inference(input_path: str,
     The recommended weight is the plain mapping of the regime through `min_cash`/`max_cash`,
     with the trading delay applied, i.e. the position the 0/1 strategy would be holding. It
     is a restatement of the signal, not a backtested result.
+
+    `centroid_distance` and `excel` work as in `run_pipeline`: the distances of every day to
+    the regime centroids join `inference_regimes.csv`, and the tables are also written into
+    one workbook, `inference_results.xlsx`.
 
     With a benchmark given (`bench_col` / `bench_file`), the regimes are those of the
     benchmark-subtracted return, so the answer is "이 섹터가 지금 시장을 이기는 국면인가"
@@ -744,7 +771,10 @@ def run_inference(input_path: str,
                             random_state=random_state, model=model, max_feats=max_feats,
                             pin_feats=pinned, cont=cont, grid_size=grid_size, verbose=verbose)
 
-    regimes = result.regimes.join(data[market_columns(data)])
+    regimes = result.regimes
+    if centroid_distance:
+        regimes = regimes.join(centroid_distances(regimes, n_components))
+    regimes = regimes.join(data[market_columns(data)])
     regimes["weight"] = build_weights(result.regimes.regime, delay=delay, bull_state=0,
                                       min_cash=min_cash, max_cash=max_cash)
 
@@ -764,8 +794,7 @@ def run_inference(input_path: str,
         "inference_start": regimes.index[0],
         "n_inference": len(regimes),
         "regime": current,
-        "regime_name": "bull" if current == 0 else ("bear" if current == bear_state
-                                                    else f"mid{current}"),
+        "regime_name": state_name(current, n_components),
         "proba": float(regimes.loc[asof, f"proba_{current}"]),
         "run_length": run_length,
         "run_start": regimes.index[len(regimes) - run_length],
@@ -792,6 +821,8 @@ def run_inference(input_path: str,
         path = os.path.join(outdir, name)
         obj.to_csv(path)
         written.append(path)
+    if excel:
+        written.append(write_excel(os.path.join(outdir, "inference_results.xlsx"), outputs))
 
     if plot:
         from plotting import plot_inference, setup_font
@@ -899,6 +930,8 @@ def run_pipeline(input_path: str,
                  plot: bool = True,
                  plot_font: str = None,
                  save_features: bool = False,
+                 centroid_distance: bool = False,
+                 excel: bool = False,
                  verbose: bool = True) -> dict:
     """
     Run the whole pipeline and write the results to `outdir`.
@@ -918,7 +951,11 @@ def run_pipeline(input_path: str,
     `pin_features` names the features the sparse model must keep at every re-estimation.
     `cont` selects the continuous jump model, which is the default here: the `proba_*`
     columns of `regimes.csv` then hold genuine regime probabilities, spaced by `grid_size`,
-    rather than the 0/1 one-hot rows of the discrete model of the article.
+    rather than the 0/1 one-hot rows of the discrete model of the article. `centroid_distance`
+    adds the distance of every day to each regime centroid to `regimes.csv`
+    (`rolling.centroid_distances`), `performance.csv` stacks the whole-period table on top of
+    one per calendar year (`backtest.performance_by_period`), and `excel` also writes every
+    table into one workbook, `results.xlsx`, one sheet per csv.
 
     Two descriptive analyses run on top of that. With the sparse model, `weight_group` splits
     the feature weights of every re-estimation across kinds of variable, so that a feature set
@@ -942,8 +979,9 @@ def run_pipeline(input_path: str,
     -------
     dict
         The intermediate objects: `data`, `X` (features), `result` (RollingJMResult),
-        `strategy`, `performance`, `summary`, optionally `hmm_result`, `hmm_strategy` and
-        `robustness`, and the list of written files.
+        `strategy`, `performance` (the whole period), `performance_periods` (the whole period
+        and every calendar year, as written to `performance.csv`), `summary`, optionally
+        `hmm_result`, `hmm_strategy` and `robustness`, and the list of written files.
     """
     os.makedirs(outdir, exist_ok=True)
     # fail fast on bad limits, and keep the resolved values for the log line and the plot title
@@ -994,7 +1032,7 @@ def run_pipeline(input_path: str,
     hmm_result = hmm_strategy = hmm_summary = None
     model_label = (f"{result.model.upper()} 0/1" if backtest_ret == "asset"
                    else f"{result.model.upper()} 0/1 ({basis_name})")
-    performance = performance_table(strategy, trading_days=trading_days, label=model_label)
+    perf_main, perf_others = strategy, None
     if hmm:
         from hmm_benchmark import run_rolling_hmm
         # the benchmark model has to see the same series the jump model was fitted on, or the
@@ -1018,8 +1056,12 @@ def run_pipeline(input_path: str,
                 f"공통 구간 {common[0]} ~ {common[-1]}에서 성과를 비교합니다.")
             jm_aligned = run_0_1_strategy(result.regimes.regime.reindex(common), bt_ret, bt_rf,
                                           delay=delay, bull_state=0, **cost_kwargs)
-        performance = performance_table(jm_aligned, trading_days=trading_days, label=model_label,
-                                        others={"HMM 0/1": hmm_strategy})
+        perf_main, perf_others = jm_aligned, {"HMM 0/1": hmm_strategy}
+    performance = performance_table(perf_main, trading_days=trading_days, label=model_label,
+                                    others=perf_others)
+    # the whole period first, then every calendar year: the layout of `performance.csv`
+    performance_periods = performance_by_period(perf_main, trading_days=trading_days,
+                                                label=model_label, others=perf_others)
 
     # 6) trading delay robustness (Table 5 of the article)
     robustness_table, delay_list = None, parse_delays(delays)
@@ -1049,12 +1091,15 @@ def run_pipeline(input_path: str,
 
     # 8) write everything out
     written = []
-    regimes_out = result.regimes.join(data[market_columns(data)])
+    regimes_out = result.regimes
+    if centroid_distance:
+        regimes_out = regimes_out.join(centroid_distances(regimes_out, n_components))
+    regimes_out = regimes_out.join(data[market_columns(data)])
     regimes_out = regimes_out.join(strategy[["weight", "jm"]].rename(columns={"jm": "strategy_ret"}))
     outputs = [("regimes.csv", regimes_out),
                ("refit_params.csv", result.params.set_index("refit_date")),
                ("strategy.csv", strategy),
-               ("performance.csv", performance),
+               ("performance.csv", performance_periods),
                ("insample_last_window.csv", result.insample_last)]
     if hmm_result is not None:
         outputs += [("hmm_regimes.csv", hmm_result.regimes),
@@ -1080,6 +1125,8 @@ def run_pipeline(input_path: str,
         path = os.path.join(outdir, name)
         obj.to_csv(path)
         written.append(path)
+    if excel:
+        written.append(write_excel(os.path.join(outdir, "results.xlsx"), outputs))
 
     if plot:
         from plotting import (plot_episode_lengths, plot_feat_weights, plot_refit_params,
@@ -1182,6 +1229,10 @@ def run_pipeline(input_path: str,
                   f"레짐 전환 {hmm_summary['n_shifts']}회 (연 {hmm_summary['shifts_per_year']:.2f}회)")
         print("-" * 72)
         print(format_performance_table(performance).to_string())
+        print("-" * 72)
+        print("연도별 수익률 (performance.csv 의 연도 블록 참고)")
+        yearly_returns = performance_periods.xs("Return", level="metric").drop(index="all")
+        print(yearly_returns.map(lambda x: f"{x * 100:.1f}%").to_string())
         if robustness_table is not None:
             print("-" * 72)
             print(f"거래 지연 로버스트니스 (지연 {', '.join(str(d) for d in delay_list)}일)")
@@ -1192,7 +1243,8 @@ def run_pipeline(input_path: str,
             print(f"  {path}")
 
     return {"data": data, "X": X, "result": result, "strategy": strategy,
-            "performance": performance, "summary": summary, "hmm_result": hmm_result,
+            "performance": performance, "performance_periods": performance_periods,
+            "summary": summary, "hmm_result": hmm_result,
             "hmm_strategy": hmm_strategy, "hmm_summary": hmm_summary,
             "robustness": robustness_table, "weight_groups": weight_shares,
             "episodes": episode_result, "written": written}
@@ -1486,7 +1538,9 @@ def main(argv=None) -> int:
                       delay=args.delay, min_cash=args.min_cash, max_cash=args.max_cash,
                       weight_group=args.weight_group,
                       plot=not args.no_plot, plot_font=args.plot_font,
-                      save_features=args.save_features, verbose=not args.quiet)
+                      save_features=args.save_features,
+                      centroid_distance=args.centroid_distance, excel=args.excel,
+                      verbose=not args.quiet)
         return 0
     run_pipeline(input_path=args.input, outdir=args.outdir, sheet=args.sheet,
                  date_col=args.date_col, close_col=args.close_col, rf_col=args.rf_col,
@@ -1526,7 +1580,9 @@ def main(argv=None) -> int:
                  path_horizon=args.path_horizon, max_lag=args.max_lag,
                  align_by=args.align_by,
                  plot=not args.no_plot, plot_font=args.plot_font,
-                 save_features=args.save_features, verbose=not args.quiet)
+                 save_features=args.save_features,
+                 centroid_distance=args.centroid_distance, excel=args.excel,
+                 verbose=not args.quiet)
     return 0
 
 

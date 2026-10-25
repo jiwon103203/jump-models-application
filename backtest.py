@@ -370,6 +370,81 @@ def performance_table(strategy_df: pd.DataFrame,
     return pd.DataFrame(table)
 
 
+def _calendar_years(index) -> np.ndarray:
+    """The calendar year of every date of `index`."""
+    return np.asarray(pd.DatetimeIndex(pd.to_datetime(pd.Index(index))).year)
+
+
+def yearly_performance_table(strategy_df: pd.DataFrame,
+                             trading_days: int = TRADING_DAYS,
+                             others: dict = None,
+                             label: str = "JM 0/1") -> pd.DataFrame:
+    """
+    Build the comparison table of `performance_table` for every calendar year on its own.
+
+    Every metric keeps its definition, with one exception: `Return` is the compounded return
+    *within* the year rather than the CAGR, i.e. what the strategy actually made that year, so
+    a first or last year that the data covers only partly is not extrapolated to a full one.
+    The `Days` row gives the number of trading days behind each year, so partial years stand
+    out. The volatility, Sharpe, Calmar, turnover and cost stay annualized.
+
+    Parameters
+    ----------
+    strategy_df, trading_days, others, label
+        As in `performance_table`. Each strategy of `others` is split by the years of its own
+        index, which the caller is expected to have aligned with `strategy_df`.
+
+    Returns
+    -------
+    pd.DataFrame
+        Indexed by (year, metric), strategies in columns.
+    """
+    frames = {"__main__": strategy_df, **(others or {})}
+    years = {name: _calendar_years(frame.index) for name, frame in frames.items()}
+    blocks = {}
+    for year in np.unique(years["__main__"]):
+        in_year = {name: frame.loc[years[name] == year] for name, frame in frames.items()}
+        main = in_year.pop("__main__")
+        block = performance_table(main, trading_days=trading_days, label=label,
+                                  others={name: frame for name, frame in in_year.items()
+                                          if len(frame)})
+        returns = {"B & H": main["bh"], label: main["jm"],
+                   **{name: frame["jm"] for name, frame in in_year.items() if len(frame)}}
+        block.loc["Return"] = pd.Series({name: float((1. + ret).prod() - 1.)
+                                         for name, ret in returns.items()})
+        block.loc["Days"] = pd.Series({name: float(len(ret)) for name, ret in returns.items()})
+        blocks[int(year)] = block
+    return pd.concat(blocks, names=["year", "metric"])
+
+
+def performance_by_period(strategy_df: pd.DataFrame,
+                          trading_days: int = TRADING_DAYS,
+                          others: dict = None,
+                          label: str = "JM 0/1") -> pd.DataFrame:
+    """
+    Stack the whole-period table of `performance_table` on top of the yearly ones.
+
+    This is the layout of `performance.csv`: the first block, period "all", is the table of
+    the whole backtest, and one block per calendar year follows (`yearly_performance_table`).
+    Every block ends with a `Days` row, the number of trading days it covers.
+
+    Returns
+    -------
+    pd.DataFrame
+        Indexed by (period, metric), strategies in columns. The period is the string "all"
+        or the year, e.g. "2008".
+    """
+    overall = performance_table(strategy_df, trading_days=trading_days, others=others, label=label)
+    overall.loc["Days"] = pd.Series({"B & H": float(len(strategy_df)), label: float(len(strategy_df)),
+                                     **{name: float(len(other)) for name, other in (others or {}).items()}})
+    yearly = yearly_performance_table(strategy_df, trading_days=trading_days, others=others,
+                                      label=label)
+    blocks = {"all": overall}
+    for year in yearly.index.get_level_values("year").unique():
+        blocks[str(year)] = yearly.loc[year]
+    return pd.concat(blocks, names=["period", "metric"])[overall.columns]
+
+
 def format_performance_table(table: pd.DataFrame) -> pd.DataFrame:
     """Format the metric table for printing: percentages where the article uses them."""
     pct_rows = ("Return", "Volatility", "MDD", "ES_0.05", "Turnover", "Leverage")
