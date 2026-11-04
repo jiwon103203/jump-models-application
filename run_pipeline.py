@@ -257,7 +257,9 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--no-plot", action="store_true", help="플롯 생성을 건너뜀")
     group.add_argument("--save-features", action="store_true", help="피처 행렬도 csv로 저장")
     group.add_argument("--centroid-distance", action="store_true",
-                       help="regimes.csv에 날짜별 레짐 중심까지의 거리(dist_bull·dist_bear) 열을 추가. "
+                       help="regimes.csv에 날짜별 레짐 중심까지의 거리(dist_bull·dist_bear) 열과, "
+                            "그 거리가 해당 재추정 학습창의 거리 분포에서 몇 백분위인지"
+                            "(dist_bull_pct·dist_bear_pct, 0~100) 열을 추가. "
                             "모델이 군집하는 표준화(sjm이면 가중) 피처 공간의 유클리드 거리")
     group.add_argument("--excel", action="store_true",
                        help="csv 결과표를 시트별로 모은 엑셀 파일(results.xlsx, 추론 모드는 "
@@ -723,8 +725,9 @@ def run_inference(input_path: str,
     is a restatement of the signal, not a backtested result.
 
     `centroid_distance` and `excel` work as in `run_pipeline`: the distances of every day to
-    the regime centroids join `inference_regimes.csv`, and the tables are also written into
-    one workbook, `inference_results.xlsx`.
+    the regime centroids, and their percentiles within the training window, join
+    `inference_regimes.csv`, and the tables are also written into one workbook,
+    `inference_results.xlsx`.
 
     With a benchmark given (`bench_col` / `bench_file`), the regimes are those of the
     benchmark-subtracted return, so the answer is "이 섹터가 지금 시장을 이기는 국면인가"
@@ -773,7 +776,8 @@ def run_inference(input_path: str,
 
     regimes = result.regimes
     if centroid_distance:
-        regimes = regimes.join(centroid_distances(regimes, n_components))
+        regimes = regimes.join(centroid_distances(regimes, n_components,
+                                                  train_losses=result.train_losses))
     regimes = regimes.join(data[market_columns(data)])
     regimes["weight"] = build_weights(result.regimes.regime, delay=delay, bull_state=0,
                                       min_cash=min_cash, max_cash=max_cash)
@@ -952,7 +956,8 @@ def run_pipeline(input_path: str,
     `cont` selects the continuous jump model, which is the default here: the `proba_*`
     columns of `regimes.csv` then hold genuine regime probabilities, spaced by `grid_size`,
     rather than the 0/1 one-hot rows of the discrete model of the article. `centroid_distance`
-    adds the distance of every day to each regime centroid to `regimes.csv`
+    adds the distance of every day to each regime centroid to `regimes.csv`, together with
+    its percentile among the distances of the training window of the refit in force
     (`rolling.centroid_distances`), `performance.csv` stacks the whole-period table on top of
     one per calendar year (`backtest.performance_by_period`), and `excel` also writes every
     table into one workbook, `results.xlsx`, one sheet per csv.
@@ -1093,7 +1098,8 @@ def run_pipeline(input_path: str,
     written = []
     regimes_out = result.regimes
     if centroid_distance:
-        regimes_out = regimes_out.join(centroid_distances(regimes_out, n_components))
+        regimes_out = regimes_out.join(centroid_distances(regimes_out, n_components,
+                                                          train_losses=result.train_losses))
     regimes_out = regimes_out.join(data[market_columns(data)])
     regimes_out = regimes_out.join(strategy[["weight", "jm"]].rename(columns={"jm": "strategy_ret"}))
     outputs = [("regimes.csv", regimes_out),
