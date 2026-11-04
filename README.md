@@ -125,7 +125,7 @@ res["performance_periods"] # 전체 기간 + 연도별 성과표 (performance.cs
 | `--no-episodes` | 꺼짐 | 국면 분석 전체를 건너뜀 |
 | `--episode-state` | 마지막 상태 | 국면을 끊을 상태 번호. `--n-components`를 3 이상으로 둘 때 씁니다 |
 | `--no-plot`, `--save-features`, `--quiet` | | 출력 제어 |
-| `--centroid-distance` | 꺼짐 | `regimes.csv`(추론 모드는 `inference_regimes.csv`)에 날짜별 **레짐 중심까지의 거리** `dist_bull`·`dist_bear` 열을 추가 (3-14 참고) |
+| `--centroid-distance` | 꺼짐 | `regimes.csv`(추론 모드는 `inference_regimes.csv`)에 날짜별 **레짐 중심까지의 거리** `dist_bull`·`dist_bear` 열과, 그 거리가 학습창 안에서 몇 백분위인지 나타내는 `dist_bull_pct`·`dist_bear_pct`(0~100) 열을 추가 (3-14 참고) |
 | `--excel` | 꺼짐 | csv 결과표를 시트별로 모은 **엑셀 파일** `results.xlsx`(추론 모드는 `inference_results.xlsx`)도 함께 저장 (3-14 참고) |
 | `--plot-font` | 자동 | 그림 폰트. 한글 라벨이 깨질 때 지정 (예: `NanumGothic`) |
 
@@ -701,7 +701,8 @@ IS–OOS Sharpe 순위 상관(Spearman): 0.31 (0에 가까우면 IS 순위가 OO
 ### 3-14. 중심점까지의 거리, 연도별 성과, 엑셀 출력 (`--centroid-distance`, `--excel`)
 
 ```bash
-# regimes.csv 에 dist_bull·dist_bear 열을 추가하고, 결과표 전체를 results.xlsx 로도 저장
+# regimes.csv 에 dist_bull·dist_bear(와 백분위 dist_bull_pct·dist_bear_pct) 열을 추가하고,
+# 결과표 전체를 results.xlsx 로도 저장
 python run_pipeline.py --input 내데이터.xlsx --centroid-distance --excel
 
 # 추론 모드도 같음: inference_regimes.csv + inference_results.xlsx
@@ -712,14 +713,20 @@ python run_pipeline.py --input 내데이터.xlsx --inference --centroid-distance
 
 아래 두 표의 숫자는 형식을 보여주기 위한 예시입니다.
 
-| date | regime | … | dist_bull | dist_bear |
-|---|---|---|---|---|
-| 2020-03-16 | 1 | … | 4.57 | 0.78 |
-| 2020-06-01 | 0 | … | 0.41 | 3.12 |
+| date | regime | … | dist_bull | dist_bear | dist_bull_pct | dist_bear_pct |
+|---|---|---|---|---|---|---|
+| 2020-03-16 | 1 | … | 4.57 | 0.78 | 99.6 | 3.1 |
+| 2020-06-01 | 0 | … | 0.41 | 3.12 | 12.4 | 71.8 |
 
 - **모델이 군집하는 공간에서 잰 유클리드 거리입니다.** 피처를 그 시점 학습창 기준으로 ±3σ 클리핑·표준화한 공간(`--model sjm`이면 피처 가중까지 곱한 공간)에서 `‖x·w − μ_k‖`이고, 단위는 대략 "학습창 표준편차 몇 개만큼"입니다. 원래 피처 단위의 중심값은 `refit_params.csv`의 `center_*` 열에 있습니다.
 - **`loss_*`와 같은 정보를 거리로 다시 쓴 것입니다.** `dist_k = √(2 · loss_k)`이므로 가장 가까운 중심은 두 열 어느 쪽으로 봐도 같습니다. `regime`과 가장 가까운 중심이 다른 날은 점프 페널티가 그 레짐에 붙잡아 두고 있는 날입니다(3-10의 페널티 요인).
-- **재추정마다 기준이 바뀝니다.** 중심과 표준화는 6개월마다 다시 적합되므로, `refit_date`가 다른 두 날의 거리는 서로 다른 중심을 기준으로 잰 값입니다. 같은 반기 안에서 비교하는 것이 가장 정확합니다.
+- **재추정마다 기준이 바뀝니다.** 중심과 표준화는 6개월마다 다시 적합되므로, `refit_date`가 다른 두 날의 거리는 서로 다른 중심을 기준으로 잰 값입니다. 같은 반기 안에서 비교하는 것이 가장 정확하고, 반기를 넘어 비교할 때는 아래의 백분위를 쓰세요.
+
+**거리 백분위(`dist_*_pct`)** 는 그날의 거리가 **그 날에 적용된 재추정(`refit_date`)의 학습창** 동안 몇 백분위였는지입니다(0~100). 학습창의 모든 날에 대해 같은 중심까지의 거리를 같은 표준화·가중으로 잰 뒤, 그날 거리 **이하**였던 학습일의 비율을 셉니다. 위 예시의 2020-03-16은 `dist_bear_pct = 3.1`이므로 학습창 3000일 가운데 bear 중심에 이만큼 가까웠던 날이 3.1%뿐이었다는 뜻이고, `dist_bull_pct = 99.6`은 bull 중심에서는 학습창의 거의 어느 날보다 멀었다는 뜻입니다.
+
+- **값이 작을수록 그 중심에 가깝습니다.** 0에 가까우면 학습 기간 중 가장 가까웠던 날들 수준, 100이면 학습 기간의 어느 날보다도 멀다는 뜻입니다. 학습창 밖의 날이므로 0(어느 학습일보다 가까움)이나 100이 실제로 나올 수 있습니다.
+- **기준 분포는 학습창의 모든 날입니다.** 그 학습창에서 해당 레짐으로 분류된 날만이 아니라 전체 학습일의 거리와 비교하므로, "이 중심에 학습 기간 대비 얼마나 가까운가"를 읽는 값입니다.
+- 거리는 `loss_*`의 단조 변환이라 `loss_*`의 백분위와 같습니다. 학습창의 날짜별 손실은 파이썬에서 `out["result"].train_losses[refit_date]`로 볼 수 있습니다.
 - 레짐을 3개 이상 쓰면 중간 상태는 `dist_mid1`처럼 번호가 붙습니다.
 
 **연도별 성과**는 따로 옵션 없이 항상 `performance.csv`에 들어갑니다. 첫 블록(`period = all`)이 기존의 전체 기간 성과표이고, 그 아래로 연도별 블록이 이어집니다. 각 블록 끝의 `Days` 행이 그 블록의 거래일 수입니다.
@@ -736,7 +743,7 @@ python run_pipeline.py --input 내데이터.xlsx --inference --centroid-distance
 - 파이썬에서 읽을 때는 `pd.read_csv("out/performance.csv", index_col=[0, 1])`로 읽은 뒤 `.loc["2008"]`, `.xs("Return", level="metric")`처럼 꺼내면 됩니다. 실행 화면에도 연도별 수익률 표가 함께 출력됩니다.
 - `--hmm`을 켜면 HMM 열도 연도별로 같이 계산됩니다.
 
-**엑셀 출력(`--excel`)** 은 csv를 대신하지 않고 **추가로** 씁니다. 그 실행이 저장한 csv 표마다 같은 이름(확장자 제외, 최대 31자)의 시트를 하나씩 만들어 한 파일에 모읍니다. 따라서 `--centroid-distance`를 함께 주면 `regimes` 시트에도 `dist_*` 열이 들어가고, `performance` 시트에는 연도별 성과가 들어갑니다. `openpyxl`이 필요합니다(2절 설치 명령에 포함). `--search` 모드에는 적용되지 않습니다.
+**엑셀 출력(`--excel`)** 은 csv를 대신하지 않고 **추가로** 씁니다. 그 실행이 저장한 csv 표마다 같은 이름(확장자 제외, 최대 31자)의 시트를 하나씩 만들어 한 파일에 모읍니다. 따라서 `--centroid-distance`를 함께 주면 `regimes` 시트에도 `dist_*`·`dist_*_pct` 열이 들어가고, `performance` 시트에는 연도별 성과가 들어갑니다. `openpyxl`이 필요합니다(2절 설치 명령에 포함). `--search` 모드에는 적용되지 않습니다.
 
 ## 4. 출력물 (`--outdir`)
 
@@ -744,7 +751,7 @@ python run_pipeline.py --input 내데이터.xlsx --inference --centroid-distance
 
 | 파일 | 내용 |
 |---|---|
-| `regimes.csv` | 날짜별 온라인 추론 레짐(0=bull, 1=bear), 레짐 확률(`proba_0`·`proba_1`), 상태별 손실(`loss_0`·`loss_1`), 사용된 재추정 시점, `--centroid-distance` 사용 시 레짐 중심까지의 거리(`dist_bull`·`dist_bear`, 3-14), 종가·수익률·무위험금리·초과수익률(벤치마크를 주면 `bench_close`·`bench_ret`·`rel_ret`도 함께), 전략 비중과 전략 수익률. 기본(연속형)에서는 `proba_*`가 `--grid-size` 간격의 확률값이고, `--no-cont`를 주면 0/1 원핫입니다 (3-8 참고) |
+| `regimes.csv` | 날짜별 온라인 추론 레짐(0=bull, 1=bear), 레짐 확률(`proba_0`·`proba_1`), 상태별 손실(`loss_0`·`loss_1`), 사용된 재추정 시점, `--centroid-distance` 사용 시 레짐 중심까지의 거리(`dist_bull`·`dist_bear`)와 그 학습창 내 백분위(`dist_bull_pct`·`dist_bear_pct`, 3-14), 종가·수익률·무위험금리·초과수익률(벤치마크를 주면 `bench_close`·`bench_ret`·`rel_ret`도 함께), 전략 비중과 전략 수익률. 기본(연속형)에서는 `proba_*`가 `--grid-size` 간격의 확률값이고, `--no-cont`를 주면 0/1 원핫입니다 (3-8 참고) |
 | `refit_params.csv` | 재추정 시점 × 레짐별 학습창 구간, 학습창 내 비중·연율 수익률·연율 변동성, 자기전이확률, **원래 피처 단위로 되돌린 군집 중심** |
 | `strategy.csv` | 일별 비중·매수량(`bought`)·매도량(`sold`)·총 거래량(`traded`)·거래비용(`cost`)·무위험금리·매수보유 수익률·전략 수익률 |
 | `performance.csv` | 매수보유 vs JM 0/1 전략 성과(CAGR, 변동성, Sharpe, MDD, Calmar, ES 5%, Turnover, Leverage, 연율 거래비용 `Cost`, 거래일 수 `Days`). 전체 기간(`period = all`) 아래에 **연도별 성과**가 이어집니다 (3-14) |

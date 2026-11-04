@@ -1203,6 +1203,39 @@ def test_state_losses_explain_the_labels():
     assert np.allclose(.5 * dist.to_numpy() ** 2, losses.to_numpy())
     assert (dist.to_numpy().argmin(axis=1) == nearest).all()
 
+    # the training losses of every refit cover exactly its training window
+    assert set(result.train_losses) == set(result.regimes.refit_date.unique())
+    for refit_date, _, win in result.schedule:
+        train = result.train_losses[refit_date]
+        pos = X.index.get_loc(refit_date)
+        assert list(train.columns) == ["loss_0", "loss_1"]
+        assert list(train.index) == list(X.index[pos - win:pos])
+        assert (train.to_numpy() >= 0.).all()
+
+    # with them, each distance is also ranked within the training window of its refit
+    ranked = centroid_distances(result.regimes, train_losses=result.train_losses)
+    assert list(ranked.columns) == ["dist_bull", "dist_bear", "dist_bull_pct", "dist_bear_pct"]
+    assert np.allclose(ranked[["dist_bull", "dist_bear"]], dist)
+    pct = ranked[["dist_bull_pct", "dist_bear_pct"]]
+    assert pct.notna().all().all() and ((pct >= 0.) & (pct <= 100.)).all().all()
+    for day in result.regimes.index[::37]:
+        train = result.train_losses[result.regimes.loc[day, "refit_date"]]
+        for k, name in enumerate(["bull", "bear"]):
+            train_dist = np.sqrt(2. * train[f"loss_{k}"].to_numpy())
+            expected = 100. * float((train_dist <= ranked.loc[day, f"dist_{name}"] + 1e-12).mean())
+            assert np.isclose(ranked.loc[day, f"dist_{name}_pct"], expected), (day, name)
+    # a lower percentile means closer than more of the training days, like a lower distance
+    for refit_date, group in ranked.groupby(result.regimes.refit_date):
+        order = group["dist_bear"].argsort().to_numpy()
+        assert (np.diff(group["dist_bear_pct"].to_numpy()[order]) >= 0.).all()
+    # regimes from another run carry refits the training losses do not know about
+    try:
+        centroid_distances(result.regimes, train_losses={})
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("refits without training losses were ranked anyway")
+
     episodes = extract_episodes(result.regimes.regime, ret.reindex(result.regimes.index))
     data = pd.DataFrame({"close": (1. + ret).cumprod(), "ret": ret}).reindex(result.regimes.index)
     metrics = episode_metrics(episodes, result.regimes, data, result.params)
@@ -1382,6 +1415,15 @@ def test_run_inference_writes_centroid_distances_and_a_workbook():
         regimes = out["regimes"]
         assert {"dist_bull", "dist_bear"} <= set(regimes.columns)
         assert np.allclose(regimes["dist_bear"], np.sqrt(2. * regimes["loss_1"]))
+        # and the percentile of that distance within the training window of the single refit
+        assert {"dist_bull_pct", "dist_bear_pct"} <= set(regimes.columns)
+        pct = regimes[["dist_bull_pct", "dist_bear_pct"]]
+        assert pct.notna().all().all() and ((pct >= 0.) & (pct <= 100.)).all().all()
+        train = out["result"].train_losses[out["summary"]["refit_date"]]
+        assert len(train) == out["summary"]["n_train"]
+        expected = 100. * (np.sqrt(2. * train["loss_1"].to_numpy())[None, :]
+                           <= regimes["dist_bear"].to_numpy()[:, None] + 1e-12).mean(axis=1)
+        assert np.allclose(regimes["dist_bear_pct"], expected)
 
         workbook = os.path.join(folder, "inference_results.xlsx")
         assert workbook in out["written"]
@@ -1391,6 +1433,8 @@ def test_run_inference_writes_centroid_distances_and_a_workbook():
         # and the csv carries the same columns
         csv = pd.read_csv(os.path.join(folder, "inference_regimes.csv"), index_col=0)
         assert np.allclose(csv["dist_bear"], regimes["dist_bear"])
+        assert np.allclose(csv["dist_bear_pct"], regimes["dist_bear_pct"])
+        assert np.allclose(sheets["inference_regimes"]["dist_bull_pct"], regimes["dist_bull_pct"])
 
         # without the option the regimes stay as they were
         plain = run_inference(_write_sample_input(folder), outdir=folder, feature_set="paper",

@@ -248,7 +248,8 @@ def state_name(k: int, n_components: int) -> str:
     return "bull" if k == 0 else ("bear" if k == n_components - 1 else f"mid{k}")
 
 
-def centroid_distances(regimes: pd.DataFrame, n_components: int = 2) -> pd.DataFrame:
+def centroid_distances(regimes: pd.DataFrame, n_components: int = 2,
+                       train_losses: dict = None) -> pd.DataFrame:
     """
     Turn the state losses of `run_rolling_jm` into the distance of every day to each centroid.
 
@@ -259,24 +260,61 @@ def centroid_distances(regimes: pd.DataFrame, n_components: int = 2) -> pd.DataF
     sparse model), so one unit is roughly one training-window standard deviation, and the
     distances of two days under different refits are measured against different centroids.
 
+    That last point is what the percentiles are for. Given the losses of the training days
+    of every refit (`RollingJMResult.train_losses`), each distance is also ranked against the
+    distances of the training window it was measured under -- the same centroid, the same
+    standardization -- so that ``dist_bear_pct = 5`` reads "only 5% of the training days were
+    this close to the bear centroid" whatever the refit, and two days of different refits can
+    be compared on that scale where their raw distances cannot.
+
     Parameters
     ----------
     regimes : pd.DataFrame
-        The `regimes` table of a `RollingJMResult`, holding the `loss_<k>` columns.
+        The `regimes` table of a `RollingJMResult`, holding the `loss_<k>` columns (and the
+        `refit_date` column, when `train_losses` is given).
 
     n_components : int, optional (default=2)
         The number of regimes.
+
+    train_losses : dict, optional
+        `RollingJMResult.train_losses`: for every refit date, the losses of the days of its
+        training window against each state, as a table with the `loss_<k>` columns. When
+        given, a `dist_<name>_pct` column is added per state.
 
     Returns
     -------
     pd.DataFrame
         Indexed like `regimes`, one `dist_<name>` column per state (`dist_bull`, `dist_bear`,
-        and `dist_mid<k>` for any state in between).
+        and `dist_mid<k>` for any state in between) and, with `train_losses`, one
+        `dist_<name>_pct` column per state: the percentile (0-100) of the distance among the
+        distances of the training days of the refit in force to the same centroid, i.e. the
+        share of those days that were at most as far from it.
     """
-    return pd.DataFrame({
-        f"dist_{state_name(k, n_components)}": np.sqrt(2. * regimes[f"loss_{k}"].clip(lower=0.))
-        for k in range(n_components)
+    names = [state_name(k, n_components) for k in range(n_components)]
+    out = pd.DataFrame({
+        f"dist_{name}": np.sqrt(2. * regimes[f"loss_{k}"].clip(lower=0.))
+        for k, name in enumerate(names)
     }, index=regimes.index)
+    if train_losses is None:
+        return out
+
+    # the distance is a monotone function of the loss, so ranking the losses ranks the distances
+    pct = np.full((len(regimes), n_components), np.nan)
+    refit_of = regimes["refit_date"].to_numpy()
+    for refit_date in pd.unique(refit_of):
+        if refit_date not in train_losses:
+            raise KeyError(
+                f"{refit_date} 재추정의 학습창 손실이 없어 거리 백분위를 계산할 수 없습니다. "
+                f"같은 run_rolling_jm 결과의 regimes 와 train_losses 를 넘겨 주세요.")
+        rows = np.flatnonzero(refit_of == refit_date)
+        train = train_losses[refit_date]
+        for k in range(n_components):
+            reference = np.sort(np.asarray(train[f"loss_{k}"], dtype=float))
+            today = regimes[f"loss_{k}"].to_numpy(dtype=float)[rows]
+            pct[rows, k] = 100. * np.searchsorted(reference, today, side="right") / len(reference)
+    for k, name in enumerate(names):
+        out[f"dist_{name}_pct"] = pct[:, k]
+    return out
 
 
 def semiannual_anchors(index) -> list:
@@ -400,6 +438,12 @@ class RollingJMResult:
     pinned_features : list of str
         Sparse model only: the features pinned into the model, i.e. those whose weight is
         positive at every re-estimation by construction. Empty when nothing was pinned.
+
+    train_losses : dict
+        For every refit date, the loss of every day of its training window against each
+        state centroid of that refit (the `loss_<k>` columns, indexed by the training days).
+        It is the in-sample counterpart of the `loss_*` columns of `regimes`, against which
+        `centroid_distances` ranks the online distances.
     """
     regimes: pd.DataFrame
     params: pd.DataFrame
@@ -412,6 +456,7 @@ class RollingJMResult:
     grid_size: float = DEFAULT_GRID_SIZE
     feat_weights: pd.DataFrame = None
     pinned_features: list = field(default_factory=list)
+    train_losses: dict = field(default_factory=dict)
 
 
 def run_rolling_jm(X: pd.DataFrame,
@@ -566,7 +611,8 @@ def run_rolling_jm(X: pd.DataFrame,
             f"(가장 짧은 창: {min(w for _, w in short)}거래일, 목표: {window}거래일).")
 
     proba_cols = [f"proba_{i}" for i in range(n_components)]
-    regime_parts, param_rows, weight_rows = [], [], {}
+    loss_cols = [f"loss_{k}" for k in range(n_components)]
+    regime_parts, param_rows, weight_rows, train_losses = [], [], {}, {}
     insample_last = None
     n_obs = len(X)
 
@@ -595,11 +641,15 @@ def run_rolling_jm(X: pd.DataFrame,
         seg = pd.DataFrame(np.asarray(proba_seg), index=proba_seg.index, columns=proba_cols)
         seg.insert(0, "regime", np.asarray(proba_seg).argmax(axis=1))
         # the distance half of the model's objective, kept so that a regime episode can be
-        # split into what the features imply and what the jump penalty holds in place
-        losses = state_losses(model_ins, X_context_processed.iloc[win:])
+        # split into what the features imply and what the jump penalty holds in place. The
+        # lookback rows are the training window itself, so their losses are kept as well: the
+        # in-sample distribution the online distances of this refit are ranked against
+        losses = state_losses(model_ins, X_context_processed)
         for k in range(n_components):
-            seg[f"loss_{k}"] = losses[:, k]
+            seg[f"loss_{k}"] = losses[win:, k]
         seg["refit_date"] = refit_date
+        train_losses[refit_date] = pd.DataFrame(losses[:win], index=X_train.index,
+                                                columns=loss_cols)
         regime_parts.append(seg)
 
         # parameters of this refit, with the centroids mapped back to the feature units.
@@ -670,4 +720,5 @@ def run_rolling_jm(X: pd.DataFrame,
                            cont=cont,
                            grid_size=grid_size,
                            feat_weights=feat_weights,
-                           pinned_features=pinned)
+                           pinned_features=pinned,
+                           train_losses=train_losses)
